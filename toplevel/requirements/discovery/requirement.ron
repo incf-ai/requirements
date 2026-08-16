@@ -1,0 +1,11 @@
+RequirementV1(
+    title: "Discovery",
+    tests: TestV1(
+        path: "/tests/generic_inspection"
+        commit: "abcdef1234"
+    ),
+    tests: None,
+    dependency: None,
+    dependencies: None,
+)
+
