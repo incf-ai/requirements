@@ -116,4 +116,103 @@ mod test {
         std::fs::remove_dir_all(&tempdir).ok();
         Ok(())
     }
+
+    fn minimal_requirement() -> RequirementOnDisk {
+        RequirementOnDisk {
+            name: crate::util::EntryName("definition".to_string()),
+            definition: crate::requirement::types::RequirementDefinitionV1 {
+                title: "Title".to_string(),
+                test: None,
+                tests: None,
+                dependency: None,
+                dependencies: None,
+            },
+            requirement_text: String::new(),
+            requirement_guidance: None,
+            test_guidance: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reports_io_errors_saving_requirement_ron() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-definition-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("requirement.ron"), std::io::ErrorKind::PermissionDenied);
+
+        let err = save_requirement_stage(&fs, &dir, &minimal_requirement()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Definition(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reports_io_errors_saving_requirement_guidance() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-guidance-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("requirement_guidance.typ"),
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let mut requirement = minimal_requirement();
+        requirement.requirement_guidance = Some("guidance".to_string());
+        let err = save_requirement_stage(&fs, &dir, &requirement).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::RequirementGuidance { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reports_io_errors_saving_test_guidance() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-test-guidance-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("test_guidance.typ"),
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let mut requirement = minimal_requirement();
+        requirement.test_guidance = Some("guidance".to_string());
+        let err = save_requirement_stage(&fs, &dir, &requirement).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::TestGuidance { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reports_io_errors_saving_requirement_typ() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-text-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("requirement.typ"), std::io::ErrorKind::PermissionDenied);
+
+        let err = save_requirement_stage(&fs, &dir, &minimal_requirement()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::RequirementText(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

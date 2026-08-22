@@ -142,6 +142,40 @@ mod test {
     }
 
     #[test]
+    fn io_errors_reading_requirement_guidance_are_reported() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = valid_stage_dir("guidance-io");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("requirement_guidance.typ"),
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let err = load_requirement_stage(&fs, &dir).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::RequirementGuidance { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn io_errors_reading_test_guidance_are_reported() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = valid_stage_dir("test-guidance-io");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("test_guidance.typ"),
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let err = load_requirement_stage(&fs, &dir).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::TestGuidance { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn missing_requirement_typ_is_reported() {
         let dir = valid_stage_dir("missing-typ");
         std::fs::remove_file(dir.join("requirement.typ")).unwrap();

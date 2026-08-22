@@ -269,3 +269,161 @@ pub(crate) fn load_named_children<T, E: std::error::Error + 'static>(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::requirement::types::RequirementDefinition;
+    use syscalls::{FaultInjectingFilesystem, StdFilesystem};
+
+    /// A `Serialize` type used by both `save_ron` tests below, so both
+    /// exercise the same monomorphization of the generic `save_ron` (branch
+    /// coverage is tracked per-instantiation, so splitting these across two
+    /// different concrete types would leave each instantiation only
+    /// half-covered).
+    struct MaybeFailingSerialize(bool);
+
+    impl Serialize for MaybeFailingSerialize {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            if self.0 {
+                Err(serde::ser::Error::custom("boom"))
+            } else {
+                serializer.serialize_unit()
+            }
+        }
+    }
+
+    #[test]
+    fn load_ron_reports_generic_io_errors() {
+        // Reuses the `RequirementDefinition` instantiation of `load_ron`
+        // (already exercised for `Missing`/`Parse` elsewhere) rather than a
+        // one-off type param, so that instantiation ends up fully covered.
+        let path = Path::new("/nonexistent/does-not-matter.ron");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(path, io::ErrorKind::PermissionDenied);
+
+        let err = load_ron::<RequirementDefinition>(&fs, path).unwrap_err();
+        assert!(matches!(err, LoadRonError::Io { .. }));
+    }
+
+    #[test]
+    fn save_ron_reports_serialize_errors() {
+        let path = Path::new("/nonexistent/does-not-matter.ron");
+        let err = save_ron(&StdFilesystem, path, &MaybeFailingSerialize(true)).unwrap_err();
+        assert!(matches!(err, SaveRonError::Serialize { .. }));
+    }
+
+    #[test]
+    fn save_ron_reports_generic_io_errors() {
+        let path = Path::new("/nonexistent/does-not-matter.ron");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(path, io::ErrorKind::PermissionDenied);
+
+        let err = save_ron(&fs, path, &MaybeFailingSerialize(false)).unwrap_err();
+        assert!(matches!(err, SaveRonError::Io { .. }));
+    }
+
+    #[test]
+    fn read_required_text_reports_generic_io_errors() {
+        let path = Path::new("/nonexistent/does-not-matter.typ");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(path, io::ErrorKind::PermissionDenied);
+
+        let err = read_required_text(&fs, path).unwrap_err();
+        assert!(matches!(err, ReadRequiredTextError::Io { .. }));
+    }
+
+    #[test]
+    fn read_optional_text_reports_generic_io_errors() {
+        let path = Path::new("/nonexistent/does-not-matter.typ");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(path, io::ErrorKind::PermissionDenied);
+
+        let err = read_optional_text(&fs, path).unwrap_err();
+        assert!(matches!(err, ReadOptionalTextError::Io { .. }));
+    }
+
+    #[test]
+    fn write_text_reports_generic_io_errors() {
+        let path = Path::new("/nonexistent/does-not-matter.typ");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(path, io::ErrorKind::PermissionDenied);
+
+        let err = write_text(&fs, path, "hello").unwrap_err();
+        assert!(matches!(err, WriteTextError::Io { .. }));
+    }
+
+    #[test]
+    fn write_optional_text_skips_writing_when_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-util-write-optional-none-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("absent.typ");
+
+        write_optional_text(&StdFilesystem, &path, None).unwrap();
+        assert!(!path.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_named_children_reports_generic_io_errors() {
+        // Reuses `load_requirement_stage` as the loader — the same
+        // instantiation `module::operations::load_module_tree` uses for its
+        // `requirements/` children — rather than a throwaway closure type,
+        // so that instantiation (already covered for `Missing` and, below,
+        // `Child`) ends up covering `Io` too.
+        let dir = Path::new("/nonexistent/does-not-matter-dir");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir, io::ErrorKind::PermissionDenied);
+
+        let err = load_named_children(&fs, dir, crate::requirement::operations::load_requirement_stage)
+            .unwrap_err();
+        assert!(matches!(err, LoadNamedChildrenError::Io { .. }));
+    }
+
+    #[test]
+    fn load_named_children_reports_child_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-util-named-children-child-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        // A "requirements/"-shaped directory with one broken child (missing
+        // its required `requirement.ron`).
+        std::fs::create_dir_all(dir.join("broken")).unwrap();
+
+        let err = load_named_children(
+            &StdFilesystem,
+            &dir,
+            crate::requirement::operations::load_requirement_stage,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, LoadNamedChildrenError::Child { .. }));
+        assert!(err.to_string().contains("broken"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[should_panic(expected = "directory has a file name")]
+    fn entry_name_of_panics_without_a_file_name() {
+        EntryName::of(Path::new("/"));
+    }
+
+    #[test]
+    fn entry_name_display_matches_the_inner_string() {
+        assert_eq!(EntryName("definition".to_string()).to_string(), "definition");
+    }
+
+    #[test]
+    fn load_ron_error_messages_are_readable() {
+        let path = PathBuf::from("/some/path.ron");
+        let err = LoadRonError::Missing { path: path.clone() };
+        assert_eq!(err.to_string(), "missing required file: /some/path.ron");
+    }
+}

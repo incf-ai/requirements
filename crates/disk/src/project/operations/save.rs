@@ -82,4 +82,47 @@ mod test {
         std::fs::remove_dir_all(&tempdir).ok();
         Ok(())
     }
+
+    fn minimal_project() -> ProjectOnDisk {
+        ProjectOnDisk {
+            definition: crate::project::types::RootV1 {
+                name: "Capstone".to_string(),
+            },
+            tree: crate::module::types::ModuleTree::default(),
+        }
+    }
+
+    #[test]
+    fn reports_io_errors_creating_the_directory() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-project-save-create-dir-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(&dir, std::io::ErrorKind::PermissionDenied);
+
+        let err = save_project(&fs, &dir, &minimal_project()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::CreateDir { .. }));
+    }
+
+    #[test]
+    fn reports_io_errors_saving_project_ron() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-project-save-definition-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("project.ron"), std::io::ErrorKind::PermissionDenied);
+
+        let err = save_project(&fs, &dir, &minimal_project()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Definition(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

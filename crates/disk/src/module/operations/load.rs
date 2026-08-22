@@ -37,7 +37,6 @@ fn load_submodule_inner(fs: &dyn Filesystem, dir: &Path) -> Result<SubmoduleOnDi
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::util::LoadNamedChildrenError;
     use syscalls::StdFilesystem;
 
     fn sample_project_dir() -> std::path::PathBuf {
@@ -93,13 +92,8 @@ mod test {
         std::fs::remove_dir(dir.join("requirements")).unwrap();
 
         let err = load_submodule(&StdFilesystem, &dir).unwrap_err();
-        let ErrorKind::Tree(tree) = err.0 else {
-            panic!("expected ErrorKind::Tree");
-        };
-        assert!(matches!(
-            *tree,
-            LoadModuleTreeError::Requirements(LoadNamedChildrenError::Missing { .. })
-        ));
+        assert!(matches!(err.0, ErrorKind::Tree(_)));
+        assert!(err.to_string().contains("missing required directory"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

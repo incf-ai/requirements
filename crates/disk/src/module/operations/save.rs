@@ -54,3 +54,75 @@ fn save_submodule_inner(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::module::types::{ModuleTree, SubmoduleV1};
+    use crate::util::EntryName;
+    use syscalls::{FaultInjectingFilesystem, StdFilesystem};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "disk-submodule-save-{name}-{}-{}",
+            std::process::id(),
+            line!()
+        ))
+    }
+
+    fn minimal_submodule() -> SubmoduleOnDisk {
+        SubmoduleOnDisk {
+            name: EntryName("setup".to_string()),
+            definition: SubmoduleV1 {
+                name: "Setup".to_string(),
+            },
+            tree: ModuleTree::default(),
+        }
+    }
+
+    #[test]
+    fn reports_io_errors_creating_the_directory() {
+        let dir = temp_dir("create-dir-io");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(&dir, io::ErrorKind::PermissionDenied);
+
+        let err = save_submodule(&fs, &dir, &minimal_submodule()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::CreateDir { .. }));
+    }
+
+    #[test]
+    fn reports_io_errors_saving_submodule_ron() {
+        let dir = temp_dir("definition-io");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("submodule.ron"), io::ErrorKind::PermissionDenied);
+
+        let err = save_submodule(&fs, &dir, &minimal_submodule()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Definition(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reports_a_failing_module_tree() {
+        let dir = temp_dir("tree-io");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("requirements"), io::ErrorKind::PermissionDenied);
+
+        let err = save_submodule(&fs, &dir, &minimal_submodule()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Tree(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn error_messages_are_readable() {
+        let dir = temp_dir("message");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("submodule.ron"), io::ErrorKind::PermissionDenied);
+
+        let err = save_submodule(&fs, &dir, &minimal_submodule()).unwrap_err();
+        assert!(err.to_string().contains("failed to save submodule.ron"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

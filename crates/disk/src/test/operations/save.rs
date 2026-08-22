@@ -84,4 +84,58 @@ mod test {
         std::fs::remove_dir_all(&tempdir).ok();
         Ok(())
     }
+
+    fn minimal_test() -> TestOnDisk {
+        TestOnDisk {
+            name: crate::util::EntryName("generic_test".to_string()),
+            definition: crate::test::types::TestV1 {
+                title: "Title".to_string(),
+                result_kind: crate::test::types::ResultKindV1::FreeForm,
+            },
+            test_text: String::new(),
+            attachments: Vec::new(),
+            template: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reports_io_errors_saving_the_template() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-test-save-template-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("template"), std::io::ErrorKind::PermissionDenied);
+
+        let mut test = minimal_test();
+        test.template = vec![crate::attachments::AttachmentFile {
+            path: std::path::PathBuf::from("result.typ"),
+            content: Vec::new(),
+        }];
+        let err = save_test(&fs, &dir, &test).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Template { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reports_io_errors_saving_test_ron() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-test-save-definition-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("test.ron"), std::io::ErrorKind::PermissionDenied);
+
+        let err = save_test(&fs, &dir, &minimal_test()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Definition(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -94,3 +94,28 @@ pub struct RequirementOnDisk {
     pub test_guidance: Option<String>,
     pub attachments: Vec<AttachmentFile>,
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn reference_path_display_matches_the_inner_string() {
+        assert_eq!(
+            ReferencePath("/tests/generic_test".to_string()).to_string(),
+            "/tests/generic_test"
+        );
+    }
+
+    #[test]
+    fn validate_error_messages_are_readable() {
+        let err = ValidateRequirementDefinitionError::AmbiguousField {
+            singular: "test",
+            plural: "tests",
+        };
+        assert_eq!(
+            err.to_string(),
+            "sets both `test` and `tests` — use only one"
+        );
+    }
+}

@@ -76,4 +76,35 @@ mod test {
         std::fs::remove_dir_all(&tempdir).ok();
         Ok(())
     }
+
+    fn minimal_result() -> ResultOnDisk {
+        ResultOnDisk {
+            name: crate::util::EntryName("definition".to_string()),
+            definition: crate::result::types::ResultsV1 {
+                title: "Title".to_string(),
+                path: crate::requirement::types::ReferencePath("requirements/definition".to_string()),
+                commit: "abc".to_string(),
+                status: None,
+            },
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reports_io_errors_saving_result_ron() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-result-save-definition-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("result.ron"), std::io::ErrorKind::PermissionDenied);
+
+        let err = save_result(&fs, &dir, &minimal_result()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Definition(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
