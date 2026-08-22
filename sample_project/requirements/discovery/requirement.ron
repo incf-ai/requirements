@@ -1,4 +1,4 @@
-RequirementV1(
+RequirementDefinitionV1(
     title: "Discovery",
     tests: TestV1(
         path: "/tests/generic_inspection"
