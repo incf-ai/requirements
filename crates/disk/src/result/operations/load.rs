@@ -66,7 +66,7 @@ mod test {
 
         assert_eq!(result.definition.title, "Definition");
         assert_eq!(result.definition.path.0, "requirements/definition");
-        assert!(result.definition.status.is_none());
+        assert!(matches!(result.definition.status, crate::result::types::StatusV1::Incomplete));
         assert!(result.attachments.is_empty());
 
         Ok(())

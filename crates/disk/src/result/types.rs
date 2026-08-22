@@ -15,13 +15,18 @@ pub struct ResultsV1 {
     pub title: String,
     pub path: ReferencePath,
     pub commit: String,
-    pub status: Option<StatusV1>,
+    /// Required; defaults to `Incomplete` if the field is absent from an
+    /// on-disk `result.ron` (e.g. a hand-authored file that hasn't recorded
+    /// an outcome yet).
+    #[serde(default)]
+    pub status: StatusV1,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub enum StatusV1 {
     Pass,
     Fail,
+    #[default]
     Incomplete,
 }
 

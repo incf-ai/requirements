@@ -217,6 +217,165 @@ impl<G: Git> Git for FaultInjectingGit<G> {
     }
 }
 
+pub trait RemoteGit {
+    /// The commit currently at `path` (or, if `path` is `None`, at the
+    /// repository's `HEAD`) in the git repository at `url`. `path`, when
+    /// given, may be a file or a directory — a directory resolves to the
+    /// newest commit touching anything under it, same as `Git::commit_for_path`.
+    fn commit_for_remote(
+        &self,
+        url: &str,
+        path: Option<&Path>,
+    ) -> Result<String, CommitForRemoteError>;
+}
+
+#[derive(Debug, Error)]
+pub enum CommitForRemoteError {
+    #[error("failed to run git: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("git exited with {status}: {stderr}")]
+    CommandFailed { status: ExitStatus, stderr: String },
+    #[error("repository {url} has no commits")]
+    Empty { url: String },
+    #[error("no commit touches {path} in {url}")]
+    NotTracked { url: String, path: PathBuf },
+}
+
+impl RemoteGit for SystemGit {
+    fn commit_for_remote(
+        &self,
+        url: &str,
+        path: Option<&Path>,
+    ) -> Result<String, CommitForRemoteError> {
+        match path {
+            None => commit_for_remote_head(url),
+            Some(path) => commit_for_remote_path(url, path),
+        }
+    }
+}
+
+fn commit_for_remote_head(url: &str) -> Result<String, CommitForRemoteError> {
+    let output = Command::new("git")
+        .args(["ls-remote", url, "HEAD"])
+        .output()
+        .map_err(|source| CommitForRemoteError::Spawn { source })?;
+
+    if !output.status.success() {
+        return Err(CommitForRemoteError::CommandFailed {
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hash = stdout.split_whitespace().next().unwrap_or("");
+    if hash.is_empty() {
+        return Err(CommitForRemoteError::Empty {
+            url: url.to_string(),
+        });
+    }
+
+    Ok(hash.to_string())
+}
+
+fn commit_for_remote_path(url: &str, path: &Path) -> Result<String, CommitForRemoteError> {
+    let clone_dir = std::env::temp_dir().join(format!(
+        "syscalls-remote-git-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    ));
+
+    let result = clone_and_look_up(url, &clone_dir, path);
+    std::fs::remove_dir_all(&clone_dir).ok();
+    result
+}
+
+fn clone_and_look_up(url: &str, clone_dir: &Path, path: &Path) -> Result<String, CommitForRemoteError> {
+    let clone_output = Command::new("git")
+        .args(["clone", "--quiet", url])
+        .arg(clone_dir)
+        .output()
+        .map_err(|source| CommitForRemoteError::Spawn { source })?;
+
+    if !clone_output.status.success() {
+        return Err(CommitForRemoteError::CommandFailed {
+            status: clone_output.status,
+            stderr: String::from_utf8_lossy(&clone_output.stderr).into_owned(),
+        });
+    }
+
+    let log_output = Command::new("git")
+        .current_dir(clone_dir)
+        .args(["log", "-1", "--format=%H", "--"])
+        .arg(path)
+        .output()
+        .map_err(|source| CommitForRemoteError::Spawn { source })?;
+
+    if !log_output.status.success() {
+        return Err(CommitForRemoteError::CommandFailed {
+            status: log_output.status,
+            stderr: String::from_utf8_lossy(&log_output.stderr).into_owned(),
+        });
+    }
+
+    let hash = String::from_utf8_lossy(&log_output.stdout).trim().to_string();
+    if hash.is_empty() {
+        return Err(CommitForRemoteError::NotTracked {
+            url: url.to_string(),
+            path: path.to_path_buf(),
+        });
+    }
+
+    Ok(hash)
+}
+
+/// Wraps another `RemoteGit`, letting tests force `commit_for_remote` on
+/// specific URLs to fail instead of shelling out to real git/network state.
+#[derive(Debug, Default)]
+pub struct FaultInjectingRemoteGit<G> {
+    inner: G,
+    faults: HashMap<String, io::ErrorKind>,
+}
+
+impl<G: RemoteGit> FaultInjectingRemoteGit<G> {
+    pub fn new(inner: G) -> Self {
+        Self {
+            inner,
+            faults: HashMap::new(),
+        }
+    }
+
+    /// Every call touching `url` will fail until removed.
+    pub fn inject(&mut self, url: impl Into<String>, kind: io::ErrorKind) {
+        self.faults.insert(url.into(), kind);
+    }
+
+    pub fn clear(&mut self, url: &str) {
+        self.faults.remove(url);
+    }
+}
+
+impl<G: RemoteGit> RemoteGit for FaultInjectingRemoteGit<G> {
+    fn commit_for_remote(
+        &self,
+        url: &str,
+        path: Option<&Path>,
+    ) -> Result<String, CommitForRemoteError> {
+        if let Some(kind) = self.faults.get(url) {
+            return Err(CommitForRemoteError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {url}")),
+            });
+        }
+        self.inner.commit_for_remote(url, path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +506,134 @@ mod tests {
 
         git.clear(&path);
         assert!(git.commit_for_path(&path).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn file_url(dir: &Path) -> String {
+        format!("file://{}", dir.display())
+    }
+
+    #[test]
+    fn system_remote_git_returns_head_when_no_path_is_given() {
+        let dir = scratch_git_repo("remote-head");
+
+        let expected = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let hash = SystemGit.commit_for_remote(&file_url(&dir), None).unwrap();
+        assert_eq!(hash, expected);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_remote_git_returns_the_commit_for_a_tracked_file() {
+        let dir = scratch_git_repo("remote-tracked");
+
+        let expected = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let hash = SystemGit
+            .commit_for_remote(&file_url(&dir), Some(Path::new("tracked.txt")))
+            .unwrap();
+        assert_eq!(hash, expected);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_remote_git_returns_the_newest_commit_in_a_nested_directory() {
+        let dir = scratch_git_repo("remote-nested");
+
+        std::fs::create_dir_all(dir.join("nested/inner")).unwrap();
+        std::fs::write(dir.join("nested/inner/file.txt"), "hello").unwrap();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["add", "nested/inner/file.txt"]);
+        run(&["commit", "--quiet", "-m", "nested"]);
+
+        let expected = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let hash = SystemGit
+            .commit_for_remote(&file_url(&dir), Some(Path::new("nested")))
+            .unwrap();
+        assert_eq!(hash, expected);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_remote_git_reports_untracked_paths() {
+        let dir = scratch_git_repo("remote-untracked");
+
+        let err = SystemGit
+            .commit_for_remote(&file_url(&dir), Some(Path::new("untracked.txt")))
+            .unwrap_err();
+        assert!(matches!(err, CommitForRemoteError::NotTracked { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_remote_git_reports_bad_urls() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-remote-git-missing-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+
+        let err = SystemGit.commit_for_remote(&file_url(&dir), None).unwrap_err();
+        assert!(matches!(err, CommitForRemoteError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn fault_injecting_remote_git_overrides_commit_for_remote() {
+        let dir = scratch_git_repo("remote-fault");
+        let url = file_url(&dir);
+
+        let mut git = FaultInjectingRemoteGit::new(SystemGit);
+        git.inject(url.clone(), io::ErrorKind::PermissionDenied);
+
+        let err = git.commit_for_remote(&url, None).unwrap_err();
+        assert!(matches!(err, CommitForRemoteError::Spawn { .. }));
+
+        git.clear(&url);
+        assert!(git.commit_for_remote(&url, None).is_ok());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

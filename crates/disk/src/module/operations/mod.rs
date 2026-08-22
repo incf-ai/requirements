@@ -259,7 +259,7 @@ mod test {
                 title: "Title".to_string(),
                 path: ReferencePath("requirements/definition".to_string()),
                 commit: "abc".to_string(),
-                status: None,
+                status: crate::result::types::StatusV1::default(),
             },
             attachments: Vec::new(),
         }

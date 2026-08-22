@@ -75,9 +75,26 @@ pub struct LocalGitReference {
     pub commit: String,
 }
 
+/// Like `LocalGitReference`, but for a dependency living in a different git
+/// repository, identified by `url` (`http(s)://`, `file://`, `ssh://`, ...)
+/// rather than a location within the current project. When present, `path`
+/// is relative to that remote repository's own root — the project-root/
+/// module-root leading-slash convention documented on `ReferencePath`
+/// doesn't apply across repositories; it's always just a path within the
+/// remote repo. `path` is optional: absent means the dependency is the
+/// remote repository itself (its project root), not some path within it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde_with::skip_serializing_none]
+pub struct RemoteGitReference {
+    pub url: String,
+    pub path: Option<ReferencePath>,
+    pub commit: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum DependencyReferenceKind {
     RequirementReferenceV1(LocalGitReference),
+    RemoteRequirementReferenceV1(RemoteGitReference),
     Submodules,
 }
 
