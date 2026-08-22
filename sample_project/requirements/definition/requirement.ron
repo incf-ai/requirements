@@ -2,10 +2,10 @@ RequirementDefinitionV1(
     title: "Definition",
     test: TestReferenceV1(
         path: "/tests/generic_inspection",
-        commit: "abcdef1234"
+        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514"
     ),
     dependency: RequirementReferenceV1(
         path: "requirements/discovery",
-        commit: "abcdef1234"
+        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514"
     ),
 )

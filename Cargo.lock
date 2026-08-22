@@ -173,6 +173,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk"
+version = "0.1.0"
+dependencies = [
+ "nunny",
+ "ron",
+ "serde",
+ "serde_with",
+ "syscalls",
+ "thiserror",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,6 +380,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "logical"
+version = "0.1.0"
+dependencies = [
+ "non-empty-string",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -481,11 +500,9 @@ dependencies = [
 name = "requirements"
 version = "0.1.0"
 dependencies = [
- "non-empty-string",
- "nunny",
- "ron",
- "serde",
- "serde_with",
+ "disk",
+ "logical",
+ "syscalls",
 ]
 
 [[package]]
@@ -657,6 +674,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "syscalls"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

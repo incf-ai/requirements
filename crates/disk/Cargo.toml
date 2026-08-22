@@ -1,0 +1,12 @@
+[package]
+name = "disk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ron = { workspace = true }
+serde = { workspace = true }
+serde_with = { workspace = true }
+nunny = { workspace = true }
+thiserror = { workspace = true }
+syscalls = { path = "../syscalls" }

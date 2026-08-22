@@ -43,8 +43,8 @@ enum DependencyKind {
 }
 
 struct TestResult {
-    title: "Embeddings",
-    path: "/toplevel/requirements/definition",
-    commit: "abcdef1234",
-    status: None
+    title: String,
+    path: String,
+    commit: String,
+    status: Option<String>,
 }

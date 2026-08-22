@@ -1,11 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/syscalls", "crates/disk", "crates/logical"]
+
+[workspace.dependencies]
+non-empty-string = "0.2.6"
+nunny = "0.2.2"
+ron = "0.12.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_with = "3.22.0"
+thiserror = "2.0.17"
+
 [package]
 name = "requirements"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-non-empty-string = "0.2.6"
-nunny = "0.2.2"
-ron = "0.12.2"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_with = "3.22.0"
+disk = { path = "crates/disk" }
+logical = { path = "crates/logical" }
+syscalls = { path = "crates/syscalls" }
