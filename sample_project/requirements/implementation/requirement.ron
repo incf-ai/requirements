@@ -1,11 +1,8 @@
 RequirementDefinitionV1(
     title: "Implementation",
-    test: TestV1(
+    test: TestReferenceV1(
         path: "/tests/generic_inspection",
         commit: "abcdef1234"
     ),
-    tests: None,
     dependency: Submodules,
-    dependencies: None,
 )
-
