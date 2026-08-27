@@ -87,6 +87,7 @@ fn save_requirement_stage_inner(
 mod test {
     use super::*;
     use crate::requirement::operations::load::load_requirement_stage;
+    use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
     fn sample_project_dir() -> std::path::PathBuf {
@@ -97,7 +98,7 @@ mod test {
     fn round_trips_a_requirement_stage_through_a_tempdir() -> Result<(), Box<dyn std::error::Error>>
     {
         let dir = sample_project_dir().join("requirements/definition");
-        let original = load_requirement_stage(&StdFilesystem, &dir)?;
+        let original = load_requirement_stage(&StdFilesystem, &FixedGit, &dir)?;
 
         let tempdir = std::env::temp_dir().join(format!(
             "disk-requirement-round-trip-{}-{}",
@@ -105,13 +106,14 @@ mod test {
             line!()
         ));
         save_requirement_stage(&StdFilesystem, &tempdir, &original)?;
-        let reloaded = load_requirement_stage(&StdFilesystem, &tempdir)?;
+        let reloaded = load_requirement_stage(&StdFilesystem, &FixedGit, &tempdir)?;
 
         assert_eq!(original.definition.title, reloaded.definition.title);
         assert_eq!(original.requirement_text, reloaded.requirement_text);
         assert_eq!(original.requirement_guidance, reloaded.requirement_guidance);
         assert_eq!(original.test_guidance, reloaded.test_guidance);
         assert_eq!(original.attachments, reloaded.attachments);
+        assert_eq!(original.commit, reloaded.commit);
 
         std::fs::remove_dir_all(&tempdir).ok();
         Ok(())
@@ -126,11 +128,15 @@ mod test {
                 tests: None,
                 dependency: None,
                 dependencies: None,
+                attachment: None,
+                attachments: None,
+                include_attachments_in_commit: true,
             },
             requirement_text: String::new(),
             requirement_guidance: None,
             test_guidance: None,
             attachments: Vec::new(),
+            commit: "deadbeef".to_string(),
         }
     }
 
@@ -144,7 +150,10 @@ mod test {
             line!()
         ));
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(dir.join("requirement.ron"), std::io::ErrorKind::PermissionDenied);
+        fs.inject(
+            dir.join("requirement.ron"),
+            std::io::ErrorKind::PermissionDenied,
+        );
 
         let err = save_requirement_stage(&fs, &dir, &minimal_requirement()).unwrap_err();
         assert!(matches!(err.0, ErrorKind::Definition(_)));
@@ -208,7 +217,10 @@ mod test {
             line!()
         ));
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(dir.join("requirement.typ"), std::io::ErrorKind::PermissionDenied);
+        fs.inject(
+            dir.join("requirement.typ"),
+            std::io::ErrorKind::PermissionDenied,
+        );
 
         let err = save_requirement_stage(&fs, &dir, &minimal_requirement()).unwrap_err();
         assert!(matches!(err.0, ErrorKind::RequirementText(_)));

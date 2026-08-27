@@ -1,9 +1,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use syscalls::Filesystem;
+use syscalls::{Filesystem, Git};
 use thiserror::Error;
 
+use crate::attachments::{
+    ReadAttachmentsError, WriteAttachmentsError, read_attachments, write_attachments,
+};
 use crate::module::types::ModuleTree;
 use crate::requirement::operations::load::Error as LoadRequirementStageError;
 use crate::requirement::operations::save::Error as SaveRequirementStageError;
@@ -24,6 +27,10 @@ use save::Error as SaveSubmoduleError;
 
 #[derive(Debug, Error)]
 pub(crate) enum LoadModuleTreeError {
+    #[error("failed to load attachments: {0}")]
+    Attachments(#[from] ReadAttachmentsError),
+    #[error("failed to load templates: {source}")]
+    Templates { source: ReadAttachmentsError },
     #[error("failed to load requirements: {0}")]
     Requirements(#[from] LoadNamedChildrenError<LoadRequirementStageError>),
     #[error("failed to load tests: {0}")]
@@ -36,26 +43,35 @@ pub(crate) enum LoadModuleTreeError {
 
 pub(crate) fn load_module_tree(
     fs: &dyn Filesystem,
+    git: &dyn Git,
     dir: &Path,
 ) -> Result<ModuleTree, LoadModuleTreeError> {
+    let attachments = read_attachments(fs, git, &dir.join("attachments"))?;
+    let templates = read_attachments(fs, git, &dir.join("templates"))
+        .map_err(|source| LoadModuleTreeError::Templates { source })?;
     let requirements = load_named_children(
         fs,
+        git,
         &dir.join("requirements"),
         crate::requirement::operations::load_requirement_stage,
     )?;
     let tests = load_named_children(
         fs,
+        git,
         &dir.join("tests"),
         crate::test::operations::load_test,
     )?;
     let results = load_named_children(
         fs,
+        git,
         &dir.join("results"),
         crate::result::operations::load_result,
     )?;
-    let modules = load_named_children(fs, &dir.join("modules"), load_submodule)?;
+    let modules = load_named_children(fs, git, &dir.join("modules"), load_submodule)?;
 
     Ok(ModuleTree {
+        attachments,
+        templates,
         requirements,
         tests,
         results,
@@ -71,6 +87,10 @@ pub(crate) enum SaveModuleTreeError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to save attachments: {0}")]
+    Attachments(#[from] WriteAttachmentsError),
+    #[error("failed to save templates: {source}")]
+    Templates { source: WriteAttachmentsError },
     #[error("failed to save requirement '{name}': {source}")]
     Requirement {
         name: String,
@@ -102,6 +122,10 @@ pub(crate) fn save_module_tree(
     dir: &Path,
     tree: &ModuleTree,
 ) -> Result<(), SaveModuleTreeError> {
+    write_attachments(fs, &dir.join("attachments"), &tree.attachments)?;
+    write_attachments(fs, &dir.join("templates"), &tree.templates)
+        .map_err(|source| SaveModuleTreeError::Templates { source })?;
+
     let requirements_dir = dir.join("requirements");
     fs.create_dir_all(&requirements_dir)
         .map_err(|source| SaveModuleTreeError::CreateDir {
@@ -170,11 +194,12 @@ pub(crate) fn save_module_tree(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::module::types::SubmoduleOnDisk;
+    use crate::requirement::types::ReferencePath;
     use crate::requirement::types::{RequirementDefinitionV1, RequirementOnDisk};
     use crate::result::types::{ResultOnDisk, ResultsV1};
-    use crate::requirement::types::ReferencePath;
     use crate::test::types::{ResultKindV1, TestOnDisk, TestV1};
-    use crate::module::types::SubmoduleOnDisk;
+    use crate::test_support::FixedGit;
     use crate::util::EntryName;
     use syscalls::{FaultInjectingFilesystem, StdFilesystem};
 
@@ -186,11 +211,18 @@ mod test {
         ))
     }
 
-    /// Builds a `dir` with all four required subdirectories present, except
+    /// Builds a `dir` with all six required subdirectories present, except
     /// for `skip`, which is left entirely absent.
     fn dir_with_all_but(name: &str, skip: &str) -> PathBuf {
         let dir = temp_dir(name);
-        for sub in ["requirements", "tests", "results", "modules"] {
+        for sub in [
+            "attachments",
+            "templates",
+            "requirements",
+            "tests",
+            "results",
+            "modules",
+        ] {
             if sub != skip {
                 std::fs::create_dir_all(dir.join(sub)).unwrap();
             }
@@ -199,9 +231,33 @@ mod test {
     }
 
     #[test]
+    fn load_module_tree_reports_missing_attachments_dir() {
+        let dir = dir_with_all_but("missing-attachments", "attachments");
+        let err = load_module_tree(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(err, LoadModuleTreeError::Attachments(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_module_tree_reports_missing_templates_dir() {
+        let dir = dir_with_all_but("missing-templates", "templates");
+        let err = load_module_tree(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(err, LoadModuleTreeError::Templates { .. }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_module_tree_reports_missing_requirements_dir() {
+        let dir = dir_with_all_but("missing-requirements", "requirements");
+        let err = load_module_tree(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(err, LoadModuleTreeError::Requirements(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn load_module_tree_reports_missing_tests_dir() {
         let dir = dir_with_all_but("missing-tests", "tests");
-        let err = load_module_tree(&StdFilesystem, &dir).unwrap_err();
+        let err = load_module_tree(&StdFilesystem, &FixedGit, &dir).unwrap_err();
         assert!(matches!(err, LoadModuleTreeError::Tests(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -209,7 +265,7 @@ mod test {
     #[test]
     fn load_module_tree_reports_missing_results_dir() {
         let dir = dir_with_all_but("missing-results", "results");
-        let err = load_module_tree(&StdFilesystem, &dir).unwrap_err();
+        let err = load_module_tree(&StdFilesystem, &FixedGit, &dir).unwrap_err();
         assert!(matches!(err, LoadModuleTreeError::Results(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -217,7 +273,7 @@ mod test {
     #[test]
     fn load_module_tree_reports_missing_modules_dir() {
         let dir = dir_with_all_but("missing-modules", "modules");
-        let err = load_module_tree(&StdFilesystem, &dir).unwrap_err();
+        let err = load_module_tree(&StdFilesystem, &FixedGit, &dir).unwrap_err();
         assert!(matches!(err, LoadModuleTreeError::Modules(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -231,11 +287,15 @@ mod test {
                 tests: None,
                 dependency: None,
                 dependencies: None,
+                attachment: None,
+                attachments: None,
+                include_attachments_in_commit: true,
             },
             requirement_text: String::new(),
             requirement_guidance: None,
             test_guidance: None,
             attachments: Vec::new(),
+            commit: "deadbeef".to_string(),
         }
     }
 
@@ -245,10 +305,17 @@ mod test {
             definition: TestV1 {
                 title: "Title".to_string(),
                 result_kind: ResultKindV1::FreeForm,
+                attachment: None,
+                attachments: None,
+                template: None,
+                templates: None,
+                include_attachments_in_commit: true,
+                include_template_in_commit: true,
             },
             test_text: String::new(),
             attachments: Vec::new(),
             template: Vec::new(),
+            commit: "deadbeef".to_string(),
         }
     }
 
@@ -260,6 +327,8 @@ mod test {
                 path: ReferencePath("requirements/definition".to_string()),
                 commit: "abc".to_string(),
                 status: crate::result::types::StatusV1::default(),
+                attachment: None,
+                attachments: None,
             },
             attachments: Vec::new(),
         }
@@ -273,6 +342,30 @@ mod test {
             },
             tree: ModuleTree::default(),
         }
+    }
+
+    #[test]
+    fn save_module_tree_reports_a_failing_attachments_write() {
+        let dir = temp_dir("failing-attachments");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("attachments"), io::ErrorKind::PermissionDenied);
+
+        let err = save_module_tree(&fs, &dir, &ModuleTree::default()).unwrap_err();
+        assert!(matches!(err, SaveModuleTreeError::Attachments(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_module_tree_reports_a_failing_templates_write() {
+        let dir = temp_dir("failing-templates");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("templates"), io::ErrorKind::PermissionDenied);
+
+        let err = save_module_tree(&fs, &dir, &ModuleTree::default()).unwrap_err();
+        assert!(matches!(err, SaveModuleTreeError::Templates { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -294,7 +387,10 @@ mod test {
     fn save_module_tree_reports_a_failing_requirement() {
         let dir = temp_dir("failing-requirement");
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(dir.join("requirements").join("foo"), io::ErrorKind::PermissionDenied);
+        fs.inject(
+            dir.join("requirements").join("foo"),
+            io::ErrorKind::PermissionDenied,
+        );
 
         let tree = ModuleTree {
             requirements: vec![minimal_requirement("foo")],
@@ -310,7 +406,10 @@ mod test {
     fn save_module_tree_reports_a_failing_test() {
         let dir = temp_dir("failing-test");
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(dir.join("tests").join("foo"), io::ErrorKind::PermissionDenied);
+        fs.inject(
+            dir.join("tests").join("foo"),
+            io::ErrorKind::PermissionDenied,
+        );
 
         let tree = ModuleTree {
             tests: vec![minimal_test("foo")],
@@ -326,7 +425,10 @@ mod test {
     fn save_module_tree_reports_a_failing_result() {
         let dir = temp_dir("failing-result");
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(dir.join("results").join("foo"), io::ErrorKind::PermissionDenied);
+        fs.inject(
+            dir.join("results").join("foo"),
+            io::ErrorKind::PermissionDenied,
+        );
 
         let tree = ModuleTree {
             results: vec![minimal_result("foo")],
@@ -342,7 +444,10 @@ mod test {
     fn save_module_tree_reports_a_failing_module() {
         let dir = temp_dir("failing-module");
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(dir.join("modules").join("foo"), io::ErrorKind::PermissionDenied);
+        fs.inject(
+            dir.join("modules").join("foo"),
+            io::ErrorKind::PermissionDenied,
+        );
 
         let tree = ModuleTree {
             modules: vec![minimal_submodule("foo")],

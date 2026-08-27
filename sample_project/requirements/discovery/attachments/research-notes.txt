@@ -1,0 +1,4 @@
+Notes gathered during discovery:
+
+- Existing systems in this space and how they differ from what we're building.
+- Open questions to resolve before moving into definition.

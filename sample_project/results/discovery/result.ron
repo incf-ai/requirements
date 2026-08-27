@@ -3,4 +3,8 @@ ResultsV1(
     path: "requirements/discovery",
     commit: "3b4649f4c443de30700efc3215ec18f9bc9f8c0a",
     status: Incomplete,
+    attachment: ModuleAttachmentReferenceV1(
+        name: "glossary",
+        path: "glossary.md"
+    ),
 )

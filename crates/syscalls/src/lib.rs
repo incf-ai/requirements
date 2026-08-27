@@ -128,7 +128,18 @@ impl<F: Filesystem> Filesystem for FaultInjectingFilesystem<F> {
 }
 
 pub trait Git {
-    fn commit_for_path(&self, path: &Path) -> Result<String, CommitForPathError>;
+    /// The newest commit touching anything under `path`, ignoring any
+    /// changes confined entirely to paths in `excludes` (each typically a
+    /// subdirectory of `path`, e.g. `path.join("attachments")`).
+    fn commit_for_path_excluding(
+        &self,
+        path: &Path,
+        excludes: &[&Path],
+    ) -> Result<String, CommitForPathError>;
+
+    fn commit_for_path(&self, path: &Path) -> Result<String, CommitForPathError> {
+        self.commit_for_path_excluding(path, &[])
+    }
 }
 
 #[derive(Debug, Error)]
@@ -148,17 +159,29 @@ pub enum CommitForPathError {
 pub struct SystemGit;
 
 impl Git for SystemGit {
-    fn commit_for_path(&self, path: &Path) -> Result<String, CommitForPathError> {
+    fn commit_for_path_excluding(
+        &self,
+        path: &Path,
+        excludes: &[&Path],
+    ) -> Result<String, CommitForPathError> {
         let cwd = if path.is_dir() {
             path
         } else {
             path.parent().unwrap_or(path)
         };
 
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .current_dir(cwd)
             .args(["log", "-1", "--format=%H", "--"])
-            .arg(path)
+            .arg(path);
+        for exclude in excludes {
+            let mut pathspec = std::ffi::OsString::from(":(exclude)");
+            pathspec.push(exclude);
+            command.arg(pathspec);
+        }
+
+        let output = command
             .output()
             .map_err(|source| CommitForPathError::Spawn { source })?;
 
@@ -207,13 +230,17 @@ impl<G: Git> FaultInjectingGit<G> {
 }
 
 impl<G: Git> Git for FaultInjectingGit<G> {
-    fn commit_for_path(&self, path: &Path) -> Result<String, CommitForPathError> {
+    fn commit_for_path_excluding(
+        &self,
+        path: &Path,
+        excludes: &[&Path],
+    ) -> Result<String, CommitForPathError> {
         if let Some(kind) = self.faults.get(path) {
             return Err(CommitForPathError::Spawn {
                 source: io::Error::new(*kind, format!("injected fault for {}", path.display())),
             });
         }
-        self.inner.commit_for_path(path)
+        self.inner.commit_for_path_excluding(path, excludes)
     }
 }
 
@@ -296,7 +323,11 @@ fn commit_for_remote_path(url: &str, path: &Path) -> Result<String, CommitForRem
     result
 }
 
-fn clone_and_look_up(url: &str, clone_dir: &Path, path: &Path) -> Result<String, CommitForRemoteError> {
+fn clone_and_look_up(
+    url: &str,
+    clone_dir: &Path,
+    path: &Path,
+) -> Result<String, CommitForRemoteError> {
     let clone_output = Command::new("git")
         .args(["clone", "--quiet", url])
         .arg(clone_dir)
@@ -324,7 +355,9 @@ fn clone_and_look_up(url: &str, clone_dir: &Path, path: &Path) -> Result<String,
         });
     }
 
-    let hash = String::from_utf8_lossy(&log_output.stdout).trim().to_string();
+    let hash = String::from_utf8_lossy(&log_output.stdout)
+        .trim()
+        .to_string();
     if hash.is_empty() {
         return Err(CommitForRemoteError::NotTracked {
             url: url.to_string(),
@@ -469,6 +502,80 @@ mod tests {
     }
 
     #[test]
+    fn commit_for_path_excluding_ignores_commits_confined_to_the_excluded_path() {
+        let dir = scratch_git_repo("excluding-ignores");
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        let initial_commit = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/inner.txt"), "hello").unwrap();
+        run(&["add", "sub/inner.txt"]);
+        run(&["commit", "--quiet", "-m", "touches only sub/"]);
+
+        let unexcluded = SystemGit.commit_for_path(&dir).unwrap();
+        assert_ne!(unexcluded, initial_commit);
+
+        let excluded = SystemGit
+            .commit_for_path_excluding(&dir, &[&dir.join("sub")])
+            .unwrap();
+        assert_eq!(excluded, initial_commit);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_for_path_excluding_reports_not_tracked_when_only_the_excluded_path_has_commits() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-git-excluding-not-tracked-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("sub/inner.txt"), "hello").unwrap();
+        run(&["add", "sub/inner.txt"]);
+        run(&["commit", "--quiet", "-m", "touches only sub/"]);
+
+        let err = SystemGit
+            .commit_for_path_excluding(&dir, &[&dir.join("sub")])
+            .unwrap_err();
+        assert!(matches!(err, CommitForPathError::NotTracked { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn system_git_reports_untracked_paths() {
         let dir = scratch_git_repo("untracked");
         std::fs::write(dir.join("untracked.txt"), "hello").unwrap();
@@ -487,7 +594,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("file.txt"), "hello").unwrap();
 
-        let err = SystemGit.commit_for_path(&dir.join("file.txt")).unwrap_err();
+        let err = SystemGit
+            .commit_for_path(&dir.join("file.txt"))
+            .unwrap_err();
         assert!(matches!(err, CommitForPathError::CommandFailed { .. }));
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -617,7 +726,9 @@ mod tests {
             line!()
         ));
 
-        let err = SystemGit.commit_for_remote(&file_url(&dir), None).unwrap_err();
+        let err = SystemGit
+            .commit_for_remote(&file_url(&dir), None)
+            .unwrap_err();
         assert!(matches!(err, CommitForRemoteError::CommandFailed { .. }));
     }
 

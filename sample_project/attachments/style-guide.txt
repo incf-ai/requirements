@@ -1,0 +1,5 @@
+Writing style for requirement, test, and result text:
+
+- Keep titles short and in sentence case.
+- Write requirement.typ/test.typ instructions as imperative steps.
+- Prefer concrete, checkable language over vague adjectives.

@@ -1,9 +1,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
-use syscalls::Filesystem;
+use serde::{Deserialize, Serialize};
+use syscalls::{Filesystem, Git};
 use thiserror::Error;
 
 pub(crate) fn ron_options() -> ron::Options {
@@ -12,6 +12,14 @@ pub(crate) fn ron_options() -> ron::Options {
         .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
         .with_default_extension(ron::extensions::Extensions::UNWRAP_NEWTYPES)
         .with_default_extension(ron::extensions::Extensions::UNWRAP_VARIANT_NEWTYPES)
+}
+
+/// Used as `#[serde(default = "default_true")]` for a required `bool` field
+/// that should default to `true` when absent from an on-disk file —
+/// `#[serde(default)]` alone would use `bool::default()` (`false`), so
+/// fields that want the opposite default need this instead.
+pub(crate) fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Error)]
@@ -184,8 +192,10 @@ pub(crate) fn write_optional_text(
 
 /// The directory name of one child entry inside a `requirements/`, `tests/`,
 /// `results/`, or `modules/` folder — a single path component (never a
-/// multi-segment path), used as the key identifying that child.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// multi-segment path), used as the key identifying that child. Also reused
+/// to name a single file inside an `attachments/` folder, e.g. by
+/// `AttachmentReferenceKind`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct EntryName(pub String);
 
 impl EntryName {
@@ -239,8 +249,9 @@ pub(crate) enum LoadNamedChildrenError<E: std::error::Error + 'static> {
 /// value it returns). `dir` itself must exist.
 pub(crate) fn load_named_children<T, E: std::error::Error + 'static>(
     fs: &dyn Filesystem,
+    git: &dyn Git,
     dir: &Path,
-    loader: impl Fn(&dyn Filesystem, &Path) -> Result<T, E>,
+    loader: impl Fn(&dyn Filesystem, &dyn Git, &Path) -> Result<T, E>,
 ) -> Result<Vec<T>, LoadNamedChildrenError<E>> {
     let mut entries = match fs.read_dir(dir) {
         Ok(entries) => entries,
@@ -262,7 +273,7 @@ pub(crate) fn load_named_children<T, E: std::error::Error + 'static>(
         .into_iter()
         .filter(|entry| fs.is_dir(entry))
         .map(|entry| {
-            loader(fs, &entry).map_err(|source| LoadNamedChildrenError::Child {
+            loader(fs, git, &entry).map_err(|source| LoadNamedChildrenError::Child {
                 name: EntryName::of(&entry),
                 source,
             })
@@ -274,6 +285,7 @@ pub(crate) fn load_named_children<T, E: std::error::Error + 'static>(
 mod test {
     use super::*;
     use crate::requirement::types::RequirementDefinition;
+    use crate::test_support::FixedGit;
     use syscalls::{FaultInjectingFilesystem, StdFilesystem};
 
     /// A `Serialize` type used by both `save_ron` tests below, so both
@@ -380,8 +392,13 @@ mod test {
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
         fs.inject(dir, io::ErrorKind::PermissionDenied);
 
-        let err = load_named_children(&fs, dir, crate::requirement::operations::load_requirement_stage)
-            .unwrap_err();
+        let err = load_named_children(
+            &fs,
+            &FixedGit,
+            dir,
+            crate::requirement::operations::load_requirement_stage,
+        )
+        .unwrap_err();
         assert!(matches!(err, LoadNamedChildrenError::Io { .. }));
     }
 
@@ -398,6 +415,7 @@ mod test {
 
         let err = load_named_children(
             &StdFilesystem,
+            &FixedGit,
             &dir,
             crate::requirement::operations::load_requirement_stage,
         )
@@ -417,7 +435,10 @@ mod test {
 
     #[test]
     fn entry_name_display_matches_the_inner_string() {
-        assert_eq!(EntryName("definition".to_string()).to_string(), "definition");
+        assert_eq!(
+            EntryName("definition".to_string()).to_string(),
+            "definition"
+        );
     }
 
     #[test]

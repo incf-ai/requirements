@@ -29,7 +29,11 @@ pub fn save_result(fs: &dyn Filesystem, dir: &Path, result: &ResultOnDisk) -> Re
     save_result_inner(fs, dir, result).map_err(Error)
 }
 
-fn save_result_inner(fs: &dyn Filesystem, dir: &Path, result: &ResultOnDisk) -> Result<(), ErrorKind> {
+fn save_result_inner(
+    fs: &dyn Filesystem,
+    dir: &Path,
+    result: &ResultOnDisk,
+) -> Result<(), ErrorKind> {
     fs.create_dir_all(dir)
         .map_err(|source| ErrorKind::CreateDir {
             path: dir.to_path_buf(),
@@ -50,6 +54,7 @@ fn save_result_inner(fs: &dyn Filesystem, dir: &Path, result: &ResultOnDisk) -> 
 mod test {
     use super::*;
     use crate::result::operations::load::load_result;
+    use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
     fn sample_project_dir() -> std::path::PathBuf {
@@ -59,7 +64,7 @@ mod test {
     #[test]
     fn round_trips_a_result_through_a_tempdir() -> Result<(), Box<dyn std::error::Error>> {
         let dir = sample_project_dir().join("results/definition");
-        let original = load_result(&StdFilesystem, &dir)?;
+        let original = load_result(&StdFilesystem, &FixedGit, &dir)?;
 
         let tempdir = std::env::temp_dir().join(format!(
             "disk-result-round-trip-{}-{}",
@@ -67,7 +72,7 @@ mod test {
             line!()
         ));
         save_result(&StdFilesystem, &tempdir, &original)?;
-        let reloaded = load_result(&StdFilesystem, &tempdir)?;
+        let reloaded = load_result(&StdFilesystem, &FixedGit, &tempdir)?;
 
         assert_eq!(original.definition.title, reloaded.definition.title);
         assert_eq!(original.definition.commit, reloaded.definition.commit);
@@ -82,9 +87,13 @@ mod test {
             name: crate::util::EntryName("definition".to_string()),
             definition: crate::result::types::ResultsV1 {
                 title: "Title".to_string(),
-                path: crate::requirement::types::ReferencePath("requirements/definition".to_string()),
+                path: crate::requirement::types::ReferencePath(
+                    "requirements/definition".to_string(),
+                ),
                 commit: "abc".to_string(),
                 status: crate::result::types::StatusV1::default(),
+                attachment: None,
+                attachments: None,
             },
             attachments: Vec::new(),
         }

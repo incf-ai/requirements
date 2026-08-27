@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-use crate::attachments::AttachmentFile;
+use crate::attachments::{AttachmentFile, AttachmentReferenceKind};
 use crate::requirement::ReferencePath;
 use crate::util::EntryName;
 
@@ -20,6 +21,29 @@ pub struct ResultsV1 {
     /// an outcome yet).
     #[serde(default)]
     pub status: StatusV1,
+    pub attachment: Option<AttachmentReferenceKind>,
+    pub attachments: Option<nunny::Vec<AttachmentReferenceKind>>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ValidateResultsError {
+    #[error("sets both `{singular}` and `{plural}` — use only one")]
+    AmbiguousField {
+        singular: &'static str,
+        plural: &'static str,
+    },
+}
+
+impl ResultsV1 {
+    pub(crate) fn validate(&self) -> Result<(), ValidateResultsError> {
+        if self.attachment.is_some() && self.attachments.is_some() {
+            return Err(ValidateResultsError::AmbiguousField {
+                singular: "attachment",
+                plural: "attachments",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

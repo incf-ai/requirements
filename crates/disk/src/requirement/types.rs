@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::attachments::AttachmentFile;
-use crate::util::EntryName;
+use crate::attachments::{AttachmentFile, AttachmentReferenceKind};
+use crate::util::{EntryName, default_true};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum RequirementDefinition {
@@ -17,6 +17,14 @@ pub struct RequirementDefinitionV1 {
     pub tests: Option<nunny::Vec<TestReferenceKind>>,
     pub dependency: Option<DependencyReferenceKind>,
     pub dependencies: Option<nunny::Vec<DependencyReferenceKind>>,
+    pub attachment: Option<AttachmentReferenceKind>,
+    pub attachments: Option<nunny::Vec<AttachmentReferenceKind>>,
+    /// Whether `attachments/` counts toward this stage's `commit` (the
+    /// newest commit touching anything in the stage's folder, computed at
+    /// load time — see `RequirementOnDisk::commit`). Defaults to `true`
+    /// (included) when absent.
+    #[serde(default = "default_true")]
+    pub include_attachments_in_commit: bool,
 }
 
 #[derive(Debug, Error)]
@@ -40,6 +48,12 @@ impl RequirementDefinitionV1 {
             return Err(ValidateRequirementDefinitionError::AmbiguousField {
                 singular: "dependency",
                 plural: "dependencies",
+            });
+        }
+        if self.attachment.is_some() && self.attachments.is_some() {
+            return Err(ValidateRequirementDefinitionError::AmbiguousField {
+                singular: "attachment",
+                plural: "attachments",
             });
         }
         Ok(())
@@ -94,7 +108,7 @@ pub struct RemoteGitReference {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum DependencyReferenceKind {
     RequirementReferenceV1(LocalGitReference),
-    RemoteRequirementReferenceV1(RemoteGitReference),
+    RemoteReferenceV1(RemoteGitReference),
     Submodules,
 }
 
@@ -110,6 +124,12 @@ pub struct RequirementOnDisk {
     pub requirement_guidance: Option<String>,
     pub test_guidance: Option<String>,
     pub attachments: Vec<AttachmentFile>,
+    /// The newest git commit touching any file in this stage's folder or its
+    /// subfolders, resolved via `syscalls::Git::commit_for_path_excluding` at
+    /// load time — not persisted in `requirement.ron`. Excludes
+    /// `attachments/` when `definition.include_attachments_in_commit` is
+    /// `false`.
+    pub commit: String,
 }
 
 #[cfg(test)]

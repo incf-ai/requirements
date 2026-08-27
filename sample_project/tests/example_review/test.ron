@@ -1,0 +1,14 @@
+TestV1(
+    title: "Example Review",
+    result_kind: FreeForm,
+    templates: [
+        LocalTemplateReferenceV1(
+            name: "checklist",
+            path: "review-checklist.typ"
+        ),
+        ModuleTemplateReferenceV1(
+            name: "summary",
+            path: "example-summary.txt"
+        ),
+    ],
+)

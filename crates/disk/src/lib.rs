@@ -1,4 +1,6 @@
 mod attachments;
+#[cfg(test)]
+mod test_support;
 mod util;
 
 pub mod module;
@@ -7,8 +9,7 @@ pub mod requirement;
 pub mod result;
 pub mod test;
 
-pub use attachments::AttachmentFile;
-pub use util::EntryName;
+pub use attachments::{AttachmentFile, AttachmentReferenceKind};
 pub use module::{
     ModuleTree, SubmoduleDefinition, SubmoduleOnDisk, SubmoduleV1, load_submodule, save_submodule,
 };
@@ -20,3 +21,4 @@ pub use requirement::{
 };
 pub use result::{ResultDefinition, ResultOnDisk, ResultsV1, StatusV1, load_result, save_result};
 pub use test::{ResultKindV1, TestDefinition, TestOnDisk, TestV1, load_test, save_test};
+pub use util::EntryName;

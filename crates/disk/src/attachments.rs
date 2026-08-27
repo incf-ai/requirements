@@ -1,14 +1,57 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use syscalls::Filesystem;
+use serde::{Deserialize, Serialize};
+use syscalls::{CommitForPathError, Filesystem, Git};
 use thiserror::Error;
 
+use crate::util::EntryName;
+
+/// Git doesn't track empty directories, so an `attachments/`-style folder
+/// with no real attachments would silently vanish from the repository.
+/// `write_attachments` always drops a placeholder file with this name into
+/// the directory to keep it present in git regardless; `read_attachments`
+/// ignores it, so it never shows up as an `AttachmentFile`.
+const PLACEHOLDER_FILENAME: &str = ".gitkeep";
+
+/// A reference to an attachment file: where it lives and the git commit that
+/// last touched it. The raw bytes are never stored here — the file itself
+/// lives on disk (and in git history), this just records path + commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentFile {
     /// Path relative to the `attachments/` (or `template/`) directory.
     pub path: PathBuf,
-    pub content: Vec<u8>,
+    /// The full git commit hash that last touched this file.
+    pub commit: String,
+}
+
+/// A `requirement.ron`/`test.ron`/`result.ron` reference to an attachment
+/// file, either physically local to the referencing entity or shared at the
+/// module level (as opposed to `AttachmentFile`, which is a file `disk` has
+/// actually walked and resolved a commit for). Resolving this against the
+/// actual attachment list is out of scope for `disk` — it only carries
+/// `name`/`path` as parsed from RON.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum AttachmentReferenceKind {
+    /// A file in this entity's own local `attachments/` folder.
+    LocalAttachmentReferenceV1 {
+        /// A logical/display name for this reference, independent of
+        /// `path` — same relationship as `RequirementOnDisk::name` (a
+        /// directory name) to `RequirementDefinitionV1::title` (freeform
+        /// text): the two are allowed to differ.
+        name: EntryName,
+        /// Where the file actually is, relative to the `attachments/`
+        /// directory (supports nested paths, unlike `name`).
+        path: PathBuf,
+    },
+    /// A file in this entity's module's shared `attachments/` folder.
+    ModuleAttachmentReferenceV1 {
+        /// See `LocalAttachmentReferenceV1::name`.
+        name: EntryName,
+        /// Where the file actually is, relative to the module's
+        /// `attachments/` directory (supports nested paths, unlike `name`).
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -21,13 +64,20 @@ pub(crate) enum ReadAttachmentsError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to look up commit for {path}: {source}")]
+    Commit {
+        path: PathBuf,
+        #[source]
+        source: CommitForPathError,
+    },
 }
 
 /// Reads every file under `dir`, recursively, as an `AttachmentFile` with a
-/// path relative to `dir`. `dir` itself must exist. Returns entries sorted by
-/// path for deterministic ordering.
+/// path relative to `dir` and the commit `git` reports for it. `dir` itself
+/// must exist. Returns entries sorted by path for deterministic ordering.
 pub(crate) fn read_attachments(
     fs: &dyn Filesystem,
+    git: &dyn Git,
     dir: &Path,
 ) -> Result<Vec<AttachmentFile>, ReadAttachmentsError> {
     if !fs.exists(dir) {
@@ -37,13 +87,14 @@ pub(crate) fn read_attachments(
     }
 
     let mut files = Vec::new();
-    read_attachments_into(fs, dir, dir, &mut files)?;
+    read_attachments_into(fs, git, dir, dir, &mut files)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
 fn read_attachments_into(
     fs: &dyn Filesystem,
+    git: &dyn Git,
     root: &Path,
     current: &Path,
     out: &mut Vec<AttachmentFile>,
@@ -65,17 +116,21 @@ fn read_attachments_into(
 
     for entry in entries {
         if fs.is_dir(&entry) {
-            read_attachments_into(fs, root, &entry, out)?;
+            read_attachments_into(fs, git, root, &entry, out)?;
+        } else if entry.file_name() == Some(std::ffi::OsStr::new(PLACEHOLDER_FILENAME)) {
+            continue;
         } else {
-            let content = fs.read(&entry).map_err(|source| ReadAttachmentsError::Io {
-                path: entry.clone(),
-                source,
-            })?;
+            let commit =
+                git.commit_for_path(&entry)
+                    .map_err(|source| ReadAttachmentsError::Commit {
+                        path: entry.clone(),
+                        source,
+                    })?;
             let path = entry
                 .strip_prefix(root)
                 .expect("attachment entry is under its own root")
                 .to_path_buf();
-            out.push(AttachmentFile { path, content });
+            out.push(AttachmentFile { path, commit });
         }
     }
 
@@ -90,11 +145,17 @@ pub(crate) enum WriteAttachmentsError {
         #[source]
         source: io::Error,
     },
+    #[error("referenced attachment does not exist on disk: {path}")]
+    Missing { path: PathBuf },
 }
 
-/// Writes each attachment under `dir`, relative to `dir`, creating parent
-/// directories as needed. Ensures `dir` itself exists even if `attachments`
-/// is empty.
+/// Ensures `dir` exists and that every attachment's file is already present
+/// under it. The `disk` crate never writes attachment bytes itself — the
+/// files are expected to already be on disk (and committed to git) by other
+/// means; this only validates that each reference still resolves to a file.
+/// Also always drops a `.gitkeep` placeholder in `dir` (see
+/// `PLACEHOLDER_FILENAME`) so the directory stays present in git even when
+/// `attachments` is empty.
 pub(crate) fn write_attachments(
     fs: &dyn Filesystem,
     dir: &Path,
@@ -106,25 +167,18 @@ pub(crate) fn write_attachments(
             source,
         })?;
 
+    let placeholder = dir.join(PLACEHOLDER_FILENAME);
+    fs.write(&placeholder, b"")
+        .map_err(|source| WriteAttachmentsError::Io {
+            path: placeholder,
+            source,
+        })?;
+
     for attachment in attachments {
         let full_path = dir.join(&attachment.path);
-        // Always `Some`: `create_dir_all(dir)` above already succeeded,
-        // which is only possible if `dir` is non-empty, so `full_path`
-        // (which starts with `dir`) always has at least one component to
-        // strip.
-        let parent = full_path
-            .parent()
-            .expect("full_path always has a parent: create_dir_all(dir) above already succeeded");
-        fs.create_dir_all(parent)
-            .map_err(|source| WriteAttachmentsError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        fs.write(&full_path, &attachment.content)
-            .map_err(|source| WriteAttachmentsError::Io {
-                path: full_path.clone(),
-                source,
-            })?;
+        if !fs.exists(&full_path) {
+            return Err(WriteAttachmentsError::Missing { path: full_path });
+        }
     }
 
     Ok(())
@@ -133,7 +187,8 @@ pub(crate) fn write_attachments(
 #[cfg(test)]
 mod test {
     use super::*;
-    use syscalls::{FaultInjectingFilesystem, StdFilesystem};
+    use crate::test_support::FixedGit;
+    use syscalls::{FaultInjectingFilesystem, FaultInjectingGit, StdFilesystem};
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -146,7 +201,7 @@ mod test {
     #[test]
     fn read_attachments_reports_missing_directory() {
         let dir = temp_dir("read-missing");
-        let err = read_attachments(&StdFilesystem, &dir).unwrap_err();
+        let err = read_attachments(&StdFilesystem, &FixedGit, &dir).unwrap_err();
         assert!(matches!(err, ReadAttachmentsError::Missing { .. }));
     }
 
@@ -158,7 +213,7 @@ mod test {
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
         fs.inject(&dir, io::ErrorKind::NotFound);
 
-        let err = read_attachments(&fs, &dir).unwrap_err();
+        let err = read_attachments(&fs, &FixedGit, &dir).unwrap_err();
         assert!(matches!(err, ReadAttachmentsError::Missing { .. }));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -172,24 +227,24 @@ mod test {
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
         fs.inject(&dir, io::ErrorKind::PermissionDenied);
 
-        let err = read_attachments(&fs, &dir).unwrap_err();
+        let err = read_attachments(&fs, &FixedGit, &dir).unwrap_err();
         assert!(matches!(err, ReadAttachmentsError::Io { .. }));
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn read_attachments_reports_io_errors_reading_a_file() {
-        let dir = temp_dir("read-file-io");
+    fn read_attachments_reports_commit_lookup_errors() {
+        let dir = temp_dir("read-file-commit");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("hello.txt");
         std::fs::write(&file, b"hello").unwrap();
 
-        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(&file, io::ErrorKind::PermissionDenied);
+        let mut git = FaultInjectingGit::new(FixedGit);
+        git.inject(&file, io::ErrorKind::PermissionDenied);
 
-        let err = read_attachments(&fs, &dir).unwrap_err();
-        assert!(matches!(err, ReadAttachmentsError::Io { .. }));
+        let err = read_attachments(&StdFilesystem, &git, &dir).unwrap_err();
+        assert!(matches!(err, ReadAttachmentsError::Commit { .. }));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -200,11 +255,11 @@ mod test {
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("nested/inner.txt"), b"hello").unwrap();
 
-        let files = read_attachments(&StdFilesystem, &dir).unwrap();
+        let files = read_attachments(&StdFilesystem, &FixedGit, &dir).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, Path::new("nested/inner.txt"));
-        assert_eq!(files[0].content, b"hello");
+        assert_eq!(files[0].commit, "deadbeef");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -220,35 +275,67 @@ mod test {
     }
 
     #[test]
-    fn write_attachments_reports_io_errors_creating_a_nested_parent() {
-        let dir = temp_dir("write-nested-parent-io");
-        let nested_parent = dir.join("nested");
+    fn write_attachments_reports_io_errors_writing_the_placeholder() {
+        let dir = temp_dir("write-placeholder-io");
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(&nested_parent, io::ErrorKind::PermissionDenied);
+        fs.inject(
+            dir.join(PLACEHOLDER_FILENAME),
+            io::ErrorKind::PermissionDenied,
+        );
 
-        let attachments = [AttachmentFile {
-            path: PathBuf::from("nested/inner.txt"),
-            content: b"hello".to_vec(),
-        }];
-        let err = write_attachments(&fs, &dir, &attachments).unwrap_err();
+        let err = write_attachments(&fs, &dir, &[]).unwrap_err();
         assert!(matches!(err, WriteAttachmentsError::Io { .. }));
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn write_attachments_reports_io_errors_writing_a_file() {
-        let dir = temp_dir("write-file-io");
-        let file = dir.join("hello.txt");
-        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(&file, io::ErrorKind::PermissionDenied);
+    fn write_attachments_leaves_a_placeholder_when_empty() {
+        let dir = temp_dir("write-placeholder");
+
+        write_attachments(&StdFilesystem, &dir, &[]).unwrap();
+        assert!(dir.join(PLACEHOLDER_FILENAME).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_attachments_ignores_the_placeholder() {
+        let dir = temp_dir("read-ignores-placeholder");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PLACEHOLDER_FILENAME), b"").unwrap();
+
+        let files = read_attachments(&StdFilesystem, &FixedGit, &dir).unwrap();
+        assert!(files.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_attachments_reports_missing_referenced_files() {
+        let dir = temp_dir("write-missing-file");
 
         let attachments = [AttachmentFile {
-            path: PathBuf::from("hello.txt"),
-            content: b"hello".to_vec(),
+            path: PathBuf::from("nested/inner.txt"),
+            commit: "deadbeef".to_string(),
         }];
-        let err = write_attachments(&fs, &dir, &attachments).unwrap_err();
-        assert!(matches!(err, WriteAttachmentsError::Io { .. }));
+        let err = write_attachments(&StdFilesystem, &dir, &attachments).unwrap_err();
+        assert!(matches!(err, WriteAttachmentsError::Missing { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_attachments_accepts_attachments_already_present_on_disk() {
+        let dir = temp_dir("write-present-file");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/inner.txt"), b"hello").unwrap();
+
+        let attachments = [AttachmentFile {
+            path: PathBuf::from("nested/inner.txt"),
+            commit: "deadbeef".to_string(),
+        }];
+        write_attachments(&StdFilesystem, &dir, &attachments).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
     }

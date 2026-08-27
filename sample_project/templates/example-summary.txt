@@ -1,0 +1,3 @@
+A short, free-form summary of what was done and observed — shared at the
+module level so any test's template can point to it instead of duplicating
+it locally.

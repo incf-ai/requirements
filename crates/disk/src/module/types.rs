@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::attachments::AttachmentFile;
 use crate::requirement::types::RequirementOnDisk;
 use crate::result::types::ResultOnDisk;
 use crate::test::types::TestOnDisk;
@@ -15,11 +16,17 @@ pub struct SubmoduleV1 {
     pub name: String,
 }
 
-/// The `requirements/`, `tests/`, `results/`, and `modules/` children shared
-/// by both the project root and every submodule, each keyed by directory
-/// name.
+/// The `attachments/`, `templates/`, `requirements/`, `tests/`, `results/`,
+/// and `modules/` children shared by both the project root and every
+/// submodule, each keyed by directory name (`attachments`/`templates` are
+/// unkeyed — flat lists shared by the whole module, referenced by
+/// `requirement.ron`/`test.ron`/`result.ron` files via
+/// `AttachmentReferenceKind`/`TemplateReferenceKind` rather than being
+/// per-name children).
 #[derive(Debug, Clone, Default)]
 pub struct ModuleTree {
+    pub attachments: Vec<AttachmentFile>,
+    pub templates: Vec<AttachmentFile>,
     pub requirements: Vec<RequirementOnDisk>,
     pub tests: Vec<TestOnDisk>,
     pub results: Vec<ResultOnDisk>,

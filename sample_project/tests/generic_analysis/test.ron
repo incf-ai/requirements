@@ -1,4 +1,8 @@
 TestV1(
     title: "Generic Analysis",
     result_kind: FreeForm,
+    attachment: LocalAttachmentReferenceV1(
+        name: "checklist",
+        path: "checklist.md"
+    ),
 )

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use syscalls::Filesystem;
+use syscalls::{Filesystem, Git};
 use thiserror::Error;
 
 use crate::module::operations::{LoadModuleTreeError, load_module_tree};
@@ -19,13 +19,21 @@ enum ErrorKind {
 #[error(transparent)]
 pub struct Error(#[from] ErrorKind);
 
-pub fn load_submodule(fs: &dyn Filesystem, dir: &Path) -> Result<SubmoduleOnDisk, Error> {
-    load_submodule_inner(fs, dir).map_err(Error)
+pub fn load_submodule(
+    fs: &dyn Filesystem,
+    git: &dyn Git,
+    dir: &Path,
+) -> Result<SubmoduleOnDisk, Error> {
+    load_submodule_inner(fs, git, dir).map_err(Error)
 }
 
-fn load_submodule_inner(fs: &dyn Filesystem, dir: &Path) -> Result<SubmoduleOnDisk, ErrorKind> {
+fn load_submodule_inner(
+    fs: &dyn Filesystem,
+    git: &dyn Git,
+    dir: &Path,
+) -> Result<SubmoduleOnDisk, ErrorKind> {
     let SubmoduleDefinition::SubmoduleV1(definition) = load_ron(fs, &dir.join("submodule.ron"))?;
-    let tree = load_module_tree(fs, dir).map_err(Box::new)?;
+    let tree = load_module_tree(fs, git, dir).map_err(Box::new)?;
 
     Ok(SubmoduleOnDisk {
         name: EntryName::of(dir),
@@ -37,6 +45,7 @@ fn load_submodule_inner(fs: &dyn Filesystem, dir: &Path) -> Result<SubmoduleOnDi
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
     fn sample_project_dir() -> std::path::PathBuf {
@@ -46,7 +55,7 @@ mod test {
     #[test]
     fn loads_the_embeddings_submodule_from_the_sample_project() -> Result<(), Error> {
         let dir = sample_project_dir().join("modules/embeddings");
-        let submodule = load_submodule(&StdFilesystem, &dir)?;
+        let submodule = load_submodule(&StdFilesystem, &FixedGit, &dir)?;
 
         assert_eq!(submodule.definition.name, "Embeddings");
         assert!(submodule.tree.requirements.is_empty());
@@ -77,7 +86,7 @@ mod test {
         let dir = valid_submodule_dir("missing-ron");
         std::fs::remove_file(dir.join("submodule.ron")).unwrap();
 
-        let err = load_submodule(&StdFilesystem, &dir).unwrap_err();
+        let err = load_submodule(&StdFilesystem, &FixedGit, &dir).unwrap_err();
         assert!(matches!(
             err.0,
             ErrorKind::Definition(LoadRonError::Missing { .. })
@@ -91,7 +100,7 @@ mod test {
         let dir = valid_submodule_dir("missing-requirements");
         std::fs::remove_dir(dir.join("requirements")).unwrap();
 
-        let err = load_submodule(&StdFilesystem, &dir).unwrap_err();
+        let err = load_submodule(&StdFilesystem, &FixedGit, &dir).unwrap_err();
         assert!(matches!(err.0, ErrorKind::Tree(_)));
         assert!(err.to_string().contains("missing required directory"));
 

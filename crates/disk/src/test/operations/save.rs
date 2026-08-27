@@ -57,6 +57,7 @@ fn save_test_inner(fs: &dyn Filesystem, dir: &Path, test: &TestOnDisk) -> Result
 mod test {
     use super::*;
     use crate::test::operations::load::load_test;
+    use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
     fn sample_project_dir() -> std::path::PathBuf {
@@ -66,15 +67,25 @@ mod test {
     #[test]
     fn round_trips_a_test_through_a_tempdir() -> Result<(), Box<dyn std::error::Error>> {
         let dir = sample_project_dir().join("tests/generic_test");
-        let original = load_test(&StdFilesystem, &dir)?;
+        let original = load_test(&StdFilesystem, &FixedGit, &dir)?;
 
         let tempdir = std::env::temp_dir().join(format!(
             "disk-test-round-trip-{}-{}",
             std::process::id(),
             line!()
         ));
+        // `write_attachments` only validates that referenced attachment
+        // files already exist on disk (it never writes bytes), so the
+        // template file has to be copied into place before saving.
+        std::fs::create_dir_all(tempdir.join("template")).unwrap();
+        std::fs::copy(
+            dir.join("template/result.typ"),
+            tempdir.join("template/result.typ"),
+        )
+        .unwrap();
+
         save_test(&StdFilesystem, &tempdir, &original)?;
-        let reloaded = load_test(&StdFilesystem, &tempdir)?;
+        let reloaded = load_test(&StdFilesystem, &FixedGit, &tempdir)?;
 
         assert_eq!(original.definition.title, reloaded.definition.title);
         assert_eq!(original.test_text, reloaded.test_text);
@@ -91,11 +102,34 @@ mod test {
             definition: crate::test::types::TestV1 {
                 title: "Title".to_string(),
                 result_kind: crate::test::types::ResultKindV1::FreeForm,
+                attachment: None,
+                attachments: None,
+                template: None,
+                templates: None,
+                include_attachments_in_commit: true,
+                include_template_in_commit: true,
             },
             test_text: String::new(),
             attachments: Vec::new(),
             template: Vec::new(),
+            commit: "deadbeef".to_string(),
         }
+    }
+
+    #[test]
+    fn leaves_a_gitkeep_in_attachments_and_template() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-test-save-gitkeep-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+
+        save_test(&StdFilesystem, &dir, &minimal_test()).unwrap();
+
+        assert!(dir.join("attachments/.gitkeep").exists());
+        assert!(dir.join("template/.gitkeep").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -113,7 +147,7 @@ mod test {
         let mut test = minimal_test();
         test.template = vec![crate::attachments::AttachmentFile {
             path: std::path::PathBuf::from("result.typ"),
-            content: Vec::new(),
+            commit: "deadbeef".to_string(),
         }];
         let err = save_test(&fs, &dir, &test).unwrap_err();
         assert!(matches!(err.0, ErrorKind::Template { .. }));
