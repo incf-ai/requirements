@@ -1,4 +1,14 @@
 TestV1(
     title: "Generic Demonstration",
     result_kind: FreeForm,
+    templates: [
+        LocalTemplateReferenceV1(
+            name: "result",
+            path: "result.typ"
+        ),
+        LocalTemplateReferenceV1(
+            name: "notes",
+            path: "notes.md"
+        ),
+    ],
 )

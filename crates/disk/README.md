@@ -201,16 +201,22 @@ written.
   ```
   ResultsV1(
       title: String,
-      path: ReferencePath,
-      commit: String,
+      requirement_path: ReferencePath,
+      requirement_commit: String,
+      test_path: ReferencePath,
+      test_commit: String,
       status: StatusV1,
       attachment: Option<AttachmentReferenceKind>,
       attachments: Option<NonEmptyVec<AttachmentReferenceKind>>,
   )
   ```
-  - `path`/`commit` record *which requirement, at what commit,* this result
-    was produced against — unlike `LocalGitReference`, this isn't a
-    reference expected to still match something; it's a fixed snapshot.
+  - `requirement_path`/`requirement_commit` record *which requirement, at
+    what commit,* this result was produced against; `test_path`/
+    `test_commit` record *which test, at what commit,* it satisfies —
+    tracked independently since a requirement and the test it references
+    don't necessarily change together. Unlike `LocalGitReference`, neither
+    pair is a reference expected to still match something; both are fixed
+    snapshots.
   - **Rule: `attachment` and `attachments` are mutually exclusive**, same as
     on `requirement.ron`, naming a file local to this result or shared at
     the module level (see `AttachmentReferenceKind` in shared conventions

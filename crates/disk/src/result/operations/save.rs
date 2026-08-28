@@ -75,7 +75,14 @@ mod test {
         let reloaded = load_result(&StdFilesystem, &FixedGit, &tempdir)?;
 
         assert_eq!(original.definition.title, reloaded.definition.title);
-        assert_eq!(original.definition.commit, reloaded.definition.commit);
+        assert_eq!(
+            original.definition.requirement_commit,
+            reloaded.definition.requirement_commit
+        );
+        assert_eq!(
+            original.definition.test_commit,
+            reloaded.definition.test_commit
+        );
         assert_eq!(original.attachments, reloaded.attachments);
 
         std::fs::remove_dir_all(&tempdir).ok();
@@ -87,10 +94,14 @@ mod test {
             name: crate::util::EntryName("definition".to_string()),
             definition: crate::result::types::ResultsV1 {
                 title: "Title".to_string(),
-                path: crate::requirement::types::ReferencePath(
+                requirement_path: crate::requirement::types::ReferencePath(
                     "requirements/definition".to_string(),
                 ),
-                commit: "abc".to_string(),
+                requirement_commit: "abc".to_string(),
+                test_path: crate::requirement::types::ReferencePath(
+                    "tests/generic_test".to_string(),
+                ),
+                test_commit: "abc".to_string(),
                 status: crate::result::types::StatusV1::default(),
                 attachment: None,
                 attachments: None,

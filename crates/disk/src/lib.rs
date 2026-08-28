@@ -20,5 +20,7 @@ pub use requirement::{
     load_requirement_stage, save_requirement_stage,
 };
 pub use result::{ResultDefinition, ResultOnDisk, ResultsV1, StatusV1, load_result, save_result};
-pub use test::{ResultKindV1, TestDefinition, TestOnDisk, TestV1, load_test, save_test};
+pub use test::{
+    ResultKindV1, TemplateReferenceKind, TestDefinition, TestOnDisk, TestV1, load_test, save_test,
+};
 pub use util::EntryName;

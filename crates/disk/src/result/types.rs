@@ -14,8 +14,19 @@ pub enum ResultDefinition {
 #[serde_with::skip_serializing_none]
 pub struct ResultsV1 {
     pub title: String,
-    pub path: ReferencePath,
-    pub commit: String,
+    /// Which requirement, at what commit, this result was produced
+    /// against — a fixed snapshot, not a reference expected to still match
+    /// something (unlike `LocalGitReference`).
+    pub requirement_path: ReferencePath,
+    pub requirement_commit: String,
+    /// Which test, at what commit, this result satisfies — independent of
+    /// `requirement_path`/`requirement_commit` since the requirement and
+    /// the test it references don't necessarily change together. Needed so
+    /// a higher layer can tell whether a requirement is "met": every one
+    /// of its tests has a result naming both that requirement and that
+    /// test.
+    pub test_path: ReferencePath,
+    pub test_commit: String,
     /// Required; defaults to `Incomplete` if the field is absent from an
     /// on-disk `result.ron` (e.g. a hand-authored file that hasn't recorded
     /// an outcome yet).

@@ -1,6 +1,8 @@
 ResultsV1(
     title: "Implementation",
-    path: "requirements/implementation",
-    commit: "3b4649f4c443de30700efc3215ec18f9bc9f8c0a",
+    requirement_path: "requirements/implementation",
+    requirement_commit: "3b4649f4c443de30700efc3215ec18f9bc9f8c0a",
+    test_path: "/tests/generic_inspection",
+    test_commit: "07b53180d4cdcce38d1566e3d2c690b479be1514",
     status: Incomplete,
 )

@@ -1,4 +1,8 @@
 TestV1(
     title: "Generic Inspection",
     result_kind: FreeForm,
+    template: LocalTemplateReferenceV1(
+        name: "result",
+        path: "result.typ"
+    ),
 )

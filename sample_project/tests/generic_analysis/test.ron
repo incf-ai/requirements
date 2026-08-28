@@ -5,4 +5,8 @@ TestV1(
         name: "checklist",
         path: "checklist.md"
     ),
+    template: LocalTemplateReferenceV1(
+        name: "result",
+        path: "result.typ"
+    ),
 )

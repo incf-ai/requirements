@@ -324,8 +324,10 @@ mod test {
             name: EntryName(name.to_string()),
             definition: ResultsV1 {
                 title: "Title".to_string(),
-                path: ReferencePath("requirements/definition".to_string()),
-                commit: "abc".to_string(),
+                requirement_path: ReferencePath("requirements/definition".to_string()),
+                requirement_commit: "abc".to_string(),
+                test_path: ReferencePath("tests/generic_test".to_string()),
+                test_commit: "abc".to_string(),
                 status: crate::result::types::StatusV1::default(),
                 attachment: None,
                 attachments: None,

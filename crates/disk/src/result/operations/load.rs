@@ -70,7 +70,7 @@ mod test {
         std::fs::create_dir_all(dir.join("attachments")).unwrap();
         std::fs::write(
             dir.join("result.ron"),
-            "ResultsV1(title: \"Title\", path: \"requirements/definition\", commit: \"abc\")",
+            "ResultsV1(title: \"Title\", requirement_path: \"requirements/definition\", requirement_commit: \"abc\", test_path: \"tests/generic_test\", test_commit: \"abc\")",
         )
         .unwrap();
         dir
@@ -82,7 +82,10 @@ mod test {
         let result = load_result(&StdFilesystem, &FixedGit, &dir)?;
 
         assert_eq!(result.definition.title, "Definition");
-        assert_eq!(result.definition.path.0, "requirements/definition");
+        assert_eq!(
+            result.definition.requirement_path.0,
+            "requirements/definition"
+        );
         assert!(matches!(
             result.definition.status,
             crate::result::types::StatusV1::Incomplete
@@ -113,8 +116,10 @@ mod test {
             dir.join("result.ron"),
             r#"ResultsV1(
                 title: "Title",
-                path: "requirements/definition",
-                commit: "abc",
+                requirement_path: "requirements/definition",
+                requirement_commit: "abc",
+                test_path: "tests/generic_test",
+                test_commit: "abc",
                 attachment: ModuleAttachmentReferenceV1(name: "logo.png", path: "logo.png"),
             )"#,
         )
@@ -137,8 +142,10 @@ mod test {
             dir.join("result.ron"),
             r#"ResultsV1(
                 title: "Title",
-                path: "requirements/definition",
-                commit: "abc",
+                requirement_path: "requirements/definition",
+                requirement_commit: "abc",
+                test_path: "tests/generic_test",
+                test_commit: "abc",
                 attachment: LocalAttachmentReferenceV1(name: "logo.png", path: "logo.png"),
             )"#,
         )
@@ -161,8 +168,10 @@ mod test {
             dir.join("result.ron"),
             r#"ResultsV1(
                 title: "Title",
-                path: "requirements/definition",
-                commit: "abc",
+                requirement_path: "requirements/definition",
+                requirement_commit: "abc",
+                test_path: "tests/generic_test",
+                test_commit: "abc",
                 attachment: ModuleAttachmentReferenceV1(name: "logo.png", path: "logo.png"),
                 attachments: [ModuleAttachmentReferenceV1(name: "logo.png", path: "logo.png")],
             )"#,
