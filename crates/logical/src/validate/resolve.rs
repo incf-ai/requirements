@@ -625,6 +625,31 @@ mod test {
         assert!(validate(project, &FixedRemoteGit).is_ok());
     }
 
+    #[test]
+    fn a_resolvable_remote_dependency_with_a_path_is_accepted() {
+        // Covers the `remote.path.as_ref().map(...)` closure specifically —
+        // `a_resolvable_remote_dependency_is_accepted` above only exercises
+        // `path: None`.
+        let mut project = create_project("Capstone");
+        let mut requirement = RequirementDraft::new("Definition");
+        requirement.commit = Some("c1".to_string());
+        requirement
+            .dependencies
+            .push(DependencyReferenceKind::RemoteReferenceV1(
+                RemoteGitReference {
+                    url: "https://example.com/repo.git".to_string(),
+                    path: Some(ReferencePath("some/path".to_string())),
+                    commit: "c1".to_string(),
+                },
+            ));
+        project
+            .tree
+            .add_requirement("definition", requirement)
+            .unwrap();
+
+        assert!(validate(project, &FixedRemoteGit).is_ok());
+    }
+
     struct FailingRemoteGit;
     impl RemoteGit for FailingRemoteGit {
         fn commit_for_remote(

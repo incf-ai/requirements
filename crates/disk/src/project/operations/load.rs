@@ -90,4 +90,23 @@ mod test {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_failing_module_tree_load_is_reported() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-project-load-tree-error-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.ron"), "RootV1(name: \"Demo\")").unwrap();
+        // Deliberately no `attachments/`/`templates/`/`requirements/`/etc.
+        // subdirectories — `load_module_tree` fails on the first one it
+        // looks for.
+
+        let err = load_project(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Tree(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

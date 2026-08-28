@@ -110,6 +110,20 @@ mod test {
     }
 
     #[test]
+    fn missing_attachments_dir_is_reported() {
+        let dir = valid_result_dir("missing-attachments");
+        std::fs::remove_dir(dir.join("attachments")).unwrap();
+
+        let err = load_result(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(
+            err.0,
+            ErrorKind::Attachments(crate::attachments::ReadAttachmentsError::Missing { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_lone_module_attachment_reference_is_accepted() -> Result<(), Error> {
         let dir = valid_result_dir("lone-module-attachment");
         std::fs::write(

@@ -265,6 +265,24 @@ mod test {
     }
 
     #[test]
+    fn read_attachments_propagates_an_error_from_a_nested_directory() {
+        // `read_attachments_reports_generic_io_errors_during_the_walk`
+        // above only exercises the top-level `read_dir` failing; the
+        // recursive call at the walk's `read_attachments_into(..)?` for a
+        // *nested* directory is a separate code path.
+        let dir = temp_dir("read-nested-io");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("nested"), io::ErrorKind::PermissionDenied);
+
+        let err = read_attachments(&fs, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(err, ReadAttachmentsError::Io { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn write_attachments_reports_io_errors_creating_the_directory() {
         let dir = temp_dir("write-create-dir-io");
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);

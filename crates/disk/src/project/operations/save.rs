@@ -211,4 +211,25 @@ mod test {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_failing_module_tree_save_is_reported() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-project-save-tree-error-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("attachments"),
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let err = save_project(&fs, &dir, &minimal_project()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Tree(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

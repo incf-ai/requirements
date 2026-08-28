@@ -1,8 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/syscalls", "crates/disk", "crates/logical"]
+members = ["crates/syscalls", "crates/disk", "crates/logical", "crates/cli"]
 
 [workspace.dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
 non-empty-string = "0.2.6"
 nunny = "0.2.2"
 ron = "0.12.2"

@@ -227,4 +227,55 @@ mod test {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn reports_io_errors_saving_attachments() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-attachments-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("attachments"),
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let err = save_requirement_stage(&fs, &dir, &minimal_requirement()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Attachments(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_definition_before_writing_anything() {
+        use crate::requirement::types::ReferencePath;
+        use crate::requirement::types::{LocalGitReference, TestReferenceKind};
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-invalid-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+
+        let mut requirement = minimal_requirement();
+        requirement.definition.test = Some(TestReferenceKind::TestReferenceV1(LocalGitReference {
+            path: ReferencePath("/tests/generic_test".to_string()),
+            commit: "deadbeef".to_string(),
+        }));
+        requirement.definition.tests = Some(nunny::vec![TestReferenceKind::TestReferenceV1(
+            LocalGitReference {
+                path: ReferencePath("/tests/generic_test".to_string()),
+                commit: "deadbeef".to_string(),
+            }
+        )]);
+
+        let err = save_requirement_stage(&StdFilesystem, &dir, &requirement).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Invalid(_)));
+        assert!(!dir.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

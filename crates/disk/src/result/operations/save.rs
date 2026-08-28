@@ -127,4 +127,25 @@ mod test {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn reports_io_errors_saving_attachments() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-result-save-attachments-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("attachments"),
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let err = save_result(&fs, &dir, &minimal_result()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Attachments(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

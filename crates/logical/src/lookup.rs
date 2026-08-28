@@ -109,4 +109,14 @@ mod test {
         let target = LogicalPath::root(EntryName("nonexistent".to_string()));
         assert!(get_test(&root, &target).is_none());
     }
+
+    #[test]
+    fn returns_none_for_a_test_in_a_missing_module() {
+        let root = sample_tree();
+        let target = LogicalPath {
+            modules: vec![EntryName("nonexistent".to_string())],
+            name: EntryName("generic_test".to_string()),
+        };
+        assert!(get_test(&root, &target).is_none());
+    }
 }

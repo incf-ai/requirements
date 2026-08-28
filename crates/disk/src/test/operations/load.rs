@@ -344,6 +344,20 @@ mod test {
     }
 
     #[test]
+    fn missing_attachments_dir_is_reported() {
+        let dir = valid_test_dir("missing-attachments");
+        std::fs::remove_dir(dir.join("attachments")).unwrap();
+
+        let err = load_test(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(
+            err.0,
+            ErrorKind::Attachments(ReadAttachmentsError::Missing { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn missing_template_dir_is_reported() {
         let dir = valid_test_dir("missing-template");
         std::fs::remove_dir(dir.join("template")).unwrap();
