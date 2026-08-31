@@ -1,0 +1,34 @@
+[package]
+name = "gui-ui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "gui"
+path = "src/main.rs"
+
+[features]
+# On by default, but every use of it is additionally gated on
+# `debug_assertions` (see `view.rs`/`lib.rs`) — so it's compiled in for a
+# normal `cargo build`/`cargo run` (dev profile) without needing to
+# remember the flag, but still compiled out of a `--release` build even
+# if this default feature stays enabled there. The stall/failure triggers
+# it adds are actively harmful in a real user's hands, not just clutter,
+# so it must never be on by accident in a release build; `--no-default-
+# features` also disables it outright regardless of profile.
+default = ["debug-panel"]
+debug-panel = []
+
+[dependencies]
+gui-core = { path = "../gui-core" }
+eframe = { workspace = true }
+egui = { workspace = true }
+rfd = { workspace = true }
+ron = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+accesskit = "0.24.1"
+egui_kittest = { version = "0.36.1", features = ["eframe"] }
+syscalls = { path = "../syscalls" }

@@ -1,15 +1,26 @@
 [workspace]
 resolver = "3"
-members = ["crates/syscalls", "crates/disk", "crates/logical", "crates/cli"]
+members = [
+    "crates/syscalls",
+    "crates/disk",
+    "crates/logical",
+    "crates/cli",
+    "crates/gui-core",
+    "crates/gui-ui",
+]
 
 [workspace.dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
+eframe = "0.36.1"
+egui = "0.36.1"
 non-empty-string = "0.2.6"
 nunny = "0.2.2"
+rfd = "0.15"
 ron = "0.12.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_with = "3.22.0"
 thiserror = "2.0.17"
+tokio = "1.53.1"
 
 [package]
 name = "requirements"

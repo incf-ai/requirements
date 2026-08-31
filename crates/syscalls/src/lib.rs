@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -123,6 +124,60 @@ impl<F: Filesystem> Filesystem for FaultInjectingFilesystem<F> {
         if let Some(err) = self.fault(path) {
             return Err(err);
         }
+        self.inner.create_dir_all(path)
+    }
+}
+
+/// Wraps another `Filesystem`, sleeping `delay` before every *mutating*
+/// call (`write`/`create_dir_all`) — letting tests make a real save
+/// artificially slow instead of racing however fast the real filesystem
+/// happens to be, without also slowing down reads (so loading a project
+/// through this wrapper stays fast; only saving one is affected). Real
+/// filesystem operations against a small project are often fast enough
+/// (sub-millisecond, no network or subprocess involved, unlike `Git`) to
+/// win a race against a deliberately short test timeout, which otherwise
+/// makes a "still in progress" state impossible to observe reliably —
+/// see `gui-ui`'s exit-dialog Saving/TimedOut tests.
+#[derive(Debug, Clone, Copy)]
+pub struct SlowFilesystem<F> {
+    inner: F,
+    delay: Duration,
+}
+
+impl<F: Filesystem> SlowFilesystem<F> {
+    pub fn new(inner: F, delay: Duration) -> Self {
+        Self { inner, delay }
+    }
+}
+
+impl<F: Filesystem> Filesystem for SlowFilesystem<F> {
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        self.inner.read_to_string(path)
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        self.inner.read_dir(path)
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        self.inner.is_dir(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+
+    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        std::thread::sleep(self.delay);
+        self.inner.write(path, contents)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        std::thread::sleep(self.delay);
         self.inner.create_dir_all(path)
     }
 }
@@ -426,6 +481,36 @@ mod tests {
         assert_eq!(fs.read(&file).unwrap(), b"hello");
         assert!(fs.exists(&file));
         assert!(fs.is_dir(&dir));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn slow_filesystem_delays_writes_but_not_reads() {
+        let dir = std::env::temp_dir().join(format!("syscalls-slow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+
+        let fs = SlowFilesystem::new(StdFilesystem, Duration::from_millis(50));
+
+        let before_write = std::time::Instant::now();
+        fs.write(&file, b"hello").unwrap();
+        assert!(before_write.elapsed() >= Duration::from_millis(50));
+
+        let before_read = std::time::Instant::now();
+        assert_eq!(fs.read_to_string(&file).unwrap(), "hello");
+        assert!(before_read.elapsed() < Duration::from_millis(50));
+
+        assert!(fs.exists(&file));
+        assert!(fs.is_dir(&dir));
+        assert_eq!(fs.read(&file).unwrap(), b"hello");
+        assert_eq!(fs.read_dir(&dir).unwrap(), vec![file.clone()]);
+
+        let subdir = dir.join("nested");
+        let before_create = std::time::Instant::now();
+        fs.create_dir_all(&subdir).unwrap();
+        assert!(before_create.elapsed() >= Duration::from_millis(50));
+        assert!(fs.is_dir(&subdir));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,0 +1,7 @@
+GuiConfig(
+    save_on_exit_timeout: Duration(
+        secs: 15,
+        nanos: 0,
+    ),
+    zoom_percent: 130,
+)

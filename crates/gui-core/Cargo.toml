@@ -1,0 +1,11 @@
+[package]
+name = "gui-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+disk = { path = "../disk" }
+logical = { path = "../logical" }
+syscalls = { path = "../syscalls" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
