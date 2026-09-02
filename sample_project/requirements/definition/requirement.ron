@@ -2,10 +2,15 @@ RequirementDefinitionV1(
     title: "Definition",
     test: TestReferenceV1(
         path: "/tests/generic_inspection",
-        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514"
+        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514",
     ),
+    tests: None,
     dependency: RequirementReferenceV1(
         path: "requirements/discovery",
-        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514"
+        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514",
     ),
+    dependencies: None,
+    attachment: None,
+    attachments: None,
+    include_attachments_in_commit: true,
 )

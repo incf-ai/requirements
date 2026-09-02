@@ -1,14 +1,19 @@
 TestV1(
     title: "Example Review",
     result_kind: FreeForm,
+    attachment: None,
+    attachments: None,
+    template: None,
     templates: [
         LocalTemplateReferenceV1(
             name: "checklist",
-            path: "review-checklist.typ"
+            path: "review-checklist.typ",
         ),
         ModuleTemplateReferenceV1(
             name: "summary",
-            path: "example-summary.txt"
+            path: "example-summary.txt",
         ),
     ],
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
 )

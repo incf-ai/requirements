@@ -1,14 +1,19 @@
 TestV1(
     title: "Generic Demonstration",
     result_kind: FreeForm,
+    attachment: None,
+    attachments: None,
+    template: None,
     templates: [
         LocalTemplateReferenceV1(
             name: "result",
-            path: "result.typ"
+            path: "result.typ",
         ),
         LocalTemplateReferenceV1(
             name: "notes",
-            path: "notes.md"
+            path: "notes.md",
         ),
     ],
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
 )

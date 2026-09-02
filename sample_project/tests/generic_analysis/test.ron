@@ -3,10 +3,14 @@ TestV1(
     result_kind: FreeForm,
     attachment: LocalAttachmentReferenceV1(
         name: "checklist",
-        path: "checklist.md"
+        path: "checklist.md",
     ),
+    attachments: None,
     template: LocalTemplateReferenceV1(
         name: "result",
-        path: "result.typ"
+        path: "result.typ",
     ),
+    templates: None,
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
 )

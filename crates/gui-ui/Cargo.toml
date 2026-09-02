@@ -23,6 +23,10 @@ debug-panel = []
 gui-core = { path = "../gui-core" }
 eframe = { workspace = true }
 egui = { workspace = true }
+# Only used for its glyph-name constants and `Variant::font_bytes()` — its
+# own `add_to_fonts`/`Variant::font_data()` helpers pin an incompatible
+# egui version (0.35) and so aren't usable directly; see `fonts.rs`.
+egui-phosphor = { version = "0.13", default-features = false, features = ["regular"] }
 rfd = { workspace = true }
 ron = { workspace = true }
 serde = { workspace = true }
@@ -31,4 +35,9 @@ thiserror = { workspace = true }
 [dev-dependencies]
 accesskit = "0.24.1"
 egui_kittest = { version = "0.36.1", features = ["eframe"] }
+# For the randomized nav_history test only — always seeded, never system
+# randomness, so runs stay reproducible. Already resolved in Cargo.lock at
+# this version via `rfd`'s own `ashpd` dependency, so this adds no new
+# download/version risk.
+rand = "0.9"
 syscalls = { path = "../syscalls" }

@@ -5,14 +5,15 @@ ResultsV1(
     test_path: "/tests/generic_inspection",
     test_commit: "07b53180d4cdcce38d1566e3d2c690b479be1514",
     status: Incomplete,
+    attachment: None,
     attachments: [
         ModuleAttachmentReferenceV1(
             name: "glossary",
-            path: "glossary.md"
+            path: "glossary.md",
         ),
         LocalAttachmentReferenceV1(
             name: "evidence",
-            path: "evidence.txt"
+            path: "evidence.txt",
         ),
     ],
 )

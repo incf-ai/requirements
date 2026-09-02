@@ -2,10 +2,15 @@ RequirementDefinitionV1(
     title: "Verification",
     test: TestReferenceV1(
         path: "/tests/generic_inspection",
-        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514"
+        commit: "4556735c20db4c7390a66aa5266cedad27ea8a67",
     ),
+    tests: None,
     dependency: RequirementReferenceV1(
         path: "requirements/validation",
-        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514"
+        commit: "07b53180d4cdcce38d1566e3d2c690b479be1514",
     ),
+    dependencies: None,
+    attachment: None,
+    attachments: None,
+    include_attachments_in_commit: true,
 )

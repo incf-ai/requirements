@@ -4,4 +4,5 @@ GuiConfig(
         nanos: 0,
     ),
     zoom_percent: 130,
+    theme: Dark,
 )

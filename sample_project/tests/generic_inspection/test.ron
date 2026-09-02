@@ -1,8 +1,13 @@
 TestV1(
     title: "Generic Inspection",
     result_kind: FreeForm,
+    attachment: None,
+    attachments: None,
     template: LocalTemplateReferenceV1(
         name: "result",
-        path: "result.typ"
+        path: "result.typ",
     ),
+    templates: None,
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
 )

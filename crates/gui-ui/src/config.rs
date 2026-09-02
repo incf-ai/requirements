@@ -18,6 +18,10 @@ pub struct GuiConfig {
     /// `egui::Context::set_zoom_factor`'s `f32` only happens at the one
     /// point that needs it, in `GuiApp::ui`.
     pub zoom_percent: u32,
+    /// The status bar's theme selector — see `ThemeChoice`'s own doc
+    /// comment on why this is `gui-ui`'s own type rather than
+    /// `egui::ThemePreference` directly.
+    pub theme: ThemeChoice,
 }
 
 impl Default for GuiConfig {
@@ -25,6 +29,47 @@ impl Default for GuiConfig {
         GuiConfig {
             save_on_exit_timeout: Duration::from_secs(15),
             zoom_percent: 100,
+            theme: ThemeChoice::default(),
+        }
+    }
+}
+
+/// Light, Dark, or follow the OS ("System") — the status bar's theme
+/// selector. A local copy of `egui::ThemePreference`'s three variants
+/// rather than that type itself: persisting it directly would need
+/// enabling egui's `serde` feature crate-wide (pulling in `accesskit/serde`
+/// and `epaint/serde` too) just for this one config field, where a small
+/// mirrored enum plus a one-line `From` conversion (see below) costs
+/// nothing extra — `gui-ui` already depends on `serde` for `GuiConfig`
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ThemeChoice {
+    Light,
+    Dark,
+    #[default]
+    System,
+}
+
+impl ThemeChoice {
+    /// Every choice, in the order the status bar's selector lists them.
+    pub const ALL: [ThemeChoice; 3] = [ThemeChoice::Light, ThemeChoice::Dark, ThemeChoice::System];
+
+    /// The label the status bar's selector shows for this choice.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::Light => "Light",
+            ThemeChoice::Dark => "Dark",
+            ThemeChoice::System => "System",
+        }
+    }
+}
+
+impl From<ThemeChoice> for egui::ThemePreference {
+    fn from(choice: ThemeChoice) -> egui::ThemePreference {
+        match choice {
+            ThemeChoice::Light => egui::ThemePreference::Light,
+            ThemeChoice::Dark => egui::ThemePreference::Dark,
+            ThemeChoice::System => egui::ThemePreference::System,
         }
     }
 }
@@ -103,6 +148,7 @@ mod test {
         let (config, error) = GuiConfig::load(Path::new("/nonexistent/gui-config.ron"));
         assert_eq!(config.save_on_exit_timeout, Duration::from_secs(15));
         assert_eq!(config.zoom_percent, 100);
+        assert_eq!(config.theme, ThemeChoice::System);
         assert!(error.is_none());
     }
 
@@ -157,6 +203,7 @@ mod test {
         let config = GuiConfig {
             save_on_exit_timeout: Duration::from_secs(30),
             zoom_percent: 150,
+            theme: ThemeChoice::Dark,
         };
         config.save(&path).unwrap();
 
@@ -164,6 +211,7 @@ mod test {
         assert!(error.is_none());
         assert_eq!(loaded.save_on_exit_timeout, Duration::from_secs(30));
         assert_eq!(loaded.zoom_percent, 150);
+        assert_eq!(loaded.theme, ThemeChoice::Dark);
 
         std::fs::remove_dir_all(&dir).ok();
     }

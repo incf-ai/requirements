@@ -5,9 +5,16 @@
 
 use std::path::PathBuf;
 
-use gui_core::{EntryKind, EntryName, EntryStatus, LogicalPath, ResultKindV1, TreeNode, TreeSnapshot};
+use gui_core::{
+    EntryKind, EntryName, EntryStatus, LogicalPath, ReferencePath, RequirementMetStatus, ResultKindV1,
+    TestUnmetReason, TreeNode, TreeSnapshot, UnmetReason,
+};
 
-use crate::{DependencyDraft, EditorState, ExitDialogState, GuiApp, LocalPoolKind, PendingNavigation, PendingProjectAction};
+use crate::{
+    AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp, LocalPoolKind,
+    PathPickerTarget, PendingNavigation, PendingProjectAction, ThemeChoice, absolute_reference_path,
+    flatten_leaf_paths, icons, leaf_kind_segment, theme_colors,
+};
 
 /// Pops a native OS folder picker (`rfd`) titled `title` — blocking, but
 /// bounded by the user's own interaction with it, not by anything
@@ -17,6 +24,113 @@ use crate::{DependencyDraft, EditorState, ExitDialogState, GuiApp, LocalPoolKind
 /// confirmed-after-unsaved-changes resume path (`render_unsaved_changes_dialog`).
 fn pick_project_folder(title: &str) -> Option<PathBuf> {
     rfd::FileDialog::new().set_title(title).pick_folder()
+}
+
+/// An icon-only action button for the toolbar/menu bar — `icon` is what's
+/// actually drawn, but `label` (shown as a hover tooltip) is also forced
+/// in as the button's own accessible name via `widget_info`, overriding
+/// what egui would otherwise derive from the icon glyph itself. That's
+/// what lets these go icon-only without also rewriting every existing
+/// `tests/interaction.rs` lookup that finds a toolbar/menu button by its
+/// old exact text (e.g. `Role::Button, "New Requirement"`) — from the
+/// accessibility tree's perspective, and so from these tests' perspective,
+/// nothing about the button's identity changed, only how it's drawn.
+fn icon_button(ui: &mut egui::Ui, enabled: bool, icon: &str, label: &str) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new(icon)).on_hover_text(label);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response
+}
+
+/// The menu bar's own flavor of `icon_button` — a dropdown menu is read as
+/// a list of text, where an icon-only item would be far less scannable
+/// than the toolbar's icon-only buttons (which get room to spread out and
+/// a hover tooltip to fall back on); this keeps `label` visible alongside
+/// its icon instead of hiding it behind a tooltip. Still overrides the
+/// accessible name back to the bare `label` (same reasoning as
+/// `icon_button`) — egui would otherwise fold the icon glyph into the
+/// concatenated accessible text too, which'd break exact-match lookups on
+/// these items in `tests/interaction.rs` just the same as an icon-only
+/// button would.
+fn icon_text_button(ui: &mut egui::Ui, enabled: bool, icon: &str, label: &str) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new((icon, label)));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response
+}
+
+/// A requirement's own Status row — the icon/color-chip pair (reusing
+/// `icons::status_icon`/`theme_colors::status_colors`, same as the tree's
+/// own status glyph — see `render_leaf` — for visual consistency between
+/// the two) plus a plain-text label, and, if `Unmet`, a bulleted line per
+/// reason it isn't. Free function, not a method: called from inside
+/// `render_requirement_form`'s own `&mut self.editor` borrow, where
+/// calling back out to a `&self`/`&mut self` method isn't available (same
+/// reason `render_dependency_fields` etc. are free functions too).
+fn render_requirement_status(ui: &mut egui::Ui, status: &RequirementMetStatus) {
+    let (entry_status, label) = match status {
+        RequirementMetStatus::Unvalidated => (EntryStatus::Unvalidated, "Unvalidated"),
+        RequirementMetStatus::Met => (EntryStatus::Met, "Met"),
+        RequirementMetStatus::Unmet(_) => (EntryStatus::Unmet, "Unmet"),
+    };
+    let (fg, bg) = theme_colors::status_colors(ui.visuals().dark_mode, entry_status);
+    ui.horizontal(|ui| {
+        ui.label("Status:");
+        ui.label(egui::RichText::new(icons::status_icon(entry_status)).color(fg).background_color(bg));
+        ui.label(label);
+    });
+    if let RequirementMetStatus::Unmet(reason) = status {
+        for line in describe_unmet_reason(reason) {
+            ui.label(format!("• {line}"));
+        }
+    }
+}
+
+/// Human-readable lines explaining an `UnmetReason` — one line for
+/// `UnknownRequirement`/`NoTests`/`NotYetSaved`, one per unsatisfied test
+/// for `UnsatisfiedTests`. Display-formatting for `logical`/`gui-core`
+/// data lives here in `gui-ui`, not those crates — same convention
+/// `DependencyDraft`'s own `Display` impl (`forms.rs`) already follows.
+fn describe_unmet_reason(reason: &UnmetReason) -> Vec<String> {
+    match reason {
+        UnmetReason::UnknownRequirement => vec!["This requirement could not be found.".to_string()],
+        UnmetReason::NoTests => vec!["It has no tests.".to_string()],
+        UnmetReason::NotYetSaved => {
+            vec!["It hasn't been saved yet, so there's no known commit to check.".to_string()]
+        }
+        UnmetReason::UnsatisfiedTests(tests) => tests
+            .iter()
+            .map(|unsatisfied| {
+                let why = match unsatisfied.reason {
+                    TestUnmetReason::UnresolvedReference => "its reference doesn't resolve to a real test",
+                    TestUnmetReason::TestNotYetSaved => "the test hasn't been saved yet",
+                    TestUnmetReason::StaleReference => "its reference is stale (pointing at an old commit of the test)",
+                    TestUnmetReason::NoPassingResult => "no current, passing result exists for it",
+                };
+                format!("Test \"{}\": {why}.", unsatisfied.test)
+            })
+            .collect(),
+    }
+}
+
+/// Whether the requirement viewer's "Update Stale References" button
+/// should show at all — `true` only when `status` actually names at least
+/// one `TestUnmetReason::StaleReference`. Every other `UnmetReason` (no
+/// tests, never saved, an unresolved reference, no passing result) isn't
+/// something this button can fix — there's no "current commit" to point a
+/// missing/unresolved reference at, and a merely-unsatisfied-by-results
+/// reference isn't stale at all.
+fn has_stale_test_reference(status: &RequirementMetStatus) -> bool {
+    matches!(
+        status,
+        RequirementMetStatus::Unmet(UnmetReason::UnsatisfiedTests(tests))
+            if tests.iter().any(|t| t.reason == TestUnmetReason::StaleReference)
+    )
+}
+
+/// `count / total` as a percentage, `0.0` for an empty `total` rather than
+/// dividing by zero — the module/project page's Pass/Fail/Incomplete and
+/// "Requirements met" lines all go through this.
+fn percentage(count: usize, total: usize) -> f64 {
+    if total == 0 { 0.0 } else { (count as f64 / total as f64) * 100.0 }
 }
 
 impl GuiApp {
@@ -47,7 +161,7 @@ impl GuiApp {
                     // unsaved-changes prompt instead of proceeding
                     // directly when there's something to lose. See
                     // `PendingProjectAction`'s own doc comment.
-                    if ui.button("New Project…").clicked() {
+                    if icon_text_button(ui, true, icons::NEW_PROJECT, "New Project…").clicked() {
                         if self.dirty {
                             self.unsaved_changes_dialog_opened(PendingProjectAction::NewProject);
                         } else {
@@ -55,7 +169,7 @@ impl GuiApp {
                         }
                         ui.close();
                     }
-                    if ui.button("Open Project…").clicked() {
+                    if icon_text_button(ui, true, icons::OPEN_PROJECT, "Open Project…").clicked() {
                         if self.dirty {
                             self.unsaved_changes_dialog_opened(PendingProjectAction::OpenProject);
                         } else if let Some(path) = pick_project_folder("Open Project") {
@@ -88,18 +202,18 @@ impl GuiApp {
                     // ever come back `Outcome::NoProjectLoaded`, which
                     // gui-ui doesn't surface anywhere; better to not
                     // offer the click at all than silently swallow it.
-                    if ui.add_enabled(has_project, egui::Button::new("Save")).clicked() {
+                    if icon_text_button(ui, has_project, icons::SAVE, "Save").clicked() {
                         self.save_button_clicked();
                         ui.close();
                     }
-                    if ui.add_enabled(has_project, egui::Button::new("Save As…")).clicked() {
+                    if icon_text_button(ui, has_project, icons::SAVE_AS, "Save As…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().set_title("Save Project As").pick_folder() {
                             self.save_project_as(path);
                         }
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Exit").clicked() {
+                    if icon_text_button(ui, true, icons::EXIT, "Exit").clicked() {
                         self.on_exit_clicked();
                         ui.close();
                     }
@@ -118,8 +232,8 @@ impl GuiApp {
                 // why.
                 #[cfg(all(feature = "debug-panel", debug_assertions))]
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if self.debug.open { "Debug ▲" } else { "Debug ▼" };
-                    if ui.button(label).clicked() {
+                    let icon = if self.debug.open { icons::DEBUG_PANEL_OPEN } else { icons::DEBUG_PANEL_CLOSED };
+                    if icon_text_button(ui, true, icon, "Debug").clicked() {
                         self.debug_panel_button_clicked();
                     }
                 });
@@ -141,11 +255,14 @@ impl GuiApp {
             // failing after these buttons were added, not by inspection.
             ui.horizontal_wrapped(|ui| {
                 // Disabled with nothing loaded — same reasoning as the
-                // File menu's own Save item, see `render_menu_bar`.
-                if ui.add_enabled(self.tree.is_some(), egui::Button::new("Save")).clicked() {
+                // File menu's own Save item, see `render_menu_bar`. Icon-
+                // only (unlike the File menu's own items) — see
+                // `icon_button`'s own doc comment on why the toolbar and
+                // menu bar each get a different flavor of icon button.
+                if icon_button(ui, self.tree.is_some(), icons::SAVE, "Save").clicked() {
                     self.save_button_clicked();
                 }
-                if ui.button("Validate").clicked() {
+                if icon_button(ui, true, icons::VALIDATE, "Validate").clicked() {
                     self.validate_clicked();
                 }
                 ui.separator();
@@ -155,11 +272,11 @@ impl GuiApp {
                 // disabled with nothing loaded at all, same as every
                 // button here that needs a real project underneath it.
                 let can_undo = self.tree.as_ref().is_some_and(|tree| tree.can_undo);
-                if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+                if icon_button(ui, can_undo, icons::UNDO, "Undo").clicked() {
                     self.undo_clicked();
                 }
                 let can_redo = self.tree.as_ref().is_some_and(|tree| tree.can_redo);
-                if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+                if icon_button(ui, can_redo, icons::REDO, "Redo").clicked() {
                     self.redo_clicked();
                 }
                 ui.separator();
@@ -174,14 +291,14 @@ impl GuiApp {
                 // `PendingNavigation`'s own doc comment; Exit is
                 // deliberately excluded, it has its own separate
                 // `self.dirty`-driven prompt, see "Exit").
-                if ui.add_enabled(self.can_go_back(), egui::Button::new("Back")).clicked() {
+                if icon_button(ui, self.can_go_back(), icons::BACK, "Back").clicked() {
                     if self.editor_has_unsaved_edits() {
                         self.unsaved_form_dialog_opened(PendingNavigation::Back);
                     } else {
                         self.back_clicked();
                     }
                 }
-                if ui.add_enabled(self.can_go_forward(), egui::Button::new("Forward")).clicked() {
+                if icon_button(ui, self.can_go_forward(), icons::FORWARD, "Forward").clicked() {
                     if self.editor_has_unsaved_edits() {
                         self.unsaved_form_dialog_opened(PendingNavigation::Forward);
                     } else {
@@ -189,32 +306,28 @@ impl GuiApp {
                     }
                 }
                 ui.separator();
-                if ui.button("Exit").clicked() {
-                    self.on_exit_clicked();
-                }
-                ui.separator();
-                if ui.button("New Requirement").clicked() {
+                if icon_button(ui, true, icons::NEW_REQUIREMENT, "New Requirement").clicked() {
                     if self.editor_has_unsaved_edits() {
                         self.unsaved_form_dialog_opened(PendingNavigation::NewRequirement);
                     } else {
                         self.new_requirement_clicked();
                     }
                 }
-                if ui.button("New Test").clicked() {
+                if icon_button(ui, true, icons::NEW_TEST, "New Test").clicked() {
                     if self.editor_has_unsaved_edits() {
                         self.unsaved_form_dialog_opened(PendingNavigation::NewTest);
                     } else {
                         self.new_test_clicked();
                     }
                 }
-                if ui.button("New Result").clicked() {
+                if icon_button(ui, true, icons::NEW_RESULT, "New Result").clicked() {
                     if self.editor_has_unsaved_edits() {
                         self.unsaved_form_dialog_opened(PendingNavigation::NewResult);
                     } else {
                         self.new_result_clicked();
                     }
                 }
-                if ui.button("New Module").clicked() {
+                if icon_button(ui, true, icons::NEW_MODULE, "New Module").clicked() {
                     if self.editor_has_unsaved_edits() {
                         self.unsaved_form_dialog_opened(PendingNavigation::NewModule);
                     } else {
@@ -222,7 +335,7 @@ impl GuiApp {
                     }
                 }
                 ui.separator();
-                if ui.button("Attachments…").clicked() {
+                if icon_button(ui, true, icons::ATTACHMENTS, "Attachments…").clicked() {
                     self.attachments_dialog_opened();
                 }
             });
@@ -235,7 +348,7 @@ impl GuiApp {
                 if self.tree.is_none() {
                     ui.label("No project loaded");
                 } else if self.dirty {
-                    ui.label("● unsaved changes");
+                    ui.label(format!("{} unsaved changes", icons::UNSAVED));
                 } else {
                     ui.label("saved");
                 }
@@ -257,14 +370,17 @@ impl GuiApp {
                 // TODO: project path, last validation outcome, once
                 // Event::ValidationFailed is surfaced into self.status.
 
-                // Zoom controls, pinned to the status bar's far right —
-                // added in reverse (`+` first) since `right_to_left`
-                // places each new widget further left of the last,
-                // starting from the right edge; this order reads
-                // "Reset − [value]% +" left-to-right, `+`/`−` bracketing
-                // the editable value per the usual zoom-control
-                // convention, Reset furthest left since it's the least
-                // frequently used of the four.
+                // Zoom controls (plus the theme selector, to their left),
+                // pinned to the status bar's far right — added in reverse
+                // (`+` first) since `right_to_left` places each new widget
+                // further left of the last, starting from the right edge;
+                // this order reads "[theme] Reset − [value]% +" left-to-
+                // right, `+`/`−` bracketing the editable value per the
+                // usual zoom-control convention, Reset furthest left of
+                // the zoom group since it's the least frequently used of
+                // the four, and the theme selector coded last so it lands
+                // furthest left of all — one more click to reach than
+                // zoom, matching how rarely it's touched.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("+").clicked() {
                         self.zoom_in_clicked();
@@ -285,6 +401,20 @@ impl GuiApp {
                     }
                     if ui.button("Reset").clicked() {
                         self.zoom_reset_clicked();
+                    }
+
+                    let mut selected_theme = None;
+                    egui::ComboBox::from_id_salt("theme_selector")
+                        .selected_text(self.config.theme.label())
+                        .show_ui(ui, |ui| {
+                            for choice in ThemeChoice::ALL {
+                                if ui.selectable_label(self.config.theme == choice, choice.label()).clicked() {
+                                    selected_theme = Some(choice);
+                                }
+                            }
+                        });
+                    if let Some(theme) = selected_theme {
+                        self.theme_selected(theme);
                     }
                 });
             });
@@ -328,7 +458,20 @@ impl GuiApp {
                     self.tree_filter.clear();
                 }
             });
+            ui.horizontal(|ui| {
+                if ui.button("Expand All").clicked() {
+                    self.tree_force_open = Some(true);
+                }
+                if ui.button("Collapse All").clicked() {
+                    self.tree_force_open = Some(false);
+                }
+            });
             ui.separator();
+
+            // Consumed here rather than left in `self` past this frame —
+            // see `tree_force_open`'s own doc comment on why it's a
+            // one-frame signal, not a persistent setting.
+            let force_open = self.tree_force_open.take();
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match &self.tree {
                 None => {
@@ -346,13 +489,17 @@ impl GuiApp {
                     // which pushes `node.name` for every module it handles.
                     let is_root_current = self.selected_module.is_empty();
                     ui.horizontal(|ui| {
-                        let glyph = if is_root_current { "◉" } else { "○" };
-                        if ui.small_button(glyph).on_hover_text("Set as current module").clicked() {
+                        let glyph = if is_root_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
+                        let mut text = egui::RichText::new(glyph);
+                        if is_root_current {
+                            text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
+                        }
+                        if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked() {
                             self.select_module(Vec::new());
                         }
                         ui.strong(root.name.as_str());
                     });
-                    render_module_children(self, ui, &root.children, &[]);
+                    render_module_children(self, ui, &root.children, &[], force_open);
                 }
             });
         });
@@ -371,6 +518,7 @@ impl GuiApp {
             NewTest,
             NewResult,
             NewModule,
+            ExistingModule,
         }
         let pane = match &self.editor {
             EditorState::None => Pane::Empty,
@@ -378,6 +526,7 @@ impl GuiApp {
             EditorState::NewTest(_) => Pane::NewTest,
             EditorState::NewResult(_) => Pane::NewResult,
             EditorState::NewModule(_) => Pane::NewModule,
+            EditorState::ExistingModule(_) => Pane::ExistingModule,
         };
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -409,6 +558,7 @@ impl GuiApp {
                 Pane::NewTest => self.render_test_form(ui),
                 Pane::NewResult => self.render_result_form(ui),
                 Pane::NewModule => self.render_module_form(ui),
+                Pane::ExistingModule => self.render_module_page(ui),
             });
         });
     }
@@ -426,6 +576,9 @@ impl GuiApp {
         let mut edit_clicked = false;
         let mut add_attachment_clicked = false;
         let mut remove_attachment: Option<PathBuf> = None;
+        let mut auto_commit_clicked: Option<(DependencySlot, AutoCommitKind)> = None;
+        let mut pick_dependency_path_clicked: Option<DependencySlot> = None;
+        let mut refresh_stale_test_references_clicked = false;
         {
             let EditorState::NewRequirement(form) = &mut self.editor else {
                 return;
@@ -440,6 +593,17 @@ impl GuiApp {
                 if read_only {
                     if ui.button("Edit").clicked() {
                         edit_clicked = true;
+                    }
+                    // Only when there's actually something for it to fix
+                    // — see `has_stale_test_reference`'s own doc comment.
+                    if has_stale_test_reference(&form.met_status) {
+                        let busy = form.pending_request.is_some();
+                        if ui
+                            .add_enabled(!busy, egui::Button::new((icons::UPDATE_STALE_REFERENCES, "Update Stale References")))
+                            .clicked()
+                        {
+                            refresh_stale_test_references_clicked = true;
+                        }
                     }
                 } else {
                     // Pinned next to the heading, not just at the
@@ -473,6 +637,14 @@ impl GuiApp {
                     }
                 }
             });
+            // Never editable, so it lives outside the read_only/editable
+            // split below — but only meaningful once something's actually
+            // been saved to check `met_status` against (a create-mode
+            // form's `met_status` is always its own `Default`,
+            // `Unvalidated`, which would just be noise to show here).
+            if editing {
+                render_requirement_status(ui, &form.met_status);
+            }
             if read_only {
                 ui.horizontal(|ui| {
                     ui.label("Title:");
@@ -527,7 +699,14 @@ impl GuiApp {
                             remove_dependency = Some(i);
                         }
                     });
-                    dependency_edited |= render_dependency_fields(ui, dep);
+                    let (changed, auto, pick_clicked) = render_dependency_fields(ui, dep, self.tree.as_ref());
+                    dependency_edited |= changed;
+                    if let Some(kind) = auto {
+                        auto_commit_clicked = Some((DependencySlot::Existing(i), kind));
+                    }
+                    if pick_clicked {
+                        pick_dependency_path_clicked = Some(DependencySlot::Existing(i));
+                    }
                 }
             }
             if let Some(i) = remove_dependency {
@@ -536,6 +715,9 @@ impl GuiApp {
             }
             if dependency_edited {
                 form.edited = true;
+            }
+            if let Some(error) = &form.commit_fetch_error {
+                ui.colored_label(egui::Color32::RED, error);
             }
             if !read_only {
                 ui.label("Add dependency:");
@@ -547,7 +729,13 @@ impl GuiApp {
                     // row loop above).
                     render_dependency_kind_picker(ui, &mut form.new_dependency);
                 });
-                render_dependency_fields(ui, &mut form.new_dependency);
+                let (_, auto, pick_clicked) = render_dependency_fields(ui, &mut form.new_dependency, self.tree.as_ref());
+                if let Some(kind) = auto {
+                    auto_commit_clicked = Some((DependencySlot::New, kind));
+                }
+                if pick_clicked {
+                    pick_dependency_path_clicked = Some(DependencySlot::New);
+                }
                 if ui.button("Add dependency").clicked() {
                     form.dependencies.push(form.new_dependency.clone());
                     form.new_dependency = DependencyDraft::default();
@@ -598,6 +786,15 @@ impl GuiApp {
             self.local_attachment_add_clicked(LocalPoolKind::RequirementAttachment);
         } else if let Some(path) = remove_attachment {
             self.local_attachment_remove_clicked(LocalPoolKind::RequirementAttachment, path);
+        }
+        if let Some((target, kind)) = auto_commit_clicked {
+            self.dependency_commit_auto_clicked(target, kind);
+        }
+        if let Some(slot) = pick_dependency_path_clicked {
+            self.path_picker_dialog_opened(PathPickerTarget::Dependency(slot));
+        }
+        if refresh_stale_test_references_clicked {
+            self.refresh_stale_test_references_clicked();
         }
     }
 
@@ -759,6 +956,7 @@ impl GuiApp {
         let mut edit_clicked = false;
         let mut add_attachment_clicked = false;
         let mut remove_attachment: Option<PathBuf> = None;
+        let mut open_picker: Option<PathPickerTarget> = None;
         {
             let EditorState::NewResult(form) = &mut self.editor else {
                 return;
@@ -829,25 +1027,18 @@ impl GuiApp {
                     // A picker, not a replacement for the field above —
                     // typing the path by hand still works (e.g. pasting
                     // one, or for when the target hasn't loaded into
-                    // `self.tree` yet). Selecting an entry here just
-                    // fills the same field with the correctly-formatted
-                    // absolute reference path, so the user doesn't have
-                    // to know `logical`'s
-                    // `/[modules/<sub>/]*requirements/<name>` syntax by
-                    // heart.
-                    if let Some(tree) = &self.tree {
-                        egui::ComboBox::from_id_salt("pick_requirement_path")
-                            .selected_text("Pick…")
-                            .show_ui(ui, |ui| {
-                                for target in flatten_leaf_paths(tree, EntryKind::Requirement) {
-                                    let path_str = absolute_reference_path(&target, "requirements");
-                                    let selected = form.requirement_path == path_str;
-                                    if ui.selectable_label(selected, target.to_string()).clicked() {
-                                        form.requirement_path = path_str;
-                                        form.edited = true;
-                                    }
-                                }
-                            });
+                    // `self.tree` yet). Opens the shared path-picker modal
+                    // (`GuiApp::path_picker_dialog`) rather than an inline
+                    // `ComboBox` — a project with enough requirements
+                    // would otherwise overflow a `ComboBox` popup right
+                    // off the screen, with no way to search it down to
+                    // the one wanted. Selecting an entry there fills this
+                    // same field with the correctly-formatted absolute
+                    // reference path, so the user doesn't have to know
+                    // `logical`'s `/[modules/<sub>/]*requirements/<name>`
+                    // syntax by heart.
+                    if self.tree.is_some() && ui.button("Pick…").clicked() {
+                        open_picker = Some(PathPickerTarget::ResultRequirementPath);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -861,19 +1052,8 @@ impl GuiApp {
                     if ui.text_edit_singleline(&mut form.test_path).changed() {
                         form.edited = true;
                     }
-                    if let Some(tree) = &self.tree {
-                        egui::ComboBox::from_id_salt("pick_test_path")
-                            .selected_text("Pick…")
-                            .show_ui(ui, |ui| {
-                                for target in flatten_leaf_paths(tree, EntryKind::Test) {
-                                    let path_str = absolute_reference_path(&target, "tests");
-                                    let selected = form.test_path == path_str;
-                                    if ui.selectable_label(selected, target.to_string()).clicked() {
-                                        form.test_path = path_str;
-                                        form.edited = true;
-                                    }
-                                }
-                            });
+                    if self.tree.is_some() && ui.button("Pick…").clicked() {
+                        open_picker = Some(PathPickerTarget::ResultTestPath);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -930,6 +1110,9 @@ impl GuiApp {
         } else if let Some(path) = remove_attachment {
             self.local_attachment_remove_clicked(LocalPoolKind::ResultAttachment, path);
         }
+        if let Some(target) = open_picker {
+            self.path_picker_dialog_opened(target);
+        }
     }
 
     fn render_module_form(&mut self, ui: &mut egui::Ui) {
@@ -958,6 +1141,89 @@ impl GuiApp {
             });
         }
         if create_clicked {
+            self.editor_create_clicked();
+        } else if cancel_clicked {
+            self.editor_cancel_clicked();
+        }
+    }
+
+    /// The view/edit page for an already-existing module or the project
+    /// root — see `ModuleDetailFormState`'s own doc comment. Same
+    /// view/edit-in-one-function shape as `render_requirement_form` etc.,
+    /// just without any local pools or dependencies to manage.
+    fn render_module_page(&mut self, ui: &mut egui::Ui) {
+        let mut edit_clicked = false;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        {
+            let EditorState::ExistingModule(form) = &mut self.editor else {
+                return;
+            };
+            let is_root = form.path.is_empty();
+            ui.horizontal(|ui| {
+                ui.heading(if is_root {
+                    format!("Project: {}", form.display_name)
+                } else {
+                    format!("Module: {}", form.display_name)
+                });
+                if form.read_only {
+                    if ui.button("Edit").clicked() {
+                        edit_clicked = true;
+                    }
+                } else {
+                    let busy = form.pending_request.is_some();
+                    if ui.add_enabled(!busy, egui::Button::new("Save")).clicked() {
+                        save_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                }
+            });
+
+            if form.read_only {
+                match &form.summary {
+                    None => {
+                        ui.label("Loading…");
+                    }
+                    Some(summary) => {
+                        ui.label(format!("Submodules: {}", summary.submodule_count));
+                        ui.label(format!("Requirements: {}", summary.requirement_count));
+                        ui.label(format!("Tests: {}", summary.test_count));
+                        ui.label(format!("Results: {}", summary.result_count));
+                        ui.separator();
+                        if summary.validated {
+                            let met_pct = percentage(summary.requirements_met, summary.requirement_count);
+                            ui.label(format!(
+                                "Requirements met: {} / {} ({met_pct:.0}%)",
+                                summary.requirements_met, summary.requirement_count
+                            ));
+                            let pass_pct = percentage(summary.results_pass, summary.result_count);
+                            let fail_pct = percentage(summary.results_fail, summary.result_count);
+                            let incomplete_pct = percentage(summary.results_incomplete, summary.result_count);
+                            ui.label(format!("Pass: {} ({pass_pct:.0}%)", summary.results_pass));
+                            ui.label(format!("Fail: {} ({fail_pct:.0}%)", summary.results_fail));
+                            ui.label(format!("Incomplete: {} ({incomplete_pct:.0}%)", summary.results_incomplete));
+                        } else {
+                            ui.label("Project not validated — met/pass/fail statistics unavailable.");
+                        }
+                    }
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    if ui.text_edit_singleline(&mut form.new_name).changed() {
+                        form.edited = true;
+                    }
+                });
+                if let Some(error) = &form.error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+            }
+        }
+        if edit_clicked {
+            self.editor_edit_clicked();
+        } else if save_clicked {
             self.editor_create_clicked();
         } else if cancel_clicked {
             self.editor_cancel_clicked();
@@ -1201,47 +1467,63 @@ impl GuiApp {
         }
     }
 
-    pub(crate) fn render_rename_module_dialog(&mut self, ui: &mut egui::Ui) {
-        if self.rename_module_dialog.is_none() {
+    /// The path-picker modal — see `PathPickerDialogState`'s own doc
+    /// comment on why this replaced a per-field `egui::ComboBox`: a
+    /// `ComboBox` popup sizes itself to its content with no scrolling, so
+    /// a long enough list of requirements/tests would overflow off the
+    /// screen with no way to search it down. This instead runs a real
+    /// `ScrollArea` (bounded height, so the modal itself never grows
+    /// unbounded either) over a filtered list, filtered by the same
+    /// case-insensitive substring convention `node_matches_filter` already
+    /// uses for the left pane's own tree filter.
+    pub(crate) fn render_path_picker_dialog(&mut self, ui: &mut egui::Ui) {
+        if self.path_picker_dialog.is_none() {
             return;
         }
 
-        let mut confirm_clicked = false;
         let mut cancel_clicked = false;
-        egui::Modal::new(egui::Id::new("rename_module_dialog")).show(ui.ctx(), |ui| {
-            let Some(dialog) = &mut self.rename_module_dialog else {
+        let mut picked: Option<LogicalPath> = None;
+
+        egui::Modal::new(egui::Id::new("path_picker_dialog")).show(ui.ctx(), |ui| {
+            let (Some(dialog), Some(tree)) = (&mut self.path_picker_dialog, &self.tree) else {
                 return;
             };
-            ui.heading("Rename Module");
-            let path_label = dialog
-                .target
-                .iter()
-                .map(EntryName::as_str)
-                .collect::<Vec<_>>()
-                .join("/");
-            ui.label(format!("Renaming: {path_label}"));
-            ui.horizontal(|ui| {
-                ui.label("New name:");
-                ui.text_edit_singleline(&mut dialog.new_name);
+            ui.heading(match dialog.kind {
+                EntryKind::Requirement => "Pick a requirement",
+                EntryKind::Test => "Pick a test",
+                EntryKind::Module | EntryKind::Result => unreachable!("no picker ever targets a module or result"),
             });
-            if let Some(error) = &dialog.error {
-                ui.colored_label(egui::Color32::RED, error);
+            ui.text_edit_singleline(&mut dialog.filter);
+            let kind_segment = leaf_kind_segment(dialog.kind);
+            let filter = dialog.filter.to_lowercase();
+
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                let mut any_shown = false;
+                for target in flatten_leaf_paths(tree, dialog.kind) {
+                    let path_str = absolute_reference_path(&target, kind_segment);
+                    if !filter.is_empty() && !path_str.to_lowercase().contains(&filter) {
+                        continue;
+                    }
+                    any_shown = true;
+                    if ui.selectable_label(false, target.to_string()).clicked() {
+                        picked = Some(target);
+                    }
+                }
+                if !any_shown {
+                    ui.label("No matches.");
+                }
+            });
+
+            ui.separator();
+            if ui.button("Cancel").clicked() {
+                cancel_clicked = true;
             }
-            let busy = dialog.pending_request.is_some();
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!busy, egui::Button::new("Rename")).clicked() {
-                    confirm_clicked = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel_clicked = true;
-                }
-            });
         });
 
-        if confirm_clicked {
-            self.rename_module_dialog_confirmed();
+        if let Some(target) = picked {
+            self.path_picker_dialog_selected(target);
         } else if cancel_clicked {
-            self.rename_module_dialog_cancelled();
+            self.path_picker_dialog_cancelled();
         }
     }
 
@@ -1342,7 +1624,7 @@ impl GuiApp {
     }
 }
 
-fn render_tree_node(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName]) {
+fn render_tree_node(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName], force_open: Option<bool>) {
     match node.kind {
         EntryKind::Module => {
             // A module with no matching descendant (filter active, no
@@ -1363,21 +1645,23 @@ fn render_tree_node(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module
                 // make it the "current module" new entries and the
                 // Attachments dialog target; the CollapsingHeader label
                 // itself only toggles expand/collapse.
-                let glyph = if is_current { "◉" } else { "○" };
-                if ui.small_button(glyph).on_hover_text("Set as current module").clicked() {
+                let glyph = if is_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
+                let mut text = egui::RichText::new(glyph);
+                if is_current {
+                    text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
+                }
+                if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked() {
                     if app.editor_has_unsaved_edits() {
                         app.unsaved_form_dialog_opened(PendingNavigation::SelectModule(this_module_path.clone()));
                     } else {
                         app.select_module(this_module_path.clone());
                     }
                 }
-                if ui.small_button("✎").on_hover_text("Rename this module").clicked() {
-                    app.rename_module_dialog_opened(this_module_path.clone());
-                }
                 egui::CollapsingHeader::new(node.name.as_str())
-                    .default_open(module_path.is_empty())
+                    .default_open(false)
+                    .open(force_open)
                     .show(ui, |ui| {
-                        render_module_children(app, ui, &node.children, &this_module_path);
+                        render_module_children(app, ui, &node.children, &this_module_path, force_open);
                     });
             });
         }
@@ -1399,15 +1683,29 @@ fn render_tree_node(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module
 /// keeps the tree's shape legible instead of interleaving three
 /// unrelated kinds of leaf in whatever order `ModuleDraft`'s maps happen
 /// to iterate.
-fn render_module_children(app: &mut GuiApp, ui: &mut egui::Ui, children: &[TreeNode], module_path: &[EntryName]) {
+fn render_module_children(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    children: &[TreeNode],
+    module_path: &[EntryName],
+    force_open: Option<bool>,
+) {
+    let mut rendered_submodule = false;
     for child in children {
         if child.kind == EntryKind::Module {
-            render_tree_node(app, ui, child, module_path);
+            render_tree_node(app, ui, child, module_path, force_open);
+            rendered_submodule = true;
         }
     }
-    render_leaf_group(app, ui, "requirements", EntryKind::Requirement, children, module_path);
-    render_leaf_group(app, ui, "tests", EntryKind::Test, children, module_path);
-    render_leaf_group(app, ui, "results", EntryKind::Result, children, module_path);
+    // Only drawn when a submodule actually rendered above — otherwise an
+    // empty-of-submodules folder would grow a separator with nothing
+    // above it to separate from.
+    if rendered_submodule {
+        ui.separator();
+    }
+    render_leaf_group(app, ui, "requirements", EntryKind::Requirement, children, module_path, force_open);
+    render_leaf_group(app, ui, "tests", EntryKind::Test, children, module_path, force_open);
+    render_leaf_group(app, ui, "results", EntryKind::Result, children, module_path, force_open);
 }
 
 /// One collapsible folder ("requirements"/"tests"/"results") holding
@@ -1420,6 +1718,7 @@ fn render_leaf_group(
     kind: EntryKind,
     children: &[TreeNode],
     module_path: &[EntryName],
+    force_open: Option<bool>,
 ) {
     let matching: Vec<&TreeNode> = children
         .iter()
@@ -1428,7 +1727,7 @@ fn render_leaf_group(
     if matching.is_empty() {
         return;
     }
-    egui::CollapsingHeader::new(title).default_open(true).show(ui, |ui| {
+    egui::CollapsingHeader::new(title).default_open(false).open(force_open).show(ui, |ui| {
         for leaf in matching {
             render_leaf(app, ui, leaf, module_path);
         }
@@ -1436,11 +1735,25 @@ fn render_leaf_group(
 }
 
 fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName]) {
-    let label = match node.kind {
-        EntryKind::Requirement => format!("{} {}", status_glyph(node.status), node.name.as_str()),
-        _ => node.name.as_str().to_string(),
+    // Both arms need to end up the same type for the one shared
+    // `selectable_label` call below — `Atoms` is that common type (a
+    // requirement's colored icon + plain name is a 2-`Atom` tuple, every
+    // other kind's bare name is a 1-`Atom` string; `.into_atoms()`
+    // unifies them, see `egui::IntoAtoms`).
+    use egui::IntoAtoms as _;
+    let content = match node.kind {
+        EntryKind::Requirement => {
+            let (fg, bg) = crate::theme_colors::status_colors(ui.visuals().dark_mode, node.status);
+            let icon = crate::icons::status_icon(node.status);
+            (
+                egui::RichText::new(icon).color(fg).background_color(bg),
+                node.name.as_str().to_string(),
+            )
+                .into_atoms()
+        }
+        _ => node.name.as_str().to_string().into_atoms(),
     };
-    if ui.selectable_label(false, label).clicked() {
+    if ui.selectable_label(false, content).clicked() {
         let target = LogicalPath {
             modules: module_path.to_vec(),
             name: node.name.clone(),
@@ -1452,41 +1765,6 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
             });
         } else {
             app.select(target, node.kind);
-        }
-    }
-}
-
-fn status_glyph(status: EntryStatus) -> &'static str {
-    match status {
-        EntryStatus::Met => "✓",
-        EntryStatus::Unmet => "✗",
-        EntryStatus::Unvalidated => "•",
-    }
-}
-
-/// Every requirement (or test) in the currently-loaded tree, as
-/// `LogicalPath`s — the Result form's path pickers' option list. Walks
-/// `tree.root.children` directly (not `render_tree_node`'s recursion),
-/// for the same reason `render_left_pane` renders the root specially: the
-/// root `TreeNode`'s own `name` is a display label, not a real
-/// module-path segment, and must never be pushed into a child's path.
-fn flatten_leaf_paths(tree: &TreeSnapshot, kind: EntryKind) -> Vec<LogicalPath> {
-    let mut out = Vec::new();
-    collect_leaf_paths(&tree.root.children, kind, &[], &mut out);
-    out
-}
-
-fn collect_leaf_paths(children: &[TreeNode], kind: EntryKind, module_path: &[EntryName], out: &mut Vec<LogicalPath>) {
-    for child in children {
-        if child.kind == EntryKind::Module {
-            let mut child_path = module_path.to_vec();
-            child_path.push(child.name.clone());
-            collect_leaf_paths(&child.children, kind, &child_path, out);
-        } else if child.kind == kind {
-            out.push(LogicalPath {
-                modules: module_path.to_vec(),
-                name: child.name.clone(),
-            });
         }
     }
 }
@@ -1526,23 +1804,63 @@ fn render_dependency_kind_picker(ui: &mut egui::Ui, dep: &mut DependencyDraft) -
 
 /// `dep`'s own editable fields, per variant — `Submodules` has none.
 /// Shared the same way `render_dependency_kind_picker` is, including its
-/// return-value convention.
-fn render_dependency_fields(ui: &mut egui::Ui, dep: &mut DependencyDraft) -> bool {
+/// `changed` return-value convention (the first element of the tuple).
+///
+/// The second element reports an "Auto" commit-fetch click, if one
+/// happened this frame — the caller (which owns `self`, unlike this free
+/// function) turns it into an actual `Command` via
+/// `GuiApp::dependency_commit_auto_clicked`, same "capture during
+/// rendering, act after the borrow of `self.editor` ends" split every
+/// other button here already follows. `tree` drives both the `Local`
+/// variant's path picker (same "picker alongside a still-hand-editable
+/// text field" shape as the Result form's own pickers — see
+/// `absolute_reference_path`'s doc comment) and its "Auto" button, which
+/// resolves the *typed* path against `tree`'s own entries to find a
+/// `LogicalPath` to resolve a commit for — so Auto only works once the
+/// field holds a path that actually matches something in the loaded tree
+/// (picked from the picker modal, or hand-typed correctly), same
+/// limitation the Result form's pickers already have with a stale/
+/// unloaded tree.
+///
+/// The third element of the returned tuple reports a "Pick…" click —
+/// like `auto`, the caller (which knows whether this is an existing row
+/// or the composer, and so which `DependencySlot`/`PathPickerTarget` it
+/// means) turns it into `GuiApp::path_picker_dialog_opened` after the
+/// borrow of `self.editor` ends.
+fn render_dependency_fields(
+    ui: &mut egui::Ui,
+    dep: &mut DependencyDraft,
+    tree: Option<&TreeSnapshot>,
+) -> (bool, Option<AutoCommitKind>, bool) {
     match dep {
         DependencyDraft::LocalRequirement { path, commit } => {
             let mut changed = false;
+            let mut auto = None;
+            let mut pick_clicked = false;
             ui.horizontal(|ui| {
                 ui.label("Path:");
                 changed |= ui.text_edit_singleline(path).changed();
+                if tree.is_some() && ui.button("Pick…").clicked() {
+                    pick_clicked = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Commit:");
                 changed |= ui.text_edit_singleline(commit).changed();
+                if ui.button("Auto").clicked()
+                    && let Some(tree) = tree
+                    && let Some(target) = flatten_leaf_paths(tree, EntryKind::Requirement)
+                        .into_iter()
+                        .find(|target| absolute_reference_path(target, "requirements") == *path)
+                {
+                    auto = Some(AutoCommitKind::Local(target));
+                }
             });
-            changed
+            (changed, auto, pick_clicked)
         }
         DependencyDraft::Remote { url, path, commit } => {
             let mut changed = false;
+            let mut auto = None;
             ui.horizontal(|ui| {
                 ui.label("URL:");
                 changed |= ui.text_edit_singleline(url).changed();
@@ -1554,46 +1872,16 @@ fn render_dependency_fields(ui: &mut egui::Ui, dep: &mut DependencyDraft) -> boo
             ui.horizontal(|ui| {
                 ui.label("Commit:");
                 changed |= ui.text_edit_singleline(commit).changed();
+                if ui.button("Auto").clicked() && !url.trim().is_empty() {
+                    auto = Some(AutoCommitKind::Remote {
+                        url: url.clone(),
+                        path: if path.trim().is_empty() { None } else { Some(ReferencePath(path.clone())) },
+                    });
+                }
             });
-            changed
+            (changed, auto, false)
         }
-        DependencyDraft::Submodules => false,
-    }
-}
-
-/// The absolute (project-root-relative, leading-`/`) `disk::ReferencePath`
-/// string for `target` — matches `logical::path::parse_reference_path`'s
-/// expected `/[modules/<sub>/]*<kind_segment>/<name>` format exactly (see
-/// that function's own parsing logic in `crates/logical/src/path.rs`),
-/// which is what `ResultDraft::requirement_path`/`test_path` are parsed
-/// against at `validate()` time. `kind_segment` is `"requirements"` or
-/// `"tests"` — the on-disk directory name, not `EntryKind`'s Rust-side
-/// spelling.
-fn absolute_reference_path(target: &LogicalPath, kind_segment: &str) -> String {
-    let mut path = String::from("/");
-    for module in &target.modules {
-        path.push_str("modules/");
-        path.push_str(module.as_str());
-        path.push('/');
-    }
-    path.push_str(kind_segment);
-    path.push('/');
-    path.push_str(target.name.as_str());
-    path
-}
-
-/// The on-disk directory name for a leaf `kind` — `"requirements"`/
-/// `"tests"`/`"results"`, matching `disk`'s own project layout (see
-/// `absolute_reference_path`'s doc comment). `EntryKind::Module` has no
-/// leaf path of its own, so no sensible mapping — `node_matches_filter`
-/// is the only caller, and it never reaches this arm for a `Module`
-/// (that case is handled directly, recursing into children instead).
-fn leaf_kind_segment(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Requirement => "requirements",
-        EntryKind::Test => "tests",
-        EntryKind::Result => "results",
-        EntryKind::Module => unreachable!("a module has no leaf path of its own"),
+        DependencyDraft::Submodules => (false, None, false),
     }
 }
 

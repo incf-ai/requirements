@@ -18,9 +18,12 @@ fn main() {
     let app = gui_ui::GuiApp::new(core, config, config_path, recent, recent_path);
 
     if let Err(err) = eframe::run_native(
-        "Requirements",
+        "IncRMS",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(|cc| {
+            gui_ui::install_icon_font(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     ) {
         eprintln!("error: {err}");
         std::process::exit(1);

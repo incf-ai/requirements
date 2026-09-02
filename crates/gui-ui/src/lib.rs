@@ -23,13 +23,20 @@ mod config;
 #[cfg(all(feature = "debug-panel", debug_assertions))]
 mod debug_panel;
 mod exit;
+mod fonts;
 mod forms;
+mod icons;
 mod recent;
+mod theme_colors;
 mod view;
 
-pub use config::{GuiConfig, LoadError as ConfigLoadError};
+pub use config::{GuiConfig, LoadError as ConfigLoadError, ThemeChoice};
 pub use exit::ExitDialogState;
-pub use forms::{DependencyDraft, ModuleFormState, RequirementFormState, ResultFormState, TestFormState};
+pub use fonts::install_icon_font;
+pub use forms::{
+    AutoCommitKind, DependencyDraft, DependencySlot, ModuleDetailFormState, ModuleFormState, RequirementFormState,
+    ResultFormState, TestFormState,
+};
 pub use recent::{LoadError as RecentLoadError, RecentProjects};
 
 use std::collections::HashMap;
@@ -37,8 +44,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gui_core::{
-    Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools, Outcome,
-    RenameModuleError, RequestId, TreeSnapshot,
+    Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools, Outcome, RequestId,
+    TreeNode, TreeSnapshot,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -57,26 +64,24 @@ pub struct GuiApp {
     /// sets it directly for a module click. Empty means the project root.
     selected_module: Vec<EntryName>,
     editor: EditorState,
-    /// Browser-style leaf-selection history for the toolbar's Back/
-    /// Forward — `nav_position` is the index of the currently-shown
-    /// entry. `select()` is the one chokepoint every current form of
-    /// navigation (a tree leaf click) already goes through, so it's the
-    /// only thing instrumented to grow this — a future requirement/test/
-    /// result navigation link gets Back/Forward for free as long as its
-    /// own click handler also just calls `select()`. Module selections
-    /// (`select_module`) deliberately aren't included: a module has
-    /// nothing of its own to show in the center pane (see `EntryDetail`'s
-    /// doc comment), so there's nothing meaningful to navigate back *to*.
-    /// Not bounded — a `LogicalPath` is small, and capping this wasn't
-    /// judged worth the complexity for a first pass. Each entry also
-    /// carries the `NavMode` it was viewed in — switching from the
-    /// read-only viewer into the editable form (`editor_edit_clicked`) is
-    /// itself a navigation, so Back returns to the viewer rather than
-    /// leaving the tab on the edit form or jumping past it to whatever
-    /// was selected before.
-    nav_history: Vec<(LogicalPath, EntryKind, NavMode)>,
+    /// Browser-style selection history for the toolbar's Back/Forward —
+    /// `nav_position` is the index of the currently-shown entry. `select()`
+    /// and `select_module()` are the two chokepoints every current form of
+    /// navigation (a tree leaf click, a module/project-root click) already
+    /// goes through, so they're the only things instrumented to grow this
+    /// — a future requirement/test/result navigation link gets Back/
+    /// Forward for free as long as its own click handler also just calls
+    /// one of the two. A `NavTarget::Leaf` entry also carries the
+    /// `NavMode` it was viewed in — switching from the read-only viewer
+    /// into the editable form (`editor_edit_clicked`) is itself a
+    /// navigation, so Back returns to the viewer rather than leaving the
+    /// tab on the edit form or jumping past it to whatever was selected
+    /// before. Not bounded — entries are small, and capping this wasn't
+    /// judged worth the complexity for a first pass.
+    nav_history: Vec<NavTarget>,
     nav_position: usize,
     pending: HashMap<RequestId, PendingKind>,
+    #[allow(dead_code)]
     status: StatusLine,
     /// Set true whenever an `Outcome` confirms a mutating `Command`
     /// actually changed something, cleared on a successful `Save`'s
@@ -114,6 +119,13 @@ pub struct GuiApp {
     /// selection is ignored rather than overwriting `editor` with detail
     /// for something no longer selected. See `apply_entry_detail`.
     detail_request: Option<RequestId>,
+    /// Which `GetRequirementMetStatus` request is refreshing the open
+    /// requirement form's `met_status` after a `Validate` completed — same
+    /// stale-reply guard as `detail_request`. Only one requirement can be
+    /// open at a time, so (unlike `local_pool_ops`) there's never more
+    /// than one of these in flight to track. See
+    /// `refresh_open_requirement_met_status`.
+    met_status_request: Option<RequestId>,
     /// The "Attachments…" modal — `Some` while it's open, for the module
     /// it was opened against (see `new_entry_module_path`, the same
     /// "current module" notion the create forms use).
@@ -127,8 +139,14 @@ pub struct GuiApp {
     /// re-fetching `EntryDetail` on completion the way `attachments_dialog`
     /// re-fetches `ModulePools`.
     local_pool_ops: HashMap<RequestId, LocalPoolOp>,
-    /// The "Rename Module" modal — `Some` while it's open.
-    rename_module_dialog: Option<RenameModuleDialogState>,
+    /// Which `GetModuleSummary` request the open `EditorState::ExistingModule`
+    /// page is waiting on — same stale-reply guard as `detail_request`.
+    /// Only one module/project page can be open at a time, same "never
+    /// more than one in flight" reasoning as `met_status_request`.
+    module_summary_request: Option<RequestId>,
+    /// The path-picker modal — `Some` while it's open. See
+    /// `PathPickerDialogState`'s own doc comment.
+    path_picker_dialog: Option<PathPickerDialogState>,
     config: GuiConfig,
     /// Where `config` was loaded from — kept so a zoom click can write
     /// the changed config straight back to the same file (`GuiConfig::
@@ -164,6 +182,13 @@ pub struct GuiApp {
     /// `/modules/setup/tests/generic_test`), case-insensitively. Empty
     /// means unfiltered — every node shows, same as before this existed.
     tree_filter: String,
+    /// A one-frame "force every `CollapsingHeader` in the tree open/closed"
+    /// signal set by the left pane's Expand All/Collapse All buttons and
+    /// consumed (reset to `None`) by the same frame's tree render — see
+    /// `view.rs`'s `render_left_pane`. Only a single frame, not a
+    /// persistent setting, so a header a user then clicks individually
+    /// afterward toggles normally instead of snapping back every frame.
+    tree_force_open: Option<bool>,
     /// The debug side panel's own state — see `debug_panel` module doc
     /// comment and README's "Debug side panel" section. Absent entirely,
     /// not just inert, in a non-`debug-panel` build.
@@ -190,6 +215,22 @@ const ZOOM_DEFAULT_PERCENT: u32 = 100;
 pub enum NavMode {
     View,
     Edit,
+}
+
+/// One entry in `GuiApp::nav_history` — either a leaf (a requirement/test/
+/// result, addressed the same way `select`/`navigate` already do) or a
+/// module/project-root selection (`select_module`'s own target, just its
+/// path — a module has no `NavMode` of its own to track, see
+/// `select_module`'s doc comment on why its own Edit toggle stays a local
+/// flag flip rather than a real navigation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NavTarget {
+    Leaf {
+        target: LogicalPath,
+        kind: EntryKind,
+        mode: NavMode,
+    },
+    Module(Vec<EntryName>),
 }
 
 /// Which project-switching action the unsaved-changes prompt
@@ -245,6 +286,10 @@ pub enum EditorState {
     NewTest(TestFormState),
     NewResult(ResultFormState),
     NewModule(ModuleFormState),
+    /// The view/edit page for an already-existing module or the project
+    /// root (`ModuleDetailFormState::path: []`) — see that type's own doc
+    /// comment. Distinct from `NewModule`, which stays creation-only.
+    ExistingModule(ModuleDetailFormState),
 }
 
 /// Which of a requirement/test/result's local pools an in-flight
@@ -293,14 +338,51 @@ pub struct AttachmentsDialogState {
     pub error: Option<String>,
 }
 
-/// The "Rename Module" modal's state — which module it's renaming
-/// (`target`, its current full path) and the new-name text buffer.
-#[derive(Debug, Default)]
-pub struct RenameModuleDialogState {
-    pub target: Vec<EntryName>,
-    pub new_name: String,
-    pub pending_request: Option<RequestId>,
-    pub error: Option<String>,
+/// Where a selection made in the path-picker modal (`PathPickerDialogState`)
+/// gets written back to — the field(s) `render_requirement_form`/
+/// `render_result_form` opened it from. Each of a requirement/test's
+/// fully-qualified path fields across the app funnels through one shared
+/// modal rather than each owning its own `egui::ComboBox` (see
+/// `GuiApp::path_picker_dialog`'s own doc comment for why), so something
+/// has to say which one a given open call means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPickerTarget {
+    ResultRequirementPath,
+    ResultTestPath,
+    /// A requirement's dependency row — `slot` picks which one, same as
+    /// `RequirementFormState::pending_commit_fetches`' own keying.
+    Dependency(DependencySlot),
+}
+
+impl PathPickerTarget {
+    /// Which of `self.tree`'s leaf kinds this target's field points at —
+    /// every target has exactly one, so `PathPickerDialogState::kind`
+    /// derives from it instead of being passed alongside redundantly.
+    fn kind(self) -> EntryKind {
+        match self {
+            PathPickerTarget::ResultRequirementPath | PathPickerTarget::Dependency(_) => EntryKind::Requirement,
+            PathPickerTarget::ResultTestPath => EntryKind::Test,
+        }
+    }
+}
+
+/// The path-picker modal's state — open (`Some`) for exactly as long as
+/// it's showing. Replaces what used to be a per-field `egui::ComboBox`
+/// (one each for the Result form's `requirement_path`/`test_path`, and the
+/// Requirement form's dependency `path`): a `ComboBox`'s popup is sized to
+/// fit its content on screen, so a project with enough requirements/tests
+/// eventually overflows available screen space with no way to search it.
+/// A modal has room for a real `ScrollArea` plus a text filter instead,
+/// the same shape the left pane's own tree filter (`tree_filter`) already
+/// uses for the identical "narrow a long list down by substring" problem
+/// — see `render_path_picker_dialog`.
+#[derive(Debug, Clone)]
+pub struct PathPickerDialogState {
+    /// `EntryKind::Requirement` or `EntryKind::Test` — never `Module`/
+    /// `Result` (nothing here ever picks a path for either of those).
+    pub kind: EntryKind,
+    pub target: PathPickerTarget,
+    pub filter: String,
 }
 
 /// What a given in-flight `RequestId` corresponds to in the UI, so its
@@ -341,12 +423,15 @@ impl GuiApp {
             exit_dialog: None,
             new_project_dialog: None,
             detail_request: None,
+            met_status_request: None,
             attachments_dialog: None,
             pools_request: None,
             local_pool_ops: HashMap::new(),
-            rename_module_dialog: None,
+            module_summary_request: None,
+            path_picker_dialog: None,
             zoom_input: config.zoom_percent.to_string(),
             tree_filter: String::new(),
+            tree_force_open: None,
             #[cfg(all(feature = "debug-panel", debug_assertions))]
             debug: debug_panel::DebugPanelState::default(),
             config,
@@ -368,7 +453,20 @@ impl GuiApp {
     /// reaches gui-ui's. See README's "Never block the render thread".
     fn apply_event(&mut self, event: Event) {
         match event {
-            Event::TreeChanged(tree) => self.tree = Some(tree),
+            Event::TreeChanged(tree) => {
+                self.tree = Some(tree);
+                // Keeps an already-open module/project page's heading in
+                // sync with the tree it was read from — matters right
+                // after a `LoadProject` in particular: that outcome (and
+                // this session's own `select_module(Vec::new())` default-
+                // to-root-page response to it) lands *before* its own
+                // `TreeChanged`, per `gui-core::Actor::apply_completion`'s
+                // ordering, so the page's `display_name` starts as the
+                // fallback empty string until this arm corrects it.
+                if let EditorState::ExistingModule(form) = &mut self.editor {
+                    form.display_name = module_display_name(self.tree.as_ref(), &form.path);
+                }
+            }
             Event::ValidationFailed(_errors) => {
                 // TODO: surface in self.status once the status bar exists.
             }
@@ -400,6 +498,13 @@ impl GuiApp {
             }
             Outcome::LoadProject(result) => {
                 self.apply_project_path_result(request, result.is_ok());
+                // Default to the project's own view page — see
+                // `Outcome::NewProject`'s note on why `self.tree` isn't
+                // necessarily fresh yet here, and `Event::TreeChanged`'s
+                // own arm for the fix-up.
+                if result.is_ok() {
+                    self.select_module(Vec::new());
+                }
             }
             // A brand new project has nothing unsaved to lose yet — same
             // "starts clean" convention a freshly loaded project follows.
@@ -408,8 +513,29 @@ impl GuiApp {
             // `Outcome::NewProject`'s own doc comment — so there's no
             // stale-reply race to guard against by waiting for this
             // completion), `new_project_dialog_confirmed` already cleared
-            // it up front.
-            Outcome::NewProject => self.dirty = false,
+            // it up front. Also opens straight to the project's own view
+            // page, same as a successful `LoadProject` — unlike that one,
+            // `gui-core::Actor::new_project` pushes `TreeChanged` *before*
+            // completing (see its own doc comment), so `self.tree` here is
+            // already the fresh one and `select_module`'s `display_name`
+            // lookup gets the real name immediately, no fix-up needed.
+            Outcome::NewProject => {
+                self.dirty = false;
+                self.select_module(Vec::new());
+            }
+            // Whether it succeeded or failed, `Validate` can change what
+            // an already-open requirement's `met_status` should show — a
+            // failed one still demotes the project back to `Draft` (see
+            // `a_failed_validate_restores_an_editable_draft` in gui-core),
+            // which flips every requirement back to `Unvalidated` just as
+            // much as a successful one can flip one to `Met`/`Unmet`. Only
+            // `met_status` itself is refreshed, never the rest of the
+            // form — see `refresh_open_requirement_met_status`'s own doc
+            // comment on why that's safe even mid-edit.
+            Outcome::Validate(_) => {
+                self.refresh_open_requirement_met_status();
+                self.refresh_open_module_summary();
+            }
             // A successful `Undo`/`Redo` changed the project's content —
             // same "unsaved changes" bookkeeping as any other successful
             // mutation. `Err` (nothing to undo/redo) means nothing
@@ -426,6 +552,9 @@ impl GuiApp {
             }
             Outcome::AddRequirement(result) => self.apply_create_result(request, result),
             Outcome::UpdateRequirement(result) => self.apply_update_result(request, result),
+            Outcome::RefreshStaleTestReferences(result) => {
+                self.apply_refresh_stale_test_references_result(request, result)
+            }
             Outcome::AddTest(result) => self.apply_create_result(request, result),
             Outcome::UpdateTest(result) => self.apply_update_result(request, result),
             Outcome::AddResult(result) => self.apply_create_result(request, result),
@@ -435,7 +564,12 @@ impl GuiApp {
             | Outcome::RemoveTest(true)
             | Outcome::RemoveResult(true)
             | Outcome::RemoveModule(true) => self.dirty = true,
-            Outcome::RenameModule(result) => self.apply_rename_module_result(request, result),
+            Outcome::RenameModule(result) => {
+                self.apply_module_rename_result(request, result.map_err(|e| e.to_string()))
+            }
+            Outcome::RenameProject(result) => {
+                self.apply_module_rename_result(request, result.map_err(|e| e.to_string()))
+            }
             Outcome::AddAttachment(result) => self.apply_pool_change_result(result.map_err(|e| e.to_string())),
             Outcome::AddTemplate(result) => self.apply_pool_change_result(result.map_err(|e| e.to_string())),
             Outcome::RemoveAttachment(removed) | Outcome::RemoveTemplate(removed) => {
@@ -475,8 +609,32 @@ impl GuiApp {
             Outcome::EntryDetail(detail) if self.detail_request == Some(request) => {
                 self.apply_entry_detail(detail);
             }
+            // Same stale-reply guard, and the same "re-check `self.editor`
+            // at apply time, not just when the request was sent" nuance —
+            // if the user navigated to a *different* requirement while
+            // this was in flight, that navigation's own `GetEntryDetail`
+            // already set a fresher `met_status`, and this now-stale-
+            // target reply is simply dropped instead of overwriting it.
+            Outcome::RequirementMetStatus(status) if self.met_status_request == Some(request) => {
+                self.met_status_request = None;
+                if let EditorState::NewRequirement(form) = &mut self.editor {
+                    form.met_status = status;
+                }
+            }
             Outcome::ModulePools(pools) if self.pools_request == Some(request) => {
                 self.apply_module_pools(pools);
+            }
+            Outcome::ModuleSummary(summary) if self.module_summary_request == Some(request) => {
+                self.module_summary_request = None;
+                if let EditorState::ExistingModule(form) = &mut self.editor {
+                    form.summary = summary;
+                }
+            }
+            Outcome::ResolveLocalCommit(result) => {
+                self.apply_commit_fetch_result(request, result.map_err(|e| e.to_string()))
+            }
+            Outcome::ResolveRemoteCommit(result) => {
+                self.apply_commit_fetch_result(request, result.map_err(|e| e.to_string()))
             }
             _ => {}
         }
@@ -636,6 +794,15 @@ impl GuiApp {
         let _ = self.config.save(&self.config_path);
     }
 
+    /// The status bar's theme selector — same "persist immediately,
+    /// best-effort" shape as `set_zoom_percent`. The actual `egui::Context::
+    /// set_theme` call happens unconditionally every frame in `ui()`, not
+    /// here — this only updates the value it reads from.
+    fn theme_selected(&mut self, theme: ThemeChoice) {
+        self.config.theme = theme;
+        self.persist_config();
+    }
+
     /// Bumps `path` to the front of `recent` and best-effort persists it
     /// — called on every successful `LoadProject`/`SaveAs`/`Save` (see
     /// `apply_project_path_result`/`apply_outcome`'s `Outcome::Save`
@@ -692,6 +859,7 @@ impl GuiApp {
             EditorState::NewRequirement(f) => f.edited,
             EditorState::NewTest(f) => f.edited,
             EditorState::NewResult(f) => f.edited,
+            EditorState::ExistingModule(f) => f.edited,
             EditorState::NewModule(_) | EditorState::None => false,
         }
     }
@@ -729,6 +897,73 @@ impl GuiApp {
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
         self.send_command(Command::Validate { request });
+    }
+
+    /// Re-fetches just the currently-open requirement's `met_status` —
+    /// called after a `Validate` completes (see `apply_outcome`'s
+    /// `Outcome::Validate` arm). A no-op if nothing's open, or what's
+    /// open isn't a requirement (a module/test/result form has no
+    /// `met_status` to refresh at all). Deliberately narrower than
+    /// `select_from_history`'s "always re-fetch everything" convention:
+    /// `met_status` is the only field `Validate` can actually change, and
+    /// it's never something the user types into, so refreshing just it
+    /// carries none of a full `GetEntryDetail` re-fetch's risk of
+    /// clobbering unsaved edits sitting in the rest of the form.
+    fn refresh_open_requirement_met_status(&mut self) {
+        let EditorState::NewRequirement(form) = &self.editor else {
+            return;
+        };
+        let Some(target) = form.editing_target.clone() else {
+            return;
+        };
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        self.met_status_request = Some(request);
+        self.send_command(Command::GetRequirementMetStatus { target, request });
+    }
+
+    /// The module/project page's counterpart to
+    /// `refresh_open_requirement_met_status` — a `Validate` can change the
+    /// met/unmet and pass/fail/incomplete counts an open page's `summary`
+    /// shows, whether it succeeded (fresh resolved data) or failed (the
+    /// project's back to `Draft`, so `summary.validated` goes back to
+    /// `false` — same "still changes what's shown" reasoning that
+    /// requirement-side refresh already documents). A no-op if nothing's
+    /// open, or what's open isn't a module/project page.
+    fn refresh_open_module_summary(&mut self) {
+        let EditorState::ExistingModule(form) = &self.editor else {
+            return;
+        };
+        let module = form.path.clone();
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        self.module_summary_request = Some(request);
+        self.send_command(Command::GetModuleSummary { module, request });
+    }
+
+    /// The requirement viewer's "Update Stale References" button
+    /// (`has_stale_test_reference` gates whether it's even shown). Reuses
+    /// `form.pending_request`/`form.error` — the same fields Save/Create
+    /// use — rather than adding dedicated ones: this button only ever
+    /// shows in the read-only viewer, which never has a Save/Create of
+    /// its own in flight, so there's no risk of the two colliding.
+    fn refresh_stale_test_references_clicked(&mut self) {
+        let target = {
+            let EditorState::NewRequirement(form) = &self.editor else {
+                return;
+            };
+            let Some(target) = form.editing_target.clone() else {
+                return;
+            };
+            target
+        };
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        if let EditorState::NewRequirement(form) = &mut self.editor {
+            form.pending_request = Some(request);
+            form.error = None;
+        }
+        self.send_command(Command::RefreshStaleTestReferences { target, request });
     }
 
     fn undo_clicked(&mut self) {
@@ -821,19 +1056,24 @@ impl GuiApp {
         self.navigate(target, kind, NavMode::View);
     }
 
-    /// The one chokepoint every current form of navigation goes through —
-    /// a tree leaf click (`select`), the viewer's "Edit" button
+    /// The one chokepoint every current form of leaf navigation goes
+    /// through — a tree leaf click (`select`), the viewer's "Edit" button
     /// (`editor_edit_clicked`), and Cancel-from-an-existing-entry's-edit
     /// (`editor_cancel_clicked`) all just call this with the mode they
     /// mean. Truncates any "forward" history past the current position
-    /// and pushes `(target, kind, mode)` (the usual "a fresh navigation
+    /// and pushes a `NavTarget::Leaf` (the usual "a fresh navigation
     /// invalidates forward history" rule browsers follow), then advances
     /// to it. `select_from_history` is the twin that skips the
     /// truncate-and-push, for Back/Forward re-visiting an entry already in
-    /// `nav_history`.
+    /// `nav_history`. `select_module` is the module/project-root
+    /// counterpart of this function.
     fn navigate(&mut self, target: LogicalPath, kind: EntryKind, mode: NavMode) {
         self.nav_history.truncate(self.nav_position + 1);
-        self.nav_history.push((target.clone(), kind, mode));
+        self.nav_history.push(NavTarget::Leaf {
+            target: target.clone(),
+            kind,
+            mode,
+        });
         self.nav_position = self.nav_history.len() - 1;
         self.select_from_history(target, kind);
     }
@@ -869,11 +1109,17 @@ impl GuiApp {
 
     /// The `NavMode` of the entry `nav_position` currently points at —
     /// what `apply_entry_detail` builds the next-landing form in. Falls
-    /// back to `View` when `nav_history` is empty (nothing navigated to
-    /// via `navigate` yet — can't happen once a `detail_request` is
-    /// actually in flight, but keeps this total rather than panicking).
+    /// back to `View` when `nav_history` is empty, or the entry there is a
+    /// `NavTarget::Module` (this function is only actually consulted right
+    /// after a `NavTarget::Leaf` lands, since `apply_entry_detail` is only
+    /// reached via a leaf's own `GetEntryDetail` reply — kept total rather
+    /// than panicking, same "never panic on a momentarily-inapplicable
+    /// view" spirit `module_display_name`'s own fallback follows).
     fn current_nav_mode(&self) -> NavMode {
-        self.nav_history.get(self.nav_position).map(|(_, _, mode)| *mode).unwrap_or(NavMode::View)
+        match self.nav_history.get(self.nav_position) {
+            Some(NavTarget::Leaf { mode, .. }) => *mode,
+            _ => NavMode::View,
+        }
     }
 
     fn can_go_back(&self) -> bool {
@@ -889,8 +1135,7 @@ impl GuiApp {
             return;
         }
         self.nav_position -= 1;
-        let (target, kind, _mode) = self.nav_history[self.nav_position].clone();
-        self.select_from_history(target, kind);
+        self.select_from_nav_target(self.nav_history[self.nav_position].clone());
     }
 
     fn forward_clicked(&mut self) {
@@ -898,87 +1143,161 @@ impl GuiApp {
             return;
         }
         self.nav_position += 1;
-        let (target, kind, _mode) = self.nav_history[self.nav_position].clone();
-        self.select_from_history(target, kind);
+        self.select_from_nav_target(self.nav_history[self.nav_position].clone());
     }
 
-    /// A module tree node was clicked — sets `selected_module` directly
-    /// (there's no `GetEntryDetail`-equivalent fetch for a module itself,
-    /// see `EntryDetail`'s doc comment: a module has no editable content
-    /// of its own). Also clears the leaf `selection`/`editor`, same as
-    /// `select` does, so the center pane doesn't keep showing a stale
-    /// leaf's form for a module that's now current.
+    /// Dispatches a landed-on history entry to whichever of
+    /// `select_from_history`/`select_module_from_history` applies —
+    /// shared by `back_clicked`/`forward_clicked`, the only two places
+    /// that ever jump straight to an already-recorded `NavTarget` rather
+    /// than creating a fresh one.
+    fn select_from_nav_target(&mut self, target: NavTarget) {
+        match target {
+            NavTarget::Leaf { target, kind, .. } => self.select_from_history(target, kind),
+            NavTarget::Module(module) => self.select_module_from_history(module),
+        }
+    }
+
+    /// A module (or the project root, `module: []`) tree node was clicked
+    /// — same job `navigate` does for a leaf: truncates any "forward"
+    /// history past the current position, pushes a fresh `NavTarget::
+    /// Module` (the module/project-root counterpart of `navigate`'s own
+    /// `NavTarget::Leaf` push), advances to it, then hands off to
+    /// `select_module_from_history` to actually do the work.
     fn select_module(&mut self, module: Vec<EntryName>) {
-        self.selected_module = module;
-        self.selection = None;
-        self.editor = EditorState::None;
+        self.nav_history.truncate(self.nav_position + 1);
+        self.nav_history.push(NavTarget::Module(module.clone()));
+        self.nav_position = self.nav_history.len() - 1;
+        self.select_module_from_history(module);
     }
 
-    /// Opens the Rename Module modal for `target`, pre-filling the
-    /// new-name field with its current (last-segment) name. `target`
-    /// empty (the project root) never reaches here — the root has no
-    /// rename button in the tree, see `view.rs`.
-    fn rename_module_dialog_opened(&mut self, target: Vec<EntryName>) {
-        let new_name = target.last().map(|name| name.as_str().to_string()).unwrap_or_default();
-        self.rename_module_dialog = Some(RenameModuleDialogState {
-            target,
-            new_name,
+    /// Sets `selected_module`, clears the leaf `selection` (same as
+    /// `select_from_history` does, so the center pane doesn't keep showing
+    /// a stale leaf's form for a module that's now current), and opens its
+    /// view page: `GetModuleSummary` for the counts, `display_name` taken
+    /// from the tree (already in hand, no separate fetch needed for that
+    /// part — see `module_display_name`). Everything `select_module` does
+    /// *except* touching `nav_history`/`nav_position` — the module
+    /// counterpart of `select_from_history`, used directly by
+    /// `select_from_nav_target` for Back/Forward re-visiting a module
+    /// already in `nav_history`.
+    fn select_module_from_history(&mut self, module: Vec<EntryName>) {
+        self.selected_module = module.clone();
+        self.selection = None;
+        let display_name = module_display_name(self.tree.as_ref(), &module);
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        self.module_summary_request = Some(request);
+        self.editor = EditorState::ExistingModule(ModuleDetailFormState {
+            path: module.clone(),
+            display_name,
+            new_name: String::new(),
+            summary: None,
+            read_only: true,
+            edited: false,
             pending_request: None,
             error: None,
         });
+        self.send_command(Command::GetModuleSummary { module, request });
     }
 
-    fn rename_module_dialog_cancelled(&mut self) {
-        self.rename_module_dialog = None;
+    /// Opens the path-picker modal — the Result form's "Pick…" buttons and
+    /// the Requirement form's dependency-row "Pick…" button all funnel
+    /// through here. `target` decides both where a selection gets written
+    /// back to and (via `PathPickerTarget::kind`) which of `self.tree`'s
+    /// leaves the modal lists. Starts with an empty filter every time —
+    /// reopening for a different field shouldn't carry over whatever was
+    /// typed into a previous, unrelated search.
+    fn path_picker_dialog_opened(&mut self, target: PathPickerTarget) {
+        self.path_picker_dialog = Some(PathPickerDialogState {
+            kind: target.kind(),
+            target,
+            filter: String::new(),
+        });
     }
 
-    fn rename_module_dialog_confirmed(&mut self) {
-        let Some(dialog) = &mut self.rename_module_dialog else {
+    fn path_picker_dialog_cancelled(&mut self) {
+        self.path_picker_dialog = None;
+    }
+
+    /// A row picked in the modal's list — writes the fully-qualified
+    /// reference path string for `picked` into whichever field
+    /// `path_picker_dialog.target` names, then closes the modal. A no-op
+    /// (but still closes) if the target form has since closed or switched
+    /// to a different entry — same "a stale target is simply dropped"
+    /// precedent `apply_local_pool_change` follows.
+    fn path_picker_dialog_selected(&mut self, picked: LogicalPath) {
+        let Some(dialog) = self.path_picker_dialog.take() else {
             return;
         };
-        if dialog.new_name.trim().is_empty() {
-            return;
+        let path_str = absolute_reference_path(&picked, leaf_kind_segment(dialog.kind));
+        match dialog.target {
+            PathPickerTarget::ResultRequirementPath => {
+                if let EditorState::NewResult(form) = &mut self.editor {
+                    form.requirement_path = path_str;
+                    form.edited = true;
+                }
+            }
+            PathPickerTarget::ResultTestPath => {
+                if let EditorState::NewResult(form) = &mut self.editor {
+                    form.test_path = path_str;
+                    form.edited = true;
+                }
+            }
+            PathPickerTarget::Dependency(slot) => {
+                if let EditorState::NewRequirement(form) = &mut self.editor {
+                    let dep = match slot {
+                        DependencySlot::Existing(i) => form.dependencies.get_mut(i),
+                        DependencySlot::New => Some(&mut form.new_dependency),
+                    };
+                    if let Some(DependencyDraft::LocalRequirement { path, .. }) = dep {
+                        *path = path_str;
+                    }
+                    // Same "only an already-added row is part of the
+                    // form's real content" distinction
+                    // `apply_commit_fetch_result` already draws.
+                    if let DependencySlot::Existing(_) = slot {
+                        form.edited = true;
+                    }
+                }
+            }
         }
-        let target = dialog.target.clone();
-        let new_name = EntryName(dialog.new_name.clone());
-        let request = self.next_request_id();
-        self.pending.insert(request, PendingKind::Generic);
-        let dialog = self.rename_module_dialog.as_mut().expect("just checked Some above");
-        dialog.pending_request = Some(request);
-        dialog.error = None;
-        self.send_command(Command::RenameModule { target, new_name, request });
     }
 
-    /// A reply for an already-closed dialog is ignored — see
-    /// `detail_request`'s doc for the same "stale reply" shape.  Success
-    /// closes the dialog and, if the renamed module was (or contained)
-    /// the current `selected_module`, updates it in place so "current
-    /// module" doesn't keep pointing at a name that no longer exists.
-    fn apply_rename_module_result(&mut self, request: RequestId, result: Result<(), RenameModuleError>) {
-        let Some(dialog) = &self.rename_module_dialog else {
+    /// The module/project page's Save — a reply for an already-closed (or
+    /// navigated-away-from) page is ignored, same "stale reply" shape as
+    /// `detail_request`. Success flips the page back to its read-only view
+    /// (mirroring `select_from_history`'s "always land on the viewer"
+    /// convention), and updates `path`/`selected_module`/`display_name` to
+    /// the new name — for the root (`path: []`), `RenameProject` never
+    /// touches the path itself, so `last_mut` below is simply a no-op
+    /// there, no special-casing needed. No `GetModuleSummary` re-fetch: a
+    /// rename can't change the subtree's counts, only its own name.
+    fn apply_module_rename_result(&mut self, request: RequestId, result: Result<(), String>) {
+        let EditorState::ExistingModule(form) = &mut self.editor else {
             return;
         };
-        if dialog.pending_request != Some(request) {
+        if form.pending_request != Some(request) {
             return;
         }
+        form.pending_request = None;
 
         match result {
             Ok(()) => {
                 self.dirty = true;
-                let Some(dialog) = self.rename_module_dialog.take() else {
-                    unreachable!("checked Some above")
-                };
-                if let Some(rest) = self.selected_module.strip_prefix(dialog.target.as_slice()) {
-                    let mut renamed = dialog.target[..dialog.target.len() - 1].to_vec();
-                    renamed.push(EntryName(dialog.new_name));
-                    renamed.extend_from_slice(rest);
-                    self.selected_module = renamed;
+                let mut new_path = form.path.clone();
+                if let Some(last) = new_path.last_mut() {
+                    *last = EntryName(form.new_name.clone());
                 }
+                form.path = new_path.clone();
+                form.display_name = form.new_name.clone();
+                form.read_only = true;
+                form.edited = false;
+                form.error = None;
+                self.selected_module = new_path;
             }
-            Err(err) => {
-                let dialog = self.rename_module_dialog.as_mut().expect("checked Some above");
-                dialog.error = Some(err.to_string());
-                dialog.pending_request = None;
+            Err(message) => {
+                form.error = Some(message);
             }
         }
     }
@@ -1008,12 +1327,16 @@ impl GuiApp {
                 test_guidance,
                 dependencies,
                 attachments,
+                met_status,
+                original,
             }) => EditorState::NewRequirement(RequirementFormState {
                 name: target.name.as_str().to_string(),
                 title,
                 requirement_text,
                 requirement_guidance: requirement_guidance.unwrap_or_default(),
                 test_guidance: test_guidance.unwrap_or_default(),
+                original,
+                met_status,
                 editing_target: Some(target),
                 read_only,
                 edited: false,
@@ -1024,16 +1347,20 @@ impl GuiApp {
                 attachments,
                 new_attachment_path: String::new(),
                 local_pool_error: None,
+                pending_commit_fetches: HashMap::new(),
+                commit_fetch_error: None,
             }),
             Some(EntryDetail::Test {
                 title,
                 result_kind,
                 attachments,
                 template_files,
+                original,
             }) => EditorState::NewTest(TestFormState {
                 name: target.name.as_str().to_string(),
                 title,
                 result_kind,
+                original,
                 editing_target: Some(target),
                 read_only,
                 edited: false,
@@ -1052,6 +1379,7 @@ impl GuiApp {
                 test_path,
                 test_commit,
                 attachments,
+                original,
             }) => EditorState::NewResult(ResultFormState {
                 name: target.name.as_str().to_string(),
                 title,
@@ -1059,6 +1387,7 @@ impl GuiApp {
                 requirement_commit,
                 test_path,
                 test_commit,
+                original,
                 editing_target: Some(target),
                 read_only,
                 edited: false,
@@ -1307,6 +1636,70 @@ impl GuiApp {
         self.remove_local_pool_entry(kind, target, path);
     }
 
+    /// A dependency row's "Auto" button — see `render_dependency_fields`'s
+    /// doc comment on how `kind` was built. Sends the matching
+    /// `ResolveLocalCommit`/`ResolveRemoteCommit` and records `target` so
+    /// `apply_commit_fetch_result` knows which dependency to fill in once
+    /// the reply arrives.
+    fn dependency_commit_auto_clicked(&mut self, target: DependencySlot, kind: AutoCommitKind) {
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        if let EditorState::NewRequirement(form) = &mut self.editor {
+            form.pending_commit_fetches.insert(request, target);
+            form.commit_fetch_error = None;
+        } else {
+            return;
+        }
+        let command = match kind {
+            AutoCommitKind::Local(target) => Command::ResolveLocalCommit {
+                target,
+                kind: EntryKind::Requirement,
+                request,
+            },
+            AutoCommitKind::Remote { url, path } => Command::ResolveRemoteCommit { url, path, request },
+        };
+        self.send_command(command);
+    }
+
+    /// Applies a `ResolveLocalCommit`/`ResolveRemoteCommit` reply to
+    /// whichever dependency slot requested it. A no-op if the Requirement
+    /// form has since closed, switched to a different entry, or the row
+    /// itself was removed while the fetch was in flight — same "a stale
+    /// reply is simply dropped" precedent as `apply_local_pool_change`.
+    fn apply_commit_fetch_result(&mut self, request: RequestId, result: Result<String, String>) {
+        let EditorState::NewRequirement(form) = &mut self.editor else {
+            return;
+        };
+        let Some(target) = form.pending_commit_fetches.remove(&request) else {
+            return;
+        };
+        match result {
+            Ok(commit) => {
+                let dep = match target {
+                    DependencySlot::Existing(i) => form.dependencies.get_mut(i),
+                    DependencySlot::New => Some(&mut form.new_dependency),
+                };
+                let Some(dep) = dep else {
+                    return;
+                };
+                match dep {
+                    DependencyDraft::LocalRequirement { commit: field, .. } => *field = commit,
+                    DependencyDraft::Remote { commit: field, .. } => *field = commit,
+                    DependencyDraft::Submodules => {}
+                }
+                // Only an already-added row is part of the form's real,
+                // submitted content — same distinction the "Add
+                // dependency" composer's own edits get in the render code
+                // (see the comment above `render_dependency_kind_picker`'s
+                // "Add dependency" call site).
+                if let DependencySlot::Existing(_) = target {
+                    form.edited = true;
+                }
+            }
+            Err(message) => form.commit_fetch_error = Some(message),
+        }
+    }
+
     fn apply_local_pool_outcome(&mut self, request: RequestId, result: Result<(), String>) {
         let Some(op) = self.local_pool_ops.remove(&request) else {
             return;
@@ -1387,7 +1780,7 @@ impl GuiApp {
             EditorState::NewRequirement(f) => f.editing_target.clone().map(|t| (t, EntryKind::Requirement)),
             EditorState::NewTest(f) => f.editing_target.clone().map(|t| (t, EntryKind::Test)),
             EditorState::NewResult(f) => f.editing_target.clone().map(|t| (t, EntryKind::Result)),
-            EditorState::NewModule(_) | EditorState::None => None,
+            EditorState::NewModule(_) | EditorState::ExistingModule(_) | EditorState::None => None,
         }
     }
 
@@ -1401,6 +1794,19 @@ impl GuiApp {
     /// nothing with an existing target is open (there's no "Edit" button
     /// to click in that case anyway).
     fn editor_edit_clicked(&mut self) {
+        // The module/project page's Edit is a local flag flip, not a
+        // navigation: there's no `NavMode`/`nav_history` for module
+        // selections (see `nav_history`'s own doc comment), and nothing
+        // about the already-fetched `summary` goes stale by toggling
+        // `read_only` — unlike a leaf's edit form, which re-fetches to
+        // keep its starting point authoritative.
+        if let EditorState::ExistingModule(form) = &mut self.editor {
+            form.new_name = form.display_name.clone();
+            form.read_only = false;
+            form.edited = false;
+            form.error = None;
+            return;
+        }
         if let Some((target, kind)) = self.editing_target_and_kind() {
             self.navigate(target, kind, NavMode::Edit);
         }
@@ -1414,6 +1820,15 @@ impl GuiApp {
     /// create-mode form (`editing_target: None`) has no viewer to return
     /// to, so it just closes, same as before this existed.
     fn editor_cancel_clicked(&mut self) {
+        // Mirrors `editor_edit_clicked`'s module/project special case — a
+        // local flip back to the viewer, discarding `new_name`; nothing
+        // else in the page was mutable, so there's nothing to re-fetch.
+        if let EditorState::ExistingModule(form) = &mut self.editor {
+            form.read_only = true;
+            form.edited = false;
+            form.error = None;
+            return;
+        }
         match self.editing_target_and_kind() {
             Some((target, kind)) => self.navigate(target, kind, NavMode::View),
             None => self.editor = EditorState::None,
@@ -1448,6 +1863,11 @@ impl GuiApp {
                 form.error = None;
                 Some(form.build_command(module, request))
             }
+            EditorState::ExistingModule(form) => {
+                form.pending_request = Some(request);
+                form.error = None;
+                Some(form.build_command(request))
+            }
             EditorState::None => None,
         };
         if let Some(command) = command {
@@ -1472,7 +1892,7 @@ impl GuiApp {
             EditorState::NewTest(f) => f.pending_request == Some(request),
             EditorState::NewResult(f) => f.pending_request == Some(request),
             EditorState::NewModule(f) => f.pending_request == Some(request),
-            EditorState::None => false,
+            EditorState::ExistingModule(_) | EditorState::None => false,
         };
         if !is_pending {
             return;
@@ -1502,7 +1922,7 @@ impl GuiApp {
                         f.error = Some(message);
                         f.pending_request = None;
                     }
-                    EditorState::None => {}
+                    EditorState::ExistingModule(_) | EditorState::None => {}
                 }
             }
         }
@@ -1521,7 +1941,7 @@ impl GuiApp {
             EditorState::NewRequirement(f) => f.pending_request == Some(request),
             EditorState::NewTest(f) => f.pending_request == Some(request),
             EditorState::NewResult(f) => f.pending_request == Some(request),
-            EditorState::NewModule(_) | EditorState::None => false,
+            EditorState::NewModule(_) | EditorState::ExistingModule(_) | EditorState::None => false,
         };
         if !is_pending {
             return;
@@ -1552,8 +1972,56 @@ impl GuiApp {
                 f.pending_request = None;
                 f.edited = !succeeded;
             }
-            EditorState::NewModule(_) | EditorState::None => {}
+            EditorState::NewModule(_) | EditorState::ExistingModule(_) | EditorState::None => {}
         }
+    }
+
+    /// Applies a `RefreshStaleTestReferences` reply — same stale-reply
+    /// guard as `apply_update_result` (checked against `form.pending_request`),
+    /// but its own method rather than folded into that shared one: this
+    /// button only ever appears in the read-only viewer, so, unlike a
+    /// real Save/Create, a success here is always safe to react to with a
+    /// full `GetEntryDetail` re-fetch — there's no in-progress edit it
+    /// could clobber. `gui-core` implicitly revalidates on success (see
+    /// `Command::RefreshStaleTestReferences`'s own doc comment), so this
+    /// re-fetch reflects the real, freshly-recomputed `met_status` rather
+    /// than a blanket `Unvalidated`.
+    fn apply_refresh_stale_test_references_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::RefreshStaleTestReferencesError>,
+    ) {
+        let target = {
+            let EditorState::NewRequirement(form) = &mut self.editor else {
+                return;
+            };
+            if form.pending_request != Some(request) {
+                return;
+            }
+            form.pending_request = None;
+            match result {
+                Ok(()) => {
+                    form.error = None;
+                    form.editing_target.clone()
+                }
+                Err(err) => {
+                    form.error = Some(err.to_string());
+                    None
+                }
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.dirty = true;
+        let detail_request = self.next_request_id();
+        self.pending.insert(detail_request, PendingKind::Generic);
+        self.detail_request = Some(detail_request);
+        self.send_command(Command::GetEntryDetail {
+            target,
+            kind: EntryKind::Requirement,
+            request: detail_request,
+        });
     }
 
     /// The Exit button / File -> Exit / window close handler. See
@@ -1650,6 +2118,11 @@ impl eframe::App for GuiApp {
         // call unconditionally every frame rather than tracking "did the
         // zoom change this frame" separately.
         ui.ctx().set_zoom_factor(self.config.zoom_percent as f32 / 100.0);
+        // Same "cheap enough to set unconditionally" reasoning as
+        // `set_zoom_factor` above — `set_theme` just writes
+        // `Options::theme_preference`, no per-call cost worth tracking
+        // "did this actually change" around.
+        ui.ctx().set_theme(self.config.theme);
 
         self.tick_exit_dialog(Instant::now());
 
@@ -1681,7 +2154,7 @@ impl eframe::App for GuiApp {
         self.render_unsaved_changes_dialog(ui);
         self.render_unsaved_form_dialog(ui);
         self.render_attachments_dialog(ui);
-        self.render_rename_module_dialog(ui);
+        self.render_path_picker_dialog(ui);
         self.render_exit_dialog(ui);
         #[cfg(all(feature = "debug-panel", debug_assertions))]
         self.render_debug_confirm_dialog(ui);
@@ -1689,6 +2162,94 @@ impl eframe::App for GuiApp {
         // Keep polling try_recv_event promptly even with no user input —
         // see README's "Never block the render thread".
         ui.ctx().request_repaint();
+    }
+}
+
+/// Every requirement (or test) in the currently-loaded tree, as
+/// `LogicalPath`s — the path-picker modal's own option list (`view.rs`'s
+/// `render_path_picker_dialog`). Walks `tree.root.children` directly (not
+/// `render_tree_node`'s recursion), for the same reason `render_left_pane`
+/// renders the root specially: the root `TreeNode`'s own `name` is a
+/// display label, not a real module-path segment, and must never be
+/// pushed into a child's path.
+pub(crate) fn flatten_leaf_paths(tree: &TreeSnapshot, kind: EntryKind) -> Vec<LogicalPath> {
+    let mut out = Vec::new();
+    collect_leaf_paths(&tree.root.children, kind, &[], &mut out);
+    out
+}
+
+fn collect_leaf_paths(children: &[TreeNode], kind: EntryKind, module_path: &[EntryName], out: &mut Vec<LogicalPath>) {
+    for child in children {
+        if child.kind == EntryKind::Module {
+            let mut child_path = module_path.to_vec();
+            child_path.push(child.name.clone());
+            collect_leaf_paths(&child.children, kind, &child_path, out);
+        } else if child.kind == kind {
+            out.push(LogicalPath {
+                modules: module_path.to_vec(),
+                name: child.name.clone(),
+            });
+        }
+    }
+}
+
+/// The absolute (project-root-relative, leading-`/`) `disk::ReferencePath`
+/// string for `target` — matches `logical::path::parse_reference_path`'s
+/// expected `/[modules/<sub>/]*<kind_segment>/<name>` format exactly (see
+/// that function's own parsing logic in `crates/logical/src/path.rs`),
+/// which is what `ResultDraft::requirement_path`/`test_path` are parsed
+/// against at `validate()` time. `kind_segment` is `"requirements"` or
+/// `"tests"` — the on-disk directory name, not `EntryKind`'s Rust-side
+/// spelling.
+/// The display name for a module path, read straight out of `tree` rather
+/// than a separate round trip — the tree already carries every module's
+/// name (it's a `TreeNode` per module), so there's nothing `gui-core` needs
+/// to be asked for here. Falls back to the path's own last segment if the
+/// tree hasn't loaded yet or the path doesn't (yet) resolve — same "never
+/// panic on a momentarily-stale view" spirit as the rest of this module.
+/// A free function (not a `&self` method) so it can be called from
+/// `apply_event`'s `Event::TreeChanged` arm while `self.editor` is
+/// separately borrowed mutably — see that arm's own comment.
+fn module_display_name(tree: Option<&TreeSnapshot>, path: &[EntryName]) -> String {
+    let Some(tree) = tree else {
+        return path.last().map(|name| name.as_str().to_string()).unwrap_or_default();
+    };
+    let mut node = &tree.root;
+    for segment in path {
+        match node.children.iter().find(|child| child.kind == EntryKind::Module && &child.name == segment) {
+            Some(child) => node = child,
+            None => return segment.as_str().to_string(),
+        }
+    }
+    node.name.as_str().to_string()
+}
+
+pub(crate) fn absolute_reference_path(target: &LogicalPath, kind_segment: &str) -> String {
+    let mut path = String::from("/");
+    for module in &target.modules {
+        path.push_str("modules/");
+        path.push_str(module.as_str());
+        path.push('/');
+    }
+    path.push_str(kind_segment);
+    path.push('/');
+    path.push_str(target.name.as_str());
+    path
+}
+
+/// The on-disk directory name for a leaf `kind` — `"requirements"`/
+/// `"tests"`/`"results"`, matching `disk`'s own project layout (see
+/// `absolute_reference_path`'s doc comment). `EntryKind::Module` has no
+/// leaf path of its own, so no sensible mapping — every caller
+/// (`view.rs`'s `node_matches_filter`/`render_path_picker_dialog`,
+/// `path_picker_dialog_selected` above) only ever reaches this with a real
+/// leaf kind.
+pub(crate) fn leaf_kind_segment(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Requirement => "requirements",
+        EntryKind::Test => "tests",
+        EntryKind::Result => "results",
+        EntryKind::Module => unreachable!("a module has no leaf path of its own"),
     }
 }
 
@@ -1997,6 +2558,319 @@ mod test {
         assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("first"))));
     }
 
+    /// The bug this session's whole nav_history/`NavTarget` change fixes:
+    /// before it, `select_module` never touched `nav_history` at all, so
+    /// Back from a module page landed on whatever was selected *before*
+    /// the leaf actually being viewed, silently skipping it.
+    #[test]
+    fn back_after_selecting_a_module_between_two_leaves_lands_on_the_middle_leaf() {
+        let mut app = test_app();
+        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
+        app.select(LogicalPath::root(disk_entry_name("second")), EntryKind::Requirement);
+        app.select_module(vec![disk_entry_name("m")]);
+        assert!(matches!(app.editor, EditorState::ExistingModule(_)));
+
+        app.back_clicked();
+
+        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("second"))));
+        assert!(matches!(app.editor, EditorState::None));
+    }
+
+    #[test]
+    fn selecting_a_module_after_going_back_discards_forward_history() {
+        let mut app = test_app();
+        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
+        app.select(LogicalPath::root(disk_entry_name("second")), EntryKind::Requirement);
+        app.back_clicked();
+        assert!(app.can_go_forward());
+
+        app.select_module(vec![disk_entry_name("m")]);
+
+        assert!(!app.can_go_forward());
+        app.back_clicked();
+        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("first"))));
+    }
+
+    #[test]
+    fn back_and_forward_walk_through_a_mixed_leaf_and_module_history() {
+        let mut app = test_app();
+        app.select(LogicalPath::root(disk_entry_name("a")), EntryKind::Requirement);
+        app.select_module(vec![disk_entry_name("m1")]);
+        app.select(LogicalPath::root(disk_entry_name("b")), EntryKind::Requirement);
+        app.select_module(Vec::new()); // the project root
+
+        // history: [a, m1, b, root], position 3 (root)
+        assert!(matches!(app.editor, EditorState::ExistingModule(_)));
+        assert_eq!(app.selected_module, Vec::<gui_core::EntryName>::new());
+
+        app.back_clicked(); // -> b
+        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("b"))));
+
+        app.back_clicked(); // -> m1
+        assert_eq!(app.selected_module, vec![disk_entry_name("m1")]);
+        assert!(matches!(app.editor, EditorState::ExistingModule(_)));
+
+        app.back_clicked(); // -> a
+        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("a"))));
+        assert!(!app.can_go_back());
+
+        app.forward_clicked(); // -> m1
+        assert_eq!(app.selected_module, vec![disk_entry_name("m1")]);
+
+        app.forward_clicked(); // -> b
+        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("b"))));
+
+        app.forward_clicked(); // -> root
+        assert_eq!(app.selected_module, Vec::<gui_core::EntryName>::new());
+        assert!(!app.can_go_forward());
+    }
+
+    // --- Randomized/model-based nav_history fuzz test ---------------------
+    //
+    // An independent oracle for `nav_history`'s browser back/forward
+    // semantics, built from the feature's own spec (a fresh navigation
+    // truncates any forward history and becomes the new current stop;
+    // Back/Forward just move `position` through the existing list) rather
+    // than from reading `NavTarget`/`select_module`/`navigate` themselves —
+    // otherwise this would just be restating the implementation back at
+    // itself. Runs a long pseudorandom (but fixed-seed, reproducible)
+    // sequence of real `GuiApp` actions against a tiny fake universe of
+    // leaves/modules and checks the live app state against the model after
+    // every step.
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Stop {
+        Leaf { name: &'static str, mode: NavMode },
+        /// Index into `FAKE_MODULES`; `0` is the project root.
+        Module(usize),
+    }
+
+    struct Model {
+        stops: Vec<Stop>,
+        position: usize,
+    }
+
+    impl Model {
+        fn new(first: Stop) -> Self {
+            Model {
+                stops: vec![first],
+                position: 0,
+            }
+        }
+
+        fn current(&self) -> Stop {
+            self.stops[self.position]
+        }
+
+        /// A fresh navigation: truncate-and-push, same rule `navigate`/
+        /// `select_module` both follow.
+        fn navigate(&mut self, stop: Stop) {
+            self.stops.truncate(self.position + 1);
+            self.stops.push(stop);
+            self.position = self.stops.len() - 1;
+        }
+
+        fn can_go_back(&self) -> bool {
+            self.position > 0
+        }
+
+        fn can_go_forward(&self) -> bool {
+            self.position + 1 < self.stops.len()
+        }
+
+        fn back(&mut self) {
+            if self.can_go_back() {
+                self.position -= 1;
+            }
+        }
+
+        fn forward(&mut self) {
+            if self.can_go_forward() {
+                self.position += 1;
+            }
+        }
+    }
+
+    const FAKE_LEAVES: [&str; 3] = ["a", "b", "c"];
+    /// `&[]` is the project root.
+    const FAKE_MODULES: [&[&str]; 3] = [&[], &["m1"], &["m2"]];
+
+    fn fake_module_path(index: usize) -> Vec<gui_core::EntryName> {
+        FAKE_MODULES[index].iter().map(|s| disk_entry_name(s)).collect()
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Action {
+        SelectLeaf(usize),
+        SelectModule(usize),
+        EditClick,
+        TriggerValidate,
+        Back,
+        Forward,
+    }
+
+    /// Completes whichever of `detail_request`/`module_summary_request`/
+    /// `met_status_request` is currently outstanding with a canned reply,
+    /// looping until none remain — generalizes
+    /// `complete_definition_requirement_detail` to any fake leaf/module and
+    /// to the extra requests `EditClick`/`TriggerValidate` can also
+    /// trigger. "Outstanding" is judged via `app.pending` (cleared by
+    /// `apply_event` for any completed request), not by the `*_request`
+    /// fields going back to `None` — those are only ever overwritten by a
+    /// fresher request, per their own doc comments (they exist to reject
+    /// stale replies by id, not to signal "still waiting"). Bounded so a
+    /// genuine bug (a request that never gets cleared) fails the test
+    /// loudly instead of hanging it.
+    fn settle(app: &mut GuiApp) {
+        for _ in 0..10 {
+            if let Some(request) = app.detail_request
+                && app.pending.contains_key(&request)
+            {
+                app.apply_event(Event::Completed {
+                    request,
+                    outcome: Outcome::EntryDetail(Some(gui_core::EntryDetail::Requirement {
+                        title: "Fake".to_string(),
+                        requirement_text: String::new(),
+                        requirement_guidance: None,
+                        test_guidance: None,
+                        dependencies: Vec::new(),
+                        attachments: Vec::new(),
+                        met_status: gui_core::RequirementMetStatus::Unvalidated,
+                        original: Box::new(gui_core::RequirementDraft::new("Fake")),
+                    })),
+                });
+                continue;
+            }
+            if let Some(request) = app.module_summary_request
+                && app.pending.contains_key(&request)
+            {
+                app.apply_event(Event::Completed {
+                    request,
+                    outcome: Outcome::ModuleSummary(Some(gui_core::ModuleSummary::default())),
+                });
+                continue;
+            }
+            if let Some(request) = app.met_status_request
+                && app.pending.contains_key(&request)
+            {
+                app.apply_event(Event::Completed {
+                    request,
+                    outcome: Outcome::RequirementMetStatus(gui_core::RequirementMetStatus::Unvalidated),
+                });
+                continue;
+            }
+            return;
+        }
+        panic!("settle: a request never drained after 10 rounds — likely a stale-reply bug");
+    }
+
+    /// Asserts the live `app` matches exactly what `model.current()` says
+    /// should be on screen — the fuzz test's whole point, run after every
+    /// single action.
+    fn assert_matches_model(app: &GuiApp, model: &Model) {
+        assert_eq!(app.can_go_back(), model.can_go_back());
+        assert_eq!(app.can_go_forward(), model.can_go_forward());
+
+        match model.current() {
+            Stop::Leaf { name, mode } => {
+                assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name(name))));
+                let EditorState::NewRequirement(form) = &app.editor else {
+                    panic!("expected NewRequirement, got {:?}", app.editor);
+                };
+                assert_eq!(form.editing_target, Some(LogicalPath::root(disk_entry_name(name))));
+                assert_eq!(form.read_only, mode == NavMode::View);
+            }
+            Stop::Module(index) => {
+                assert_eq!(app.selection, None);
+                assert_eq!(app.selected_module, fake_module_path(index));
+                let EditorState::ExistingModule(form) = &app.editor else {
+                    panic!("expected ExistingModule, got {:?}", app.editor);
+                };
+                assert_eq!(form.path, fake_module_path(index));
+            }
+        }
+    }
+
+    fn run_nav_fuzz(seed: u64, actions: usize) {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut app = test_app();
+        app.select(LogicalPath::root(disk_entry_name(FAKE_LEAVES[0])), EntryKind::Requirement);
+        settle(&mut app);
+        let mut model = Model::new(Stop::Leaf {
+            name: FAKE_LEAVES[0],
+            mode: NavMode::View,
+        });
+        assert_matches_model(&app, &model);
+
+        for _ in 0..actions {
+            let action = match rng.random_range(0..100u32) {
+                0..=19 => Action::SelectLeaf(rng.random_range(0..FAKE_LEAVES.len())),
+                20..=29 => Action::SelectModule(rng.random_range(0..FAKE_MODULES.len())),
+                30..=39 => Action::EditClick,
+                40..=49 => Action::TriggerValidate,
+                50..=74 => Action::Back,
+                _ => Action::Forward,
+            };
+
+            match action {
+                Action::SelectLeaf(i) => {
+                    let name = FAKE_LEAVES[i];
+                    app.select(LogicalPath::root(disk_entry_name(name)), EntryKind::Requirement);
+                    model.navigate(Stop::Leaf { name, mode: NavMode::View });
+                }
+                Action::SelectModule(i) => {
+                    app.select_module(fake_module_path(i));
+                    model.navigate(Stop::Module(i));
+                }
+                Action::EditClick => {
+                    // Mirrors the real "Edit" button only being on screen
+                    // for a read-only leaf viewer in the first place — the
+                    // no-op cases (a module page, or an already-editable
+                    // form) are already covered by
+                    // `editor_edit_clicked_does_nothing_for_a_create_mode_form`
+                    // and aren't what this test is about.
+                    if let Stop::Leaf { name, mode: NavMode::View } = model.current() {
+                        app.editor_edit_clicked();
+                        model.navigate(Stop::Leaf { name, mode: NavMode::Edit });
+                    }
+                }
+                Action::TriggerValidate => {
+                    // Doesn't change what's the "current" nav stop, just
+                    // proves it doesn't corrupt navigation while refreshing
+                    // whatever's open.
+                    app.apply_event(Event::Completed {
+                        request: 999,
+                        outcome: Outcome::Validate(Ok(())),
+                    });
+                }
+                Action::Back => app.back_clicked(),
+                Action::Forward => app.forward_clicked(),
+            }
+            if matches!(action, Action::Back | Action::Forward) {
+                match action {
+                    Action::Back => model.back(),
+                    Action::Forward => model.forward(),
+                    _ => unreachable!(),
+                }
+            }
+
+            settle(&mut app);
+            assert_matches_model(&app, &model);
+        }
+    }
+
+    #[test]
+    fn nav_history_matches_an_independent_model_across_hundreds_of_random_actions_seed_1() {
+        run_nav_fuzz(1, 400);
+    }
+
+    #[test]
+    fn nav_history_matches_an_independent_model_across_hundreds_of_random_actions_seed_2() {
+        run_nav_fuzz(0xC0FFEE, 400);
+    }
+
     #[test]
     fn a_matching_requirement_detail_reply_opens_it_pre_filled_and_read_only() {
         let mut app = test_app();
@@ -2012,6 +2886,8 @@ mod test {
                 test_guidance: None,
                 dependencies: Vec::new(),
                 attachments: Vec::new(),
+                met_status: gui_core::RequirementMetStatus::Unvalidated,
+                original: Box::new(gui_core::RequirementDraft::new("Definition")),
             })),
         });
 
@@ -2050,6 +2926,8 @@ mod test {
                     gui_core::DependencyReferenceKind::Submodules,
                 ],
                 attachments: Vec::new(),
+                met_status: gui_core::RequirementMetStatus::Unvalidated,
+                original: Box::new(gui_core::RequirementDraft::new("Definition")),
             })),
         });
 
@@ -2298,6 +3176,8 @@ mod test {
                 test_guidance: None,
                 dependencies: Vec::new(),
                 attachments: Vec::new(),
+                met_status: gui_core::RequirementMetStatus::Unvalidated,
+                original: Box::new(gui_core::RequirementDraft::new("First")),
             })),
         });
 
@@ -2431,6 +3311,24 @@ mod test {
     }
 
     #[test]
+    fn a_successful_new_project_opens_the_root_view_page() {
+        let mut app = test_app();
+        app.new_project_dialog_opened();
+        app.new_project_dialog_confirmed();
+        let request = app.next_request;
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::NewProject,
+        });
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.path.is_empty());
+    }
+
+    #[test]
     fn a_successful_save_as_clears_dirty() {
         let mut app = test_app();
         app.save_project_as(std::path::PathBuf::from("/some/project"));
@@ -2491,6 +3389,55 @@ mod test {
         });
 
         assert!(!app.needs_path_before_saving());
+    }
+
+    #[test]
+    fn a_successful_load_project_opens_the_root_view_page() {
+        let mut app = test_app();
+        app.open_project(std::path::PathBuf::from("/some/project"));
+        let request = app.next_request;
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::LoadProject(Ok(())),
+        });
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.path.is_empty());
+    }
+
+    #[test]
+    fn a_tree_changed_event_refreshes_an_open_root_pages_display_name() {
+        // No `self.tree` yet (`select_module` falls back to the path's own
+        // last segment when it's `None` — for the root, an empty string,
+        // since `path: []` has no last segment) — this is exactly the gap
+        // between a `LoadProject` `Outcome` and its own `TreeChanged`
+        // (`gui-core::Actor::apply_completion`'s ordering) this arm exists
+        // to close.
+        let mut app = test_app();
+        app.select_module(Vec::new());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert_eq!(form.display_name, "");
+
+        app.apply_event(Event::TreeChanged(TreeSnapshot {
+            root: TreeNode {
+                name: disk_entry_name("Capstone"),
+                kind: EntryKind::Module,
+                status: gui_core::EntryStatus::Unvalidated,
+                children: Vec::new(),
+            },
+            can_undo: false,
+            can_redo: false,
+        }));
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert_eq!(form.display_name, "Capstone");
     }
 
     #[test]
@@ -2659,7 +3606,7 @@ mod test {
 
         assert_eq!(app.selected_module, vec![disk_entry_name("setup")]);
         assert!(app.selection.is_none());
-        assert!(matches!(app.editor, EditorState::None));
+        assert!(matches!(app.editor, EditorState::ExistingModule(_)));
     }
 
     #[test]
@@ -2694,6 +3641,8 @@ mod test {
                 test_guidance: None,
                 dependencies: Vec::new(),
                 attachments: Vec::new(),
+                met_status: gui_core::RequirementMetStatus::Unvalidated,
+                original: Box::new(gui_core::RequirementDraft::new("Definition")),
             })),
         });
     }
@@ -3014,6 +3963,213 @@ mod test {
     }
 
     #[test]
+    fn validate_completion_refreshes_the_open_requirements_met_status() {
+        let mut app = app_editing_a_requirement();
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(matches!(form.met_status, gui_core::RequirementMetStatus::Unvalidated));
+
+        app.apply_event(Event::Completed {
+            request: 999,
+            outcome: Outcome::Validate(Ok(())),
+        });
+        let request = app.met_status_request.expect("Validate should have requested a met_status refresh");
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RequirementMetStatus(gui_core::RequirementMetStatus::Met),
+        });
+
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(matches!(form.met_status, gui_core::RequirementMetStatus::Met));
+        assert!(app.met_status_request.is_none());
+    }
+
+    #[test]
+    fn validate_completion_does_nothing_for_a_creation_mode_form() {
+        let mut app = test_app();
+        app.new_requirement_clicked();
+
+        app.apply_event(Event::Completed {
+            request: 999,
+            outcome: Outcome::Validate(Ok(())),
+        });
+
+        // No `editing_target` to refresh a `met_status` for.
+        assert!(app.met_status_request.is_none());
+    }
+
+    #[test]
+    fn validate_completion_refreshes_an_open_module_pages_summary() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        // Clear the stale request `select_module` itself already sent, so
+        // the assertion below can only be satisfied by `Validate`'s own
+        // refresh.
+        app.module_summary_request = None;
+
+        app.apply_event(Event::Completed {
+            request: 999,
+            outcome: Outcome::Validate(Ok(())),
+        });
+
+        let request = app.module_summary_request.expect("Validate should have requested a summary refresh");
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::ModuleSummary(Some(gui_core::ModuleSummary {
+                validated: true,
+                requirement_count: 2,
+                requirements_met: 1,
+                ..Default::default()
+            })),
+        });
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        let summary = form.summary.as_ref().expect("summary should be populated");
+        assert!(summary.validated);
+        assert_eq!(summary.requirements_met, 1);
+    }
+
+    #[test]
+    fn validate_completion_does_nothing_for_a_creation_mode_module_form() {
+        let mut app = test_app();
+        app.new_module_clicked();
+
+        app.apply_event(Event::Completed {
+            request: 999,
+            outcome: Outcome::Validate(Ok(())),
+        });
+
+        // `NewModule` (creation) has no `ExistingModule` page to refresh.
+        assert!(app.module_summary_request.is_none());
+    }
+
+    #[test]
+    fn refresh_stale_test_references_clicked_sends_the_command_and_tracks_it_as_pending() {
+        let mut app = app_editing_a_requirement();
+
+        app.refresh_stale_test_references_clicked();
+
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.pending_request.is_some());
+        assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn refresh_stale_test_references_clicked_does_nothing_for_a_creation_mode_form() {
+        let mut app = test_app();
+        app.new_requirement_clicked();
+
+        app.refresh_stale_test_references_clicked();
+
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        // No `editing_target` — nothing to send a command against.
+        assert!(form.pending_request.is_none());
+    }
+
+    #[test]
+    fn a_successful_refresh_marks_dirty_and_refetches_entry_detail() {
+        let mut app = app_editing_a_requirement();
+        app.refresh_stale_test_references_clicked();
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = form.pending_request.unwrap();
+        assert!(!app.dirty);
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RefreshStaleTestReferences(Ok(())),
+        });
+
+        assert!(app.dirty);
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.pending_request.is_none());
+        assert!(form.error.is_none());
+        // Re-fetches the full detail — same "always re-fetch rather than
+        // trust stale local state" convention `select_from_history` uses.
+        assert!(app.detail_request.is_some());
+    }
+
+    #[test]
+    fn a_failed_refresh_shows_the_error_and_does_not_refetch() {
+        let mut app = app_editing_a_requirement();
+        app.refresh_stale_test_references_clicked();
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = form.pending_request.unwrap();
+        let stale_detail_request = app.detail_request;
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RefreshStaleTestReferences(Err(gui_core::RefreshStaleTestReferencesError::NotValidated)),
+        });
+
+        assert!(!app.dirty);
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.pending_request.is_none());
+        assert!(form.error.is_some());
+        // No re-fetch on failure — nothing on disk/in the draft actually
+        // changed.
+        assert_eq!(app.detail_request, stale_detail_request);
+    }
+
+    #[test]
+    fn a_stale_refresh_reply_is_ignored_after_the_form_is_closed() {
+        let mut app = app_editing_a_requirement();
+        app.refresh_stale_test_references_clicked();
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = form.pending_request.unwrap();
+        app.editor_cancel_clicked();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RefreshStaleTestReferences(Ok(())),
+        });
+
+        // Still closed — the reply didn't resurrect a form the user
+        // already navigated away from.
+        assert!(matches!(app.editor, EditorState::None));
+    }
+
+    #[test]
+    fn a_stale_met_status_reply_is_ignored_after_the_form_is_closed() {
+        let mut app = app_editing_a_requirement();
+        app.apply_event(Event::Completed {
+            request: 999,
+            outcome: Outcome::Validate(Ok(())),
+        });
+        let request = app.met_status_request.expect("Validate should have requested a met_status refresh");
+        app.editor_cancel_clicked();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RequirementMetStatus(gui_core::RequirementMetStatus::Met),
+        });
+
+        // Still closed — the reply didn't resurrect a form the user
+        // already navigated away from.
+        assert!(matches!(app.editor, EditorState::None));
+    }
+
+    #[test]
     fn a_stale_local_attachment_reply_is_ignored_after_the_form_is_closed() {
         let mut app = app_editing_a_requirement();
         let EditorState::NewRequirement(form) = &mut app.editor else {
@@ -3035,6 +4191,67 @@ mod test {
     }
 
     #[test]
+    fn a_stale_commit_fetch_reply_is_ignored_after_the_form_is_closed() {
+        let mut app = app_editing_a_requirement();
+        app.dependency_commit_auto_clicked(
+            DependencySlot::New,
+            AutoCommitKind::Local(LogicalPath::root(disk_entry_name("discovery"))),
+        );
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = *form.pending_commit_fetches.keys().next().unwrap();
+        app.editor_cancel_clicked();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::ResolveLocalCommit(Ok("deadbeef".to_string())),
+        });
+
+        // Still closed — same "the reply didn't resurrect a form the user
+        // already navigated away from" precedent as the local-attachment
+        // reply above.
+        assert!(matches!(app.editor, EditorState::None));
+    }
+
+    #[test]
+    fn a_stale_commit_fetch_reply_for_a_removed_dependency_is_ignored() {
+        let mut app = app_editing_a_requirement();
+        let EditorState::NewRequirement(form) = &mut app.editor else {
+            unreachable!()
+        };
+        form.dependencies.push(DependencyDraft::LocalRequirement {
+            path: "/requirements/discovery".to_string(),
+            commit: String::new(),
+        });
+        app.dependency_commit_auto_clicked(
+            DependencySlot::Existing(0),
+            AutoCommitKind::Local(LogicalPath::root(disk_entry_name("discovery"))),
+        );
+        let EditorState::NewRequirement(form) = &mut app.editor else {
+            unreachable!()
+        };
+        let request = *form.pending_commit_fetches.keys().next().unwrap();
+        // The row itself is gone by the time the reply lands — a
+        // different stale-reply shape than the form closing outright
+        // (`a_stale_commit_fetch_reply_is_ignored_after_the_form_is_closed`
+        // above): the form's still open, just with nothing left at that
+        // index for `apply_commit_fetch_result` to write into.
+        form.dependencies.remove(0);
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::ResolveLocalCommit(Ok("deadbeef".to_string())),
+        });
+
+        // No panic, and nothing resurrected the removed row.
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.dependencies.is_empty());
+    }
+
+    #[test]
     fn local_attachment_add_clicked_does_nothing_for_a_creation_mode_form() {
         let mut app = test_app();
         app.new_requirement_clicked();
@@ -3051,140 +4268,208 @@ mod test {
     }
 
     #[test]
-    fn rename_module_dialog_opened_pre_fills_the_current_name() {
+    fn select_module_opens_the_view_page_and_fetches_its_summary() {
         let mut app = test_app();
 
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
+        app.select_module(vec![disk_entry_name("setup")]);
 
-        let dialog = app.rename_module_dialog.as_ref().unwrap();
-        assert_eq!(dialog.target, vec![disk_entry_name("setup")]);
-        assert_eq!(dialog.new_name, "setup");
-    }
-
-    #[test]
-    fn rename_module_dialog_cancelled_closes_it() {
-        let mut app = test_app();
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-
-        app.rename_module_dialog_cancelled();
-
-        assert!(app.rename_module_dialog.is_none());
-    }
-
-    #[test]
-    fn rename_module_dialog_confirmed_sends_the_command() {
-        let mut app = test_app();
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-        app.rename_module_dialog.as_mut().unwrap().new_name = "renamed".to_string();
-
-        app.rename_module_dialog_confirmed();
-
-        let dialog = app.rename_module_dialog.as_ref().unwrap();
-        assert!(dialog.pending_request.is_some());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert_eq!(form.path, vec![disk_entry_name("setup")]);
+        assert!(form.read_only);
+        assert!(form.summary.is_none());
+        assert!(app.module_summary_request.is_some());
         assert_eq!(app.pending.len(), 1);
     }
 
     #[test]
-    fn rename_module_dialog_confirmed_with_an_empty_name_does_nothing() {
+    fn selecting_the_root_opens_the_view_page_with_an_empty_path() {
         let mut app = test_app();
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-        app.rename_module_dialog.as_mut().unwrap().new_name = String::new();
 
-        app.rename_module_dialog_confirmed();
+        app.select_module(Vec::new());
 
-        assert!(app.rename_module_dialog.as_ref().unwrap().pending_request.is_none());
-        assert!(app.pending.is_empty());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.path.is_empty());
     }
 
     #[test]
-    fn a_successful_rename_closes_the_dialog_and_marks_dirty() {
+    fn a_module_summary_reply_populates_the_page() {
         let mut app = test_app();
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-        app.rename_module_dialog.as_mut().unwrap().new_name = "renamed".to_string();
-        app.rename_module_dialog_confirmed();
-        let request = app.rename_module_dialog.as_ref().unwrap().pending_request.unwrap();
+        app.select_module(vec![disk_entry_name("setup")]);
+        let request = app.module_summary_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::ModuleSummary(Some(gui_core::ModuleSummary {
+                requirement_count: 3,
+                ..Default::default()
+            })),
+        });
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert_eq!(form.summary.as_ref().unwrap().requirement_count, 3);
+        assert!(app.module_summary_request.is_none());
+    }
+
+    #[test]
+    fn a_stale_module_summary_reply_is_ignored_after_navigating_away() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        let stale_request = app.module_summary_request.unwrap();
+
+        app.select_module(vec![disk_entry_name("other")]);
+
+        app.apply_event(Event::Completed {
+            request: stale_request,
+            outcome: Outcome::ModuleSummary(Some(gui_core::ModuleSummary::default())),
+        });
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        // Still the second selection, untouched by the first's stale reply.
+        assert_eq!(form.path, vec![disk_entry_name("other")]);
+        assert!(form.summary.is_none());
+    }
+
+    #[test]
+    fn editor_edit_clicked_switches_the_module_page_to_editable() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+
+        app.editor_edit_clicked();
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(!form.read_only);
+        assert_eq!(form.new_name, form.display_name);
+    }
+
+    #[test]
+    fn editor_cancel_clicked_reverts_the_module_page_to_read_only() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "scratch".to_string();
+            form.edited = true;
+        }
+
+        app.editor_cancel_clicked();
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.read_only);
+        assert!(!form.edited);
+    }
+
+    #[test]
+    fn editor_create_clicked_on_a_nested_module_page_sends_the_rename() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+
+        app.editor_create_clicked();
+
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.pending_request.is_some());
+        // 2: the `GetModuleSummary` `select_module` itself sent, plus this
+        // rename.
+        assert_eq!(app.pending.len(), 2);
+    }
+
+    #[test]
+    fn a_successful_module_rename_updates_the_path_and_returns_to_the_view() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+        app.editor_create_clicked();
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        let request = form.pending_request.unwrap();
 
         app.apply_event(Event::Completed {
             request,
             outcome: Outcome::RenameModule(Ok(())),
         });
 
-        assert!(app.rename_module_dialog.is_none());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert_eq!(form.path, vec![disk_entry_name("renamed")]);
+        assert_eq!(form.display_name, "renamed");
+        assert!(form.read_only);
+        assert_eq!(app.selected_module, vec![disk_entry_name("renamed")]);
         assert!(app.dirty);
     }
 
     #[test]
-    fn a_successful_rename_updates_the_current_module_if_it_was_renamed() {
+    fn a_failed_module_rename_reports_the_error_and_stays_in_edit_mode() {
         let mut app = test_app();
-        app.selected_module = vec![disk_entry_name("setup")];
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-        app.rename_module_dialog.as_mut().unwrap().new_name = "renamed".to_string();
-        app.rename_module_dialog_confirmed();
-        let request = app.rename_module_dialog.as_ref().unwrap().pending_request.unwrap();
-
-        app.apply_event(Event::Completed {
-            request,
-            outcome: Outcome::RenameModule(Ok(())),
-        });
-
-        assert_eq!(app.selected_module, vec![disk_entry_name("renamed")]);
-    }
-
-    #[test]
-    fn a_successful_rename_updates_a_nested_current_module_path() {
-        let mut app = test_app();
-        app.selected_module = vec![disk_entry_name("setup"), disk_entry_name("nested")];
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-        app.rename_module_dialog.as_mut().unwrap().new_name = "renamed".to_string();
-        app.rename_module_dialog_confirmed();
-        let request = app.rename_module_dialog.as_ref().unwrap().pending_request.unwrap();
-
-        app.apply_event(Event::Completed {
-            request,
-            outcome: Outcome::RenameModule(Ok(())),
-        });
-
-        assert_eq!(
-            app.selected_module,
-            vec![disk_entry_name("renamed"), disk_entry_name("nested")]
-        );
-    }
-
-    #[test]
-    fn a_failed_rename_reports_the_error_and_keeps_the_dialog_open() {
-        let mut app = test_app();
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-        app.rename_module_dialog.as_mut().unwrap().new_name = "renamed".to_string();
-        app.rename_module_dialog_confirmed();
-        let request = app.rename_module_dialog.as_ref().unwrap().pending_request.unwrap();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+        app.editor_create_clicked();
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        let request = form.pending_request.unwrap();
 
         app.apply_event(Event::Completed {
             request,
             outcome: Outcome::RenameModule(Err(gui_core::RenameModuleError::NotFound)),
         });
 
-        let dialog = app.rename_module_dialog.as_ref().unwrap();
-        assert!(dialog.error.is_some());
-        assert!(dialog.pending_request.is_none());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.error.is_some());
+        assert!(!form.read_only);
         assert!(!app.dirty);
     }
 
     #[test]
-    fn a_stale_rename_reply_is_ignored_after_the_dialog_is_closed() {
+    fn a_successful_project_rename_leaves_the_root_path_empty() {
         let mut app = test_app();
-        app.rename_module_dialog_opened(vec![disk_entry_name("setup")]);
-        app.rename_module_dialog.as_mut().unwrap().new_name = "renamed".to_string();
-        app.rename_module_dialog_confirmed();
-        let request = app.rename_module_dialog.as_ref().unwrap().pending_request.unwrap();
-        app.rename_module_dialog_cancelled();
+        app.select_module(Vec::new());
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "Renamed Project".to_string();
+        }
+        app.editor_create_clicked();
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        let request = form.pending_request.unwrap();
 
         app.apply_event(Event::Completed {
             request,
-            outcome: Outcome::RenameModule(Ok(())),
+            outcome: Outcome::RenameProject(Ok(())),
         });
 
-        // Still closed and not marked dirty from a stale reply.
-        assert!(app.rename_module_dialog.is_none());
-        assert!(!app.dirty);
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.path.is_empty());
+        assert_eq!(form.display_name, "Renamed Project");
+        assert_eq!(app.selected_module, Vec::<gui_core::EntryName>::new());
     }
 }

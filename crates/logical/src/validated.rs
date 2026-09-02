@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use disk::{DependencyReferenceKind, StatusV1, TestReferenceKind};
+use disk::{DependencyReferenceKind, LocalGitReference, StatusV1, TestReferenceKind};
 use syscalls::Filesystem;
 
 use crate::LogicalPath;
@@ -17,6 +17,55 @@ use crate::path::parse_reference_path;
 /// re-resolves fresh against the wrapped draft.
 #[derive(Debug, Clone)]
 pub struct ValidatedProject(ProjectDraft);
+
+/// Why `ValidatedProject::requirement_unmet_reason` says a requirement
+/// isn't met — the reasoned counterpart to `is_requirement_met`'s plain
+/// `bool`. See that method's own doc comment / README's "Requirement-met
+/// semantics" for the checks this mirrors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnmetReason {
+    /// No `LogicalPath` in the project resolves to this requirement.
+    UnknownRequirement,
+    NoTests,
+    /// Authored in-memory, never saved/reloaded from an actual git
+    /// repository — see `RequirementDraft::commit`'s own doc comment.
+    NotYetSaved,
+    /// One entry per test reference that isn't satisfied yet — a
+    /// requirement with several tests where only one fails still reports
+    /// just that one, not "unmet" with no further detail.
+    UnsatisfiedTests(Vec<UnsatisfiedTest>),
+}
+
+/// One of a requirement's test references, and why it doesn't (yet)
+/// satisfy `is_requirement_met`'s condition 1/2 for that test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatisfiedTest {
+    /// The reference path as authored (`LocalGitReference::path`'s raw
+    /// text) — always available, unlike a resolved `LogicalPath`, which a
+    /// `TestUnmetReason::UnresolvedReference` by definition doesn't have.
+    pub test: String,
+    pub reason: TestUnmetReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestUnmetReason {
+    /// The reference doesn't resolve to a real test in the project.
+    /// Shouldn't happen against an already-`ValidatedProject` — `validate()`
+    /// itself would have caught this as a broken reference — kept for
+    /// defensive completeness (see `is_requirement_met`'s own tests on
+    /// reaching a `ValidatedProject` without a real `validate()` pass).
+    UnresolvedReference,
+    /// The referenced test exists but was authored in-memory and never
+    /// saved/reloaded, so it has no known commit yet to check currency
+    /// against — the test-side mirror of `UnmetReason::NotYetSaved`.
+    TestNotYetSaved,
+    /// The requirement's own recorded commit for this test doesn't match
+    /// the test's current commit — the reference is stale.
+    StaleReference,
+    /// No result exists whose requirement/test commits both match today's
+    /// and whose `status` is `Pass`.
+    NoPassingResult,
+}
 
 impl ValidatedProject {
     pub(crate) fn new(draft: ProjectDraft) -> Self {
@@ -54,45 +103,121 @@ impl ValidatedProject {
     /// and whose `status` is `Pass`. Historical/non-`Pass` results are not
     /// errors — they're just excluded here, per the README.
     pub fn is_requirement_met(&self, requirement: &LogicalPath) -> bool {
+        self.requirement_unmet_reason(requirement).is_none()
+    }
+
+    /// The detailed counterpart to `is_requirement_met` — `None` means met
+    /// (exactly the cases that method returns `true` for), `Some(reason)`
+    /// says *which* check failed instead of collapsing straight to
+    /// `false`. Same checks, same order, same edge-case handling (a
+    /// malformed/unresolved reference reached via `ValidatedProject::new`
+    /// directly rather than a real `validate()` pass, etc.) — kept in one
+    /// place so the two can never drift apart.
+    pub fn requirement_unmet_reason(&self, requirement: &LogicalPath) -> Option<UnmetReason> {
         let Some(req) = get_requirement(&self.0.tree, requirement) else {
-            return false;
+            return Some(UnmetReason::UnknownRequirement);
         };
         if req.tests.is_empty() {
-            return false;
+            return Some(UnmetReason::NoTests);
         }
         let Some(req_commit) = &req.commit else {
-            return false;
+            return Some(UnmetReason::NotYetSaved);
         };
 
         let all_results = collect_results(&self.0.tree, &[]);
 
-        req.tests.iter().all(|test_ref| {
-            let TestReferenceKind::TestReferenceV1(local) = test_ref;
-            let Ok(target) = parse_reference_path(&local.path, &requirement.modules, "tests")
-            else {
-                return false;
-            };
-            let Some(test) = get_test(&self.0.tree, &target) else {
-                return false;
-            };
-            let Some(test_commit) = &test.commit else {
-                return false;
-            };
-            if &local.commit != test_commit {
-                return false;
-            }
+        let unsatisfied: Vec<UnsatisfiedTest> = req
+            .tests
+            .iter()
+            .filter_map(|test_ref| {
+                let TestReferenceKind::TestReferenceV1(local) = test_ref;
+                let test_label = local.path.0.clone();
 
-            all_results.iter().any(|(result_path, result)| {
-                result_satisfies(
-                    result,
-                    &result_path.modules,
-                    requirement,
-                    req_commit,
-                    &target,
-                    test_commit,
-                )
+                let Ok(target) = parse_reference_path(&local.path, &requirement.modules, "tests")
+                else {
+                    return Some(UnsatisfiedTest {
+                        test: test_label,
+                        reason: TestUnmetReason::UnresolvedReference,
+                    });
+                };
+                let Some(test) = get_test(&self.0.tree, &target) else {
+                    return Some(UnsatisfiedTest {
+                        test: test_label,
+                        reason: TestUnmetReason::UnresolvedReference,
+                    });
+                };
+                let Some(test_commit) = &test.commit else {
+                    return Some(UnsatisfiedTest {
+                        test: test_label,
+                        reason: TestUnmetReason::TestNotYetSaved,
+                    });
+                };
+                if &local.commit != test_commit {
+                    return Some(UnsatisfiedTest {
+                        test: test_label,
+                        reason: TestUnmetReason::StaleReference,
+                    });
+                }
+
+                let satisfied = all_results.iter().any(|(result_path, result)| {
+                    result_satisfies(
+                        result,
+                        &result_path.modules,
+                        requirement,
+                        req_commit,
+                        &target,
+                        test_commit,
+                    )
+                });
+                if satisfied {
+                    None
+                } else {
+                    Some(UnsatisfiedTest {
+                        test: test_label,
+                        reason: TestUnmetReason::NoPassingResult,
+                    })
+                }
             })
-        })
+            .collect();
+
+        if unsatisfied.is_empty() {
+            None
+        } else {
+            Some(UnmetReason::UnsatisfiedTests(unsatisfied))
+        }
+    }
+
+    /// A corrected copy of `requirement`'s `tests` list, with every
+    /// `TestUnmetReason::StaleReference` entry's pinned commit updated to
+    /// the referenced test's real current commit — the "Update Stale
+    /// References" button's own computation. An entry that's fine already,
+    /// or that `requirement_unmet_reason` would report as
+    /// `UnresolvedReference`/`TestNotYetSaved` instead, is left exactly as
+    /// it was: there's no *current* commit to correct it to. `None` if
+    /// `requirement` itself doesn't resolve.
+    pub fn refreshed_test_references(&self, requirement: &LogicalPath) -> Option<Vec<TestReferenceKind>> {
+        let req = get_requirement(&self.0.tree, requirement)?;
+        Some(
+            req.tests
+                .iter()
+                .map(|test_ref| {
+                    let TestReferenceKind::TestReferenceV1(local) = test_ref;
+                    let current_commit = parse_reference_path(&local.path, &requirement.modules, "tests")
+                        .ok()
+                        .and_then(|target| get_test(&self.0.tree, &target))
+                        .and_then(|test| test.commit.as_deref());
+                    match current_commit {
+                        Some(commit) if commit != local.commit => {
+                            TestReferenceKind::TestReferenceV1(LocalGitReference {
+                                path: local.path.clone(),
+                                commit: commit.to_string(),
+                            })
+                        }
+                        _ => test_ref.clone(),
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// The transitive closure of local (`RequirementReferenceV1`)
@@ -280,10 +405,24 @@ mod test {
         LogicalPath::root(disk::EntryName("definition".to_string()))
     }
 
+    /// `requirement_unmet_reason`'s answer for "definition" when its one
+    /// test ("/tests/generic_test") is unsatisfied for `reason` — the
+    /// shape every "not met because of the test" case below asserts.
+    fn unsatisfied_for(reason: TestUnmetReason) -> UnmetReason {
+        UnmetReason::UnsatisfiedTests(vec![UnsatisfiedTest {
+            test: "/tests/generic_test".to_string(),
+            reason,
+        }])
+    }
+
     #[test]
     fn not_met_with_no_result_at_all() {
         let project = validated(project_with_current_requirement_and_test());
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
+        );
     }
 
     #[test]
@@ -296,6 +435,7 @@ mod test {
 
         let project = validated(project);
         assert!(project.is_requirement_met(&requirement_path()));
+        assert_eq!(project.requirement_unmet_reason(&requirement_path()), None);
     }
 
     #[test]
@@ -307,6 +447,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
+        );
     }
 
     #[test]
@@ -318,6 +462,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
+        );
     }
 
     #[test]
@@ -329,6 +477,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
+        );
     }
 
     #[test]
@@ -358,6 +510,81 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::StaleReference))
+        );
+    }
+
+    #[test]
+    fn refreshed_test_references_fixes_a_stale_reference() {
+        let mut project = create_project("Capstone");
+        let mut requirement = RequirementDraft::new("Definition");
+        requirement.commit = Some("c1".to_string());
+        requirement
+            .tests
+            .push(TestReferenceKind::TestReferenceV1(LocalGitReference {
+                path: ReferencePath("/tests/generic_test".to_string()),
+                commit: "stale".to_string(),
+            }));
+        project
+            .tree
+            .add_requirement("definition", requirement)
+            .unwrap();
+
+        let mut test = TestDraft::new("Generic Test", ResultKindV1::FreeForm);
+        test.commit = Some("t1".to_string());
+        project.tree.add_test("generic_test", test).unwrap();
+
+        let project = validated(project);
+        let refreshed = project.refreshed_test_references(&requirement_path()).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        let TestReferenceKind::TestReferenceV1(local) = &refreshed[0];
+        assert_eq!(local.path, ReferencePath("/tests/generic_test".to_string()));
+        assert_eq!(local.commit, "t1");
+    }
+
+    #[test]
+    fn refreshed_test_references_leaves_an_already_current_reference_unchanged() {
+        let project = validated(project_with_current_requirement_and_test());
+        let refreshed = project.refreshed_test_references(&requirement_path()).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        let TestReferenceKind::TestReferenceV1(local) = &refreshed[0];
+        assert_eq!(local.commit, "t1");
+    }
+
+    #[test]
+    fn refreshed_test_references_leaves_an_unresolved_reference_unchanged() {
+        let mut project = create_project("Capstone");
+        let mut requirement = RequirementDraft::new("Definition");
+        requirement.commit = Some("c1".to_string());
+        requirement
+            .tests
+            .push(TestReferenceKind::TestReferenceV1(LocalGitReference {
+                path: ReferencePath("/tests/nonexistent".to_string()),
+                commit: "t1".to_string(),
+            }));
+        project
+            .tree
+            .add_requirement("definition", requirement)
+            .unwrap();
+
+        // Not calling `validate()` — same "reach a `ValidatedProject`
+        // without a real validate() pass" precedent
+        // `not_met_when_the_referenced_test_does_not_exist` documents.
+        let project = ValidatedProject::new(project);
+        let refreshed = project.refreshed_test_references(&requirement_path()).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        // Nothing safe to correct an unresolved reference to — left as-is.
+        let TestReferenceKind::TestReferenceV1(local) = &refreshed[0];
+        assert_eq!(local.commit, "t1");
+    }
+
+    #[test]
+    fn refreshed_test_references_returns_none_for_an_unknown_requirement() {
+        let project = validated(project_with_current_requirement_and_test());
+        let unknown = LogicalPath::root(disk::EntryName("nonexistent".to_string()));
+        assert!(project.refreshed_test_references(&unknown).is_none());
     }
 
     #[test]
@@ -372,6 +599,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(UnmetReason::NoTests)
+        );
     }
 
     #[test]
@@ -391,6 +622,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(UnmetReason::NotYetSaved)
+        );
     }
 
     #[test]
@@ -398,6 +633,10 @@ mod test {
         let project = validated(project_with_current_requirement_and_test());
         let unknown = LogicalPath::root(disk::EntryName("nonexistent".to_string()));
         assert!(!project.is_requirement_met(&unknown));
+        assert_eq!(
+            project.requirement_unmet_reason(&unknown),
+            Some(UnmetReason::UnknownRequirement)
+        );
     }
 
     #[test]
@@ -421,6 +660,13 @@ mod test {
         // for why `is_requirement_met` still needs to handle this.
         let project = ValidatedProject::new(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(UnmetReason::UnsatisfiedTests(vec![UnsatisfiedTest {
+                test: "tests".to_string(),
+                reason: TestUnmetReason::UnresolvedReference,
+            }]))
+        );
     }
 
     #[test]
@@ -446,6 +692,13 @@ mod test {
         // doesn't happen to re-check this exact requirement.
         let project = ValidatedProject::new(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(UnmetReason::UnsatisfiedTests(vec![UnsatisfiedTest {
+                test: "/tests/nonexistent".to_string(),
+                reason: TestUnmetReason::UnresolvedReference,
+            }]))
+        );
     }
 
     #[test]
@@ -474,6 +727,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::TestNotYetSaved))
+        );
     }
 
     #[test]
@@ -490,6 +747,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
+        );
     }
 
     #[test]
@@ -501,6 +762,10 @@ mod test {
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
+        );
     }
 
     #[test]
@@ -512,6 +777,10 @@ mod test {
 
         let project = ValidatedProject::new(project);
         assert!(!project.is_requirement_met(&requirement_path()));
+        assert_eq!(
+            project.requirement_unmet_reason(&requirement_path()),
+            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
+        );
     }
 
     #[test]
@@ -556,6 +825,7 @@ mod test {
             name: disk::EntryName("definition".to_string()),
         };
         assert!(project.is_requirement_met(&path));
+        assert_eq!(project.requirement_unmet_reason(&path), None);
         assert!(project.all_requirements_met_in_subtree(&[]));
     }
 

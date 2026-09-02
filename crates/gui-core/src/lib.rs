@@ -17,10 +17,14 @@ pub use actor::CoreHandle;
 // (e.g. `self.selection: Option<LogicalPath>`) without taking a direct
 // Cargo dependency on `disk`/`logical` itself — see gui-ui/README.md's
 // "Dependencies".
-pub use disk::{DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, RemoteGitReference, ResultKindV1};
+pub use disk::{
+    DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, RemoteGitReference, ResultKindV1, StatusV1,
+    TestReferenceKind,
+};
 pub use logical::LogicalPath;
 pub use logical::AddPoolFileError;
 pub use logical::draft::{RequirementDraft, ResultDraft, TestDraft};
+pub use logical::{TestUnmetReason, UnmetReason, UnsatisfiedTest};
 
 use std::path::PathBuf;
 
@@ -112,6 +116,23 @@ pub enum Command {
         requirement: Box<RequirementDraft>,
         request: RequestId,
     },
+    /// Rewrites every `TestUnmetReason::StaleReference` entry in
+    /// `target`'s own `tests` to the referenced test's current commit —
+    /// the "Update Stale References" button. Needs a `Validated` project
+    /// (only that knows each test's *current* commit to correct a stale
+    /// one to); like any other edit, the fix itself demotes back to
+    /// `Draft`, but — unlike `UpdateRequirement` — that's implicit and
+    /// momentary: on success this immediately revalidates too, so the
+    /// button doesn't read as having wiped every requirement's
+    /// `met_status` back to `Unvalidated` just to fix one reference. If
+    /// that implicit revalidation itself fails, the project is simply
+    /// left `Draft` (same as `UpdateRequirement` always leaves it) —
+    /// still a successful `RefreshStaleTestReferences`, just not
+    /// re-validated.
+    RefreshStaleTestReferences {
+        target: LogicalPath,
+        request: RequestId,
+    },
     RemoveRequirement {
         target: LogicalPath,
         request: RequestId,
@@ -170,6 +191,16 @@ pub enum Command {
     RenameModule {
         target: Vec<EntryName>,
         new_name: EntryName,
+        request: RequestId,
+    },
+    /// The project-root counterpart to `RenameModule` — the root has no
+    /// `EntryName` key in a parent's `modules` map to rename (it's the
+    /// `ProjectDraft.definition: RootV1`'s own `name: String` field
+    /// instead), so `RenameModule` hard-rejects `target: []` via
+    /// `RenameModuleError::CannotRenameRoot` rather than trying to handle
+    /// it. This is that separate operation.
+    RenameProject {
+        new_name: String,
         request: RequestId,
     },
     /// A module-level attachment pool entry — addressed by `module` +
@@ -256,7 +287,14 @@ pub enum Command {
         kind: EntryKind,
         request: RequestId,
     },
-    IsRequirementMet {
+    /// A requirement's current `RequirementMetStatus` — the same
+    /// computation `GetEntryDetail`'s own `met_status` field runs, on
+    /// demand for whichever requirement is already open, without the rest
+    /// of a full `EntryDetail` round trip. `gui-ui` uses this to refresh
+    /// an already-open requirement's status after `Validate` completes,
+    /// without touching (or risking clobbering) anything else in that
+    /// form.
+    GetRequirementMetStatus {
         target: LogicalPath,
         request: RequestId,
     },
@@ -269,6 +307,35 @@ pub enum Command {
     /// showing what's there to add/remove against.
     GetModulePools {
         module: Vec<EntryName>,
+        request: RequestId,
+    },
+    /// Recursive counts (submodules, requirements, tests, results) plus,
+    /// when `Validated`, the met/unmet and pass/fail/incomplete breakdown
+    /// over a module's *entire* subtree — the on-demand read behind the
+    /// module/project viewer page. `module: []` means the project root.
+    GetModuleSummary {
+        module: Vec<EntryName>,
+        request: RequestId,
+    },
+    /// The current latest commit touching `target`'s own on-disk
+    /// directory — the "Auto" button next to a local dependency
+    /// reference's `commit` field, so the user doesn't have to look it up
+    /// and paste it in by hand. Shells out to `git`, so (like
+    /// `LoadProject`) it's spawned rather than run inline, even though it
+    /// touches no project state.
+    ResolveLocalCommit {
+        target: LogicalPath,
+        kind: EntryKind,
+        request: RequestId,
+    },
+    /// The remote-reference counterpart to `ResolveLocalCommit` — resolves
+    /// directly against `url`/`path` rather than anything in the loaded
+    /// project (mirroring how `logical::validate::resolve` itself checks a
+    /// `RemoteGitReference`), so unlike `ResolveLocalCommit` this doesn't
+    /// need a project loaded on disk at all.
+    ResolveRemoteCommit {
+        url: String,
+        path: Option<ReferencePath>,
         request: RequestId,
     },
 
@@ -294,6 +361,7 @@ pub enum Outcome {
     Redo(Result<(), RedoError>),
     AddRequirement(Result<(), AddChildError>),
     UpdateRequirement(Result<(), UpdateChildError>),
+    RefreshStaleTestReferences(Result<(), RefreshStaleTestReferencesError>),
     /// Whether an entry was actually removed — `remove_*` never fails in
     /// `logical` either, it's just `Option`-shaped; `false` covers both
     /// "no project loaded" and "nothing there by that path".
@@ -307,6 +375,7 @@ pub enum Outcome {
     AddModule(Result<(), AddChildError>),
     RemoveModule(bool),
     RenameModule(Result<(), RenameModuleError>),
+    RenameProject(Result<(), RenameProjectError>),
     AddAttachment(Result<(), AddPoolChildError>),
     RemoveAttachment(bool),
     AddTemplate(Result<(), AddPoolChildError>),
@@ -320,14 +389,34 @@ pub enum Outcome {
     AddResultAttachment(Result<(), AddLocalPoolError>),
     RemoveResultAttachment(bool),
     EntryDetail(Option<EntryDetail>),
-    RequirementMet(bool),
+    RequirementMetStatus(RequirementMetStatus),
     DependencyChain(Vec<LogicalPath>),
     /// `None` means the module itself wasn't found.
     ModulePools(Option<ModulePools>),
+    /// `None` means the module itself wasn't found.
+    ModuleSummary(Option<ModuleSummary>),
+    ResolveLocalCommit(Result<String, ResolveLocalCommitError>),
+    /// No extra failure mode beyond `syscalls::CommitForRemoteError` itself
+    /// — carried directly, same as `Outcome::LoadProject` carries `disk`'s
+    /// own error type unwrapped.
+    ResolveRemoteCommit(Result<String, syscalls::CommitForRemoteError>),
     /// A command that needs a loaded project arrived when `state` is
     /// `None` (no `LoadProject` has ever succeeded, or the current
     /// project failed to load).
     NoProjectLoaded,
+}
+
+/// `ResolveLocalCommit`'s own error type — the same `syscalls`-level
+/// failure `Command::AddRequirementAttachment` (etc.) can hit resolving an
+/// attachment's commit, plus one failure mode specific to being asked for
+/// a commit at all: no project loaded on disk yet to resolve `target`
+/// against.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveLocalCommitError {
+    #[error("no project is loaded on disk to resolve a commit from")]
+    NoProjectPath,
+    #[error(transparent)]
+    Commit(#[from] syscalls::CommitForPathError),
 }
 
 /// `add_requirement`/`add_test`/`add_result`/`add_module` all need
@@ -418,6 +507,16 @@ pub enum RenameModuleError {
     Add(#[from] AddNamedChildError),
 }
 
+/// `rename_project`'s own error type — much narrower than
+/// `RenameModuleError` since there's no map key, no sibling to collide
+/// with, and no "not found" case (the root always exists once a project is
+/// loaded); the only way it can fail is a name that isn't actually a name.
+#[derive(Debug, thiserror::Error)]
+pub enum RenameProjectError {
+    #[error("project name cannot be empty")]
+    EmptyName,
+}
+
 /// `save()` requires a `ValidatedProject` — an unvalidated `Draft` can't
 /// be saved at all, per `logical`'s design (see its README's "Draft vs.
 /// validated"). `disk::project::operations::save::Error` has no variant
@@ -429,6 +528,21 @@ pub enum SaveError {
     NotValidated,
     #[error(transparent)]
     Save(#[from] disk::project::operations::save::Error),
+}
+
+/// `RefreshStaleTestReferences`'s own error type — same `NotValidated`-
+/// precondition-plus-reused-failure shape as `SaveError`. The reused half
+/// is `UpdateChildError` rather than a fresh "requirement not found"
+/// variant: once the project's actually `Validated`, applying the
+/// computed fix is exactly an ordinary `update_*`-shaped operation (see
+/// `Actor::update_in_module`), so it fails for the identical reasons any
+/// other `update_*` command does.
+#[derive(Debug, thiserror::Error)]
+pub enum RefreshStaleTestReferencesError {
+    #[error("project must be validated first to know each test's current commit")]
+    NotValidated,
+    #[error(transparent)]
+    Update(#[from] UpdateChildError),
 }
 
 /// `Undo`'s own error type per the per-`Command` convention (see
@@ -477,6 +591,24 @@ pub enum EntryDetail {
         /// This requirement's own local attachment pool — see
         /// `Command::AddRequirementAttachment`'s doc comment.
         attachments: Vec<PathBuf>,
+        /// Why this requirement is (or isn't) `EntryStatus::Met` — see
+        /// `RequirementMetStatus`'s own doc comment. Computed fresh on
+        /// every `GetEntryDetail`, same "always recompute, never cache"
+        /// spirit as `logical::ValidatedProject`'s own queries.
+        met_status: RequirementMetStatus,
+        /// The full `RequirementDraft` this was read from, unmodified —
+        /// `gui-ui`'s `RequirementFormState::build_command` clones this
+        /// and overlays only the fields above, so `UpdateRequirement`
+        /// (a wholesale replace, see its own doc comment) round-trips
+        /// `tests`/`attachment_refs`/`include_attachments_in_commit`/
+        /// `commit` — fields this `EntryDetail` variant doesn't otherwise
+        /// expose at all — instead of silently resetting them. `Box`ed
+        /// for the same reason `Command::AddRequirement`/`UpdateRequirement`
+        /// already box their own `RequirementDraft` payload: keeps this,
+        /// by far the largest field here, from bloating every other
+        /// `EntryDetail`/`Outcome`/`Event` variant's own size too (they
+        /// all share one enum).
+        original: Box<RequirementDraft>,
     },
     Test {
         title: String,
@@ -485,6 +617,9 @@ pub enum EntryDetail {
         /// Distinct from `attachments` — see `Command::AddTestTemplateFile`'s
         /// doc comment.
         template_files: Vec<PathBuf>,
+        /// See `EntryDetail::Requirement`'s own `original` doc comment —
+        /// same reasoning, for `TestDraft`.
+        original: Box<TestDraft>,
     },
     Result {
         title: String,
@@ -493,6 +628,10 @@ pub enum EntryDetail {
         test_path: String,
         test_commit: String,
         attachments: Vec<PathBuf>,
+        /// See `EntryDetail::Requirement`'s own `original` doc comment —
+        /// same reasoning, for `ResultDraft` (notably including `status`,
+        /// which nothing in `gui-ui` even shows a control for today).
+        original: Box<ResultDraft>,
     },
 }
 
@@ -504,6 +643,27 @@ pub enum EntryDetail {
 pub struct ModulePools {
     pub attachments: Vec<PathBuf>,
     pub templates: Vec<PathBuf>,
+}
+
+/// Recursive summary statistics for a module's (or, for the project root,
+/// the whole project's) subtree — the on-demand read behind the module/
+/// project viewer page's "total numbers of things" and pass/fail/incomplete
+/// percentages. `requirements_met`/`requirements_unmet`/`results_*` are
+/// only meaningful when `validated` is true (they're left `0` otherwise,
+/// same "nothing to say yet" spirit as `RequirementMetStatus::Unvalidated`)
+/// — the caller decides how to present that, this just reports it.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleSummary {
+    pub submodule_count: usize,
+    pub requirement_count: usize,
+    pub test_count: usize,
+    pub result_count: usize,
+    pub validated: bool,
+    pub requirements_met: usize,
+    pub requirements_unmet: usize,
+    pub results_pass: usize,
+    pub results_fail: usize,
+    pub results_incomplete: usize,
 }
 
 #[derive(Debug)]
@@ -553,4 +713,26 @@ pub enum EntryStatus {
     Unvalidated,
     Met,
     Unmet,
+}
+
+/// The `GetEntryDetail`-only, one-entry-at-a-time counterpart to
+/// `EntryStatus` — same three states, but `Unmet` carries *why*. Kept as
+/// its own type rather than just adding a payload to `EntryStatus` itself:
+/// that one has to stay cheap and `Copy` for every `TreeNode` in a
+/// `TreeSnapshot`, while this is heavier (an `UnmetReason` can hold a
+/// `Vec`) and only ever computed for whichever one requirement is
+/// currently open in the center pane — matching the tree-vs-detail split
+/// `EntryStatus`/`EntryDetail` already draw (see `EntryDetail`'s own doc
+/// comment).
+#[derive(Debug, Clone, Default)]
+pub enum RequirementMetStatus {
+    /// No project is validated right now — Met/Unmet isn't meaningfully
+    /// answerable (no resolved references to check), same reasoning
+    /// `EntryStatus::Unvalidated` already applies at the tree level. Also
+    /// the default — a brand-new, not-yet-created requirement has nothing
+    /// to check yet either, same "nothing to say" spirit.
+    #[default]
+    Unvalidated,
+    Met,
+    Unmet(UnmetReason),
 }
