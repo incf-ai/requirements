@@ -1,0 +1,19 @@
+ResultsV1(
+    title: "Integration",
+    requirement_path: "requirements/integration",
+    requirement_commit: "3c4d5e6f708192a0b1c2d3e4f5061728394a5b6c",
+    test_path: "tests/contract",
+    test_commit: "3c4d5e6f708192a0b1c2d3e4f5061728394a5b6c",
+    status: Fail,
+    attachment: None,
+    attachments: Some([
+        LocalAttachmentReferenceV1(
+            name: "failure-report",
+            path: "integration-evidence.txt",
+        ),
+        ModuleAttachmentReferenceV1(
+            name: "diagram",
+            path: "diagrams/architecture.txt",
+        ),
+    ]),
+)

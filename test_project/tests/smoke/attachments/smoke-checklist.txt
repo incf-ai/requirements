@@ -1,0 +1,1 @@
+Quick sanity checks to run before anything else.

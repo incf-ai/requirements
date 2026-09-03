@@ -1,0 +1,9 @@
+ResultsV1(
+    title: "External",
+    requirement_path: "requirements/external",
+    requirement_commit: "4d5e6f708192a0b1c2d3e4f5061728394a5b6c7d",
+    test_path: "tests/smoke",
+    test_commit: "2b3c4d5e6f708192a0b1c2d3e4f5061728394a5b",
+    attachment: None,
+    attachments: None,
+)

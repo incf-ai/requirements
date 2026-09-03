@@ -1,0 +1,22 @@
+RequirementDefinitionV1(
+    title: "Integration",
+    test: None,
+    tests: Some([
+        TestReferenceV1(
+            path: "tests/smoke",
+            commit: "2b3c4d5e6f708192a0b1c2d3e4f5061728394a5b",
+        ),
+        TestReferenceV1(
+            path: "tests/contract",
+            commit: "3c4d5e6f708192a0b1c2d3e4f5061728394a5b6c",
+        ),
+    ]),
+    dependency: RequirementReferenceV1(
+        path: "requirements/design",
+        commit: "9f8e7d6c5b4a3928170695847362514031201f0e",
+    ),
+    dependencies: None,
+    attachment: None,
+    attachments: None,
+    include_attachments_in_commit: true,
+)

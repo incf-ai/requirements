@@ -1,0 +1,19 @@
+RequirementDefinitionV1(
+    title: "Alpha Spec",
+    test: TestReferenceV1(
+        path: "tests/alpha_test",
+        commit: "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+    ),
+    tests: None,
+    dependency: RequirementReferenceV1(
+        path: "/requirements/design",
+        commit: "9f8e7d6c5b4a3928170695847362514031201f0e",
+    ),
+    dependencies: None,
+    attachment: ModuleAttachmentReferenceV1(
+        name: "alpha-notes",
+        path: "alpha-notes.txt",
+    ),
+    attachments: None,
+    include_attachments_in_commit: true,
+)

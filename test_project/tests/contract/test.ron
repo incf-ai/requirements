@@ -1,0 +1,28 @@
+TestV1(
+    title: "Contract",
+    result_kind: Template,
+    attachment: None,
+    attachments: Some([
+        ModuleAttachmentReferenceV1(
+            name: "overview",
+            path: "overview.md",
+        ),
+    ]),
+    template: None,
+    templates: Some([
+        LocalTemplateReferenceV1(
+            name: "contract-a",
+            path: "contract_a.txt",
+        ),
+        LocalTemplateReferenceV1(
+            name: "contract-b",
+            path: "contract_b.txt",
+        ),
+        ModuleTemplateReferenceV1(
+            name: "report",
+            path: "report-template.typ",
+        ),
+    ]),
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
+)

@@ -1,0 +1,1 @@
+Clause B was not satisfied by the current implementation.

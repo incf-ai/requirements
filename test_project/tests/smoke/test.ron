@@ -1,0 +1,16 @@
+TestV1(
+    title: "Smoke",
+    result_kind: FreeForm,
+    attachment: LocalAttachmentReferenceV1(
+        name: "smoke-checklist",
+        path: "smoke-checklist.txt",
+    ),
+    attachments: None,
+    template: LocalTemplateReferenceV1(
+        name: "smoke-template",
+        path: "smoke_template.txt",
+    ),
+    templates: None,
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
+)

@@ -1,0 +1,15 @@
+ResultsV1(
+    title: "Alpha Spec",
+    requirement_path: "requirements/spec",
+    requirement_commit: "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+    test_path: "tests/alpha_test",
+    test_commit: "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+    status: Pass,
+    attachment: None,
+    attachments: Some([
+        LocalAttachmentReferenceV1(
+            name: "checklist-filled",
+            path: "checklist.txt",
+        ),
+    ]),
+)

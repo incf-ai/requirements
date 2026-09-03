@@ -1,0 +1,4 @@
+Root
+├── modules/alpha
+│   └── modules/alpha_child
+└── modules/beta

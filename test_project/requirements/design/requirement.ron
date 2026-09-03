@@ -1,0 +1,16 @@
+RequirementDefinitionV1(
+    title: "Design",
+    test: TestReferenceV1(
+        path: "tests/smoke",
+        commit: "2b3c4d5e6f708192a0b1c2d3e4f5061728394a5b",
+    ),
+    tests: None,
+    dependency: None,
+    dependencies: None,
+    attachment: LocalAttachmentReferenceV1(
+        name: "design-notes",
+        path: "design-notes.txt",
+    ),
+    attachments: None,
+    include_attachments_in_commit: true,
+)

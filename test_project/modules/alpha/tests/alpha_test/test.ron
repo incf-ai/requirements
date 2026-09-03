@@ -1,0 +1,24 @@
+TestV1(
+    title: "Alpha Test",
+    result_kind: Template,
+    attachment: None,
+    attachments: Some([
+        ModuleAttachmentReferenceV1(
+            name: "alpha-notes",
+            path: "alpha-notes.txt",
+        ),
+    ]),
+    template: None,
+    templates: Some([
+        LocalTemplateReferenceV1(
+            name: "checklist",
+            path: "checklist.txt",
+        ),
+        ModuleTemplateReferenceV1(
+            name: "alpha-template",
+            path: "alpha-template.typ",
+        ),
+    ]),
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
+)
