@@ -19,6 +19,10 @@ ResultsV1(
             name: "report",
             path: "report-template.typ",
         ),
+        LocalAttachmentReferenceV1(
+            name: "failure-report",
+            path: "integration-evidence.txt",
+        ),
         ModuleAttachmentReferenceV1(
             name: "diagram",
             path: "diagrams/architecture.txt",
