@@ -1,0 +1,13 @@
+TestV1(
+    title: "Plain",
+    result_kind: FreeForm,
+    attachment: None,
+    attachments: None,
+    template: LocalTemplateReferenceV1(
+        name: "plain-template",
+        path: "plain_template.txt",
+    ),
+    templates: None,
+    include_attachments_in_commit: true,
+    include_template_in_commit: true,
+)

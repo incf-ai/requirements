@@ -5,10 +5,8 @@ RequirementDefinitionV1(
         commit: "2b3c4d5e6f708192a0b1c2d3e4f5061728394a5b",
     ),
     tests: None,
-    dependency: None,
-    dependencies: Some([
-        Submodules,
-    ]),
+    dependency: Submodules,
+    dependencies: None,
     attachment: None,
     attachments: None,
     include_attachments_in_commit: true,

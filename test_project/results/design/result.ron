@@ -4,7 +4,7 @@ ResultsV1(
     requirement_commit: "2b3c4d5e6f708192a0b1c2d3e4f5061728394a5b",
     test_path: "tests/smoke",
     test_commit: "2b3c4d5e6f708192a0b1c2d3e4f5061728394a5b",
-    status: Pass,
+    status: Incomplete,
     attachment: None,
     attachments: None,
 )
