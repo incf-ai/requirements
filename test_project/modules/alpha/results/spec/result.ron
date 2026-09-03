@@ -11,5 +11,9 @@ ResultsV1(
             name: "checklist-filled",
             path: "checklist.txt",
         ),
+        LocalAttachmentReferenceV1(
+            name: "alpha-template-filled",
+            path: "alpha-template.typ",
+        ),
     ]),
 )

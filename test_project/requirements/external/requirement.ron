@@ -7,11 +7,6 @@ RequirementDefinitionV1(
     tests: None,
     dependency: None,
     dependencies: Some([
-        RemoteReferenceV1(
-            url: "https://example.com/other-project.git",
-            path: Some("requirements/shared"),
-            commit: "4d5e6f708192a0b1c2d3e4f5061728394a5b6c7d",
-        ),
         Submodules,
     ]),
     attachment: None,

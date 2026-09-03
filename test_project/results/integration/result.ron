@@ -8,8 +8,16 @@ ResultsV1(
     attachment: None,
     attachments: Some([
         LocalAttachmentReferenceV1(
-            name: "failure-report",
-            path: "integration-evidence.txt",
+            name: "clause-a",
+            path: "contract_a.txt",
+        ),
+        LocalAttachmentReferenceV1(
+            name: "clause-b",
+            path: "contract_b.txt",
+        ),
+        LocalAttachmentReferenceV1(
+            name: "report",
+            path: "report-template.typ",
         ),
         ModuleAttachmentReferenceV1(
             name: "diagram",
