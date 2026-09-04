@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use disk::{DependencyReferenceKind, LocalGitReference, StatusV1, TestReferenceKind};
-use syscalls::Filesystem;
+use syscalls::{Filesystem, Git};
 
 use crate::LogicalPath;
 use crate::convert::export::export_project;
@@ -88,10 +88,11 @@ impl ValidatedProject {
     pub fn save(
         &self,
         fs: &dyn Filesystem,
+        git: &dyn Git,
         dir: &Path,
     ) -> Result<(), disk::project::operations::save::Error> {
         let on_disk = export_project(&self.0);
-        disk::save_project(fs, dir, &on_disk)
+        disk::save_project(fs, git, dir, &on_disk)
     }
 
     /// See `crates/logical/README.md`'s "Requirement-met semantics" for
@@ -1019,7 +1020,13 @@ mod test {
             std::process::id(),
             line!()
         ));
-        project.save(&syscalls::StdFilesystem, &dir).unwrap();
+        project
+            .save(
+                &syscalls::StdFilesystem,
+                &crate::test_support::FixedGit,
+                &dir,
+            )
+            .unwrap();
 
         let reloaded = disk::load_project(
             &syscalls::StdFilesystem,

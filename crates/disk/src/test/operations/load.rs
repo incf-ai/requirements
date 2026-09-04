@@ -90,8 +90,8 @@ mod test {
     use crate::test_support::{FixedGit, git_commit_all, init_scratch_git_repo};
     use syscalls::{StdFilesystem, SystemGit};
 
-    fn sample_project_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
     /// Builds a minimal valid `tests/<name>/` folder in a fresh tempdir.
@@ -131,22 +131,25 @@ mod test {
     }
 
     #[test]
-    fn loads_generic_test_from_the_sample_project() -> Result<(), Error> {
-        let dir = sample_project_dir().join("tests/generic_test");
+    fn loads_the_plain_test_from_the_test_project() -> Result<(), Error> {
+        let dir = test_project_dir().join("tests/plain");
         let test = load_test(&StdFilesystem, &FixedGit, &dir)?;
 
-        assert_eq!(test.definition.title, "Generic Test");
+        assert_eq!(test.definition.title, "Plain");
         assert!(matches!(
             test.definition.result_kind,
             ResultKindV1::FreeForm
         ));
         assert_eq!(
             test.test_text,
-            "Perform an test that the requirement(s) are met recording applicable data.\n"
+            "Perform the plain freeform test and record the outcome.\n"
         );
         assert!(test.attachments.is_empty());
         assert_eq!(test.template.len(), 1);
-        assert_eq!(test.template[0].path, std::path::Path::new("result.typ"));
+        assert_eq!(
+            test.template[0].path,
+            std::path::Path::new("plain_template.txt")
+        );
 
         Ok(())
     }

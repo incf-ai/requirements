@@ -162,13 +162,13 @@ mod test {
     use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
-    fn sample_project_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
     #[test]
     fn export_then_import_round_trips_counts() {
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
         let exported = export_project(&draft);
@@ -189,22 +189,28 @@ mod test {
         // `split_singular_plural_handles_zero_one_and_many` below already
         // proves the underlying function never produces both Some — a
         // structural guarantee that (correctly) can never be violated by
-        // any real data, sample project included. This just confirms the
+        // any real data, test project included. This just confirms the
         // plural field lands correctly for an entity that actually has
-        // more than one reference: `example_review`'s two `templates`.
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+        // more than one reference: `alpha_test`'s two `templates`.
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
         let exported = export_project(&draft);
 
-        let review = exported
+        let alpha = exported
+            .tree
+            .modules
+            .iter()
+            .find(|module| module.name.as_str() == "alpha")
+            .expect("test project has an alpha module");
+        let alpha_test = alpha
             .tree
             .tests
             .iter()
-            .find(|test| test.name.as_str() == "example_review")
-            .expect("sample project has an example_review test");
-        assert!(review.definition.template.is_none());
+            .find(|test| test.name.as_str() == "alpha_test")
+            .expect("alpha module has an alpha_test test");
+        assert!(alpha_test.definition.template.is_none());
         assert_eq!(
-            review.definition.templates.as_ref().map(|t| t.len()),
+            alpha_test.definition.templates.as_ref().map(|t| t.len()),
             Some(2)
         );
     }

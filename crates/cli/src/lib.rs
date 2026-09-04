@@ -214,7 +214,7 @@ fn run_command(
     match command {
         Command::CreateProject { name } => {
             let draft = create_project(name);
-            save_draft(fs, dir, &draft)?;
+            save_draft(fs, git, dir, &draft)?;
             Ok("created".to_string())
         }
         Command::AddModule { module, name } => {
@@ -421,11 +421,12 @@ fn load(
 /// into) commands go through `validate::validate`.
 fn save_draft(
     fs: &dyn Filesystem,
+    git: &dyn Git,
     dir: &std::path::Path,
     draft: &ProjectDraft,
 ) -> Result<(), ErrorKind> {
     let on_disk = convert::export_project(draft);
-    disk::save_project(fs, dir, &on_disk)?;
+    disk::save_project(fs, git, dir, &on_disk)?;
     Ok(())
 }
 
@@ -437,7 +438,7 @@ fn mutate(
 ) -> Result<(), ErrorKind> {
     let mut draft = load(fs, git, dir)?;
     change(&mut draft)?;
-    save_draft(fs, dir, &draft)
+    save_draft(fs, git, dir, &draft)
 }
 
 #[cfg(test)]

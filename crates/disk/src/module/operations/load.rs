@@ -48,16 +48,16 @@ mod test {
     use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
-    fn sample_project_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
     #[test]
-    fn loads_the_embeddings_submodule_from_the_sample_project() -> Result<(), Error> {
-        let dir = sample_project_dir().join("modules/embeddings");
+    fn loads_the_beta_submodule_from_the_test_project() -> Result<(), Error> {
+        let dir = test_project_dir().join("modules/beta");
         let submodule = load_submodule(&StdFilesystem, &FixedGit, &dir)?;
 
-        assert_eq!(submodule.definition.name, "Embeddings");
+        assert_eq!(submodule.definition.name, "Beta");
         assert!(submodule.tree.requirements.is_empty());
         assert!(submodule.tree.tests.is_empty());
         assert!(submodule.tree.results.is_empty());

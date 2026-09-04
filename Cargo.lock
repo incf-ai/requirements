@@ -1728,6 +1728,7 @@ dependencies = [
  "egui-phosphor",
  "egui_kittest",
  "gui-core",
+ "logical",
  "rand",
  "rfd",
  "ron",

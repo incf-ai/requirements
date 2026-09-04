@@ -45,7 +45,7 @@ use std::time::Instant;
 
 use gui_core::{
     Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools, Outcome, RequestId,
-    TreeNode, TreeSnapshot,
+    SaveError, TreeNode, TreeSnapshot,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -107,6 +107,15 @@ pub struct GuiApp {
     /// request id" shape as `detail_request`/`pools_request`.
     pending_project_path: Option<(RequestId, PathBuf)>,
     exit_dialog: Option<ExitDialogState>,
+    /// Set once Stage 2 of the exit flow has actually sent
+    /// `Command::Shutdown` — see "Exit" below. From that point on, the
+    /// window's own close control must never be intercepted again: the
+    /// explicit `ViewportCommand::Close` Stage 2 sends (or, when the OS
+    /// close request itself was left uncancelled, the real one) surfaces
+    /// as `close_requested()` again on a later pass indistinguishably
+    /// from a brand new click, and re-running Stage 1 against it would
+    /// cancel that close and reopen the dialog forever.
+    shutdown_sent: bool,
     /// Text buffer for the "New Project" modal (the project's name) —
     /// `Some` while it's open. Unlike Open/Save As, this has no
     /// corresponding native picker: a project's *name* isn't a
@@ -133,6 +142,18 @@ pub struct GuiApp {
     /// Which `GetModulePools` request `attachments_dialog` is waiting on
     /// — same stale-reply guard as `detail_request`.
     pools_request: Option<RequestId>,
+    /// The selected module's (or project root's) own attachments/
+    /// templates, shown read-only in the tree pane's bottom half — see
+    /// `render_selected_module_pane`. Kept separate from
+    /// `attachments_dialog`'s own copy: the modal is still the only place
+    /// attachments/templates are added or removed, this is purely a
+    /// display cache refreshed whenever the selected module or the tree
+    /// itself changes.
+    sidebar_pools: Option<ModulePools>,
+    /// Which `GetModulePools` request `sidebar_pools` is waiting on — same
+    /// stale-reply guard as `pools_request`, kept distinct so the modal's
+    /// and the sidebar's in-flight fetches never get cross-matched.
+    sidebar_pools_request: Option<RequestId>,
     /// In-flight local-pool (a requirement/test/result's own attachments/
     /// template files) add/remove commands, keyed by their `RequestId` —
     /// see `LocalPoolOp`'s doc comment for why this exists instead of
@@ -169,6 +190,23 @@ pub struct GuiApp {
     /// open. See `PendingNavigation`'s own doc comment on how this
     /// differs from `unsaved_changes_dialog` above.
     unsaved_form_dialog: Option<PendingNavigation>,
+    /// The "must validate before saving" prompt — `Some` while it's open.
+    /// Opened when a `Save`/`SaveAs` gui-core can only answer with
+    /// `SaveError::NotValidated` comes back (the project is still an
+    /// unvalidated `Draft` — e.g. a brand-new `NewProject`, or one edited
+    /// since its last `Validate`), rather than leaving that failure
+    /// silent — see `ValidateBeforeSaveDialogState`'s own doc comment.
+    validate_before_save_dialog: Option<ValidateBeforeSaveDialogState>,
+    /// The Delete-button confirmation prompt — `Some` while it's open. See
+    /// `DeleteConfirmState`'s own doc comment.
+    delete_confirm_dialog: Option<DeleteConfirmState>,
+    /// A failed `LoadProject`'s error message — `Some` while the "couldn't
+    /// open project" dialog is open. Set from `Outcome::LoadProject`'s
+    /// `Err` case (e.g. the target directory isn't a git repository) so
+    /// the failure isn't just silently dropped, since `project_path`
+    /// deliberately stays unset on a failed load and there's otherwise
+    /// nothing on screen to explain why nothing opened.
+    load_error_dialog: Option<String>,
     /// The zoom text field's own editable buffer — kept separate from
     /// `config.zoom_percent` (a `u32`) since a text field needs somewhere
     /// to hold invalid/in-progress input (an empty string, a partial
@@ -264,6 +302,63 @@ pub enum PendingProjectAction {
 /// `editor_cancel_clicked`). Every variant here mirrors a real
 /// `GuiApp` method that would otherwise silently overwrite/clear
 /// `self.editor` out from under an unsaved edit.
+/// Which save gui-ui was trying to do when it hit `SaveError::NotValidated`
+/// — resumed (as the same `Save`/`SaveAs`) once `ValidateBeforeSaveDialogState
+/// ::Asking`'s Validate succeeds. `SaveAs` carries its target path since
+/// `pending_project_path` (which normally carries it) is gone by the time
+/// the dialog needs to retry — `apply_project_path_result` already took it
+/// when the failed `SaveAs` completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSaveAction {
+    Save,
+    SaveAs(PathBuf),
+}
+
+/// The "must validate before saving" prompt's own state machine — see
+/// `GuiApp::validate_before_save_dialog`'s doc comment on when it opens.
+/// `Asking` -> `Validating` -> either closes (success — the original
+/// `PendingSaveAction` is retried automatically) or `Failed` (shows the
+/// validation errors, with a single "Ok" button that just closes the
+/// dialog — no auto-retry, since there's nothing to retry that would
+/// behave differently).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidateBeforeSaveDialogState {
+    Asking { action: PendingSaveAction },
+    Validating { request: RequestId, action: PendingSaveAction },
+    Failed { errors: Vec<String> },
+}
+
+/// What the Delete-confirmation dialog is about to delete — built by
+/// `GuiApp::editor_delete_clicked` from whichever edit form is currently
+/// open, and turned back into the matching `Command::Remove*` by
+/// `GuiApp::delete_confirmed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteTarget {
+    Requirement(LogicalPath),
+    Test(LogicalPath),
+    Result(LogicalPath),
+    Module(Vec<EntryName>),
+}
+
+/// The Delete-button confirmation prompt's own state — see
+/// `GuiApp::delete_confirm_dialog`'s doc comment on when it opens.
+/// `label` is the entry's display name, shown in the confirmation
+/// message. `pending_request` tracks the in-flight `Command::Remove*`
+/// once "Delete" is confirmed, so `GuiApp::apply_delete_result` can tell
+/// a reply meant for this dialog apart from a stale one for a dialog the
+/// user already cancelled — same "stale reply" guard every other
+/// in-flight request in this file follows. `error` surfaces the rare
+/// case the entry was already gone by the time the command reached
+/// gui-core (`Outcome::Remove*(false)`), leaving the dialog open instead
+/// of silently closing on a delete that didn't actually happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteConfirmState {
+    target: DeleteTarget,
+    label: String,
+    pending_request: Option<RequestId>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingNavigation {
     Select { target: LogicalPath, kind: EntryKind },
@@ -421,11 +516,14 @@ impl GuiApp {
             project_path: None,
             pending_project_path: None,
             exit_dialog: None,
+            shutdown_sent: false,
             new_project_dialog: None,
             detail_request: None,
             met_status_request: None,
             attachments_dialog: None,
             pools_request: None,
+            sidebar_pools: None,
+            sidebar_pools_request: None,
             local_pool_ops: HashMap::new(),
             module_summary_request: None,
             path_picker_dialog: None,
@@ -440,6 +538,9 @@ impl GuiApp {
             recent_path,
             unsaved_changes_dialog: None,
             unsaved_form_dialog: None,
+            validate_before_save_dialog: None,
+            delete_confirm_dialog: None,
+            load_error_dialog: None,
             next_request: 0,
         }
     }
@@ -466,6 +567,7 @@ impl GuiApp {
                 if let EditorState::ExistingModule(form) = &mut self.editor {
                     form.display_name = module_display_name(self.tree.as_ref(), &form.path);
                 }
+                self.fetch_sidebar_pools(self.selected_module.clone());
             }
             Event::ValidationFailed(_errors) => {
                 // TODO: surface in self.status once the status bar exists.
@@ -490,9 +592,26 @@ impl GuiApp {
                     self.record_recent_project(path);
                 }
             }
+            // The project is still an unvalidated `Draft` (a brand-new
+            // `NewProject`, or one edited since its last `Validate`) —
+            // rather than leaving this silent (there's nothing else that
+            // would tell the user *why* nothing got saved), open the
+            // "must validate first" prompt with this `Save` as what to
+            // retry once validation succeeds.
+            Outcome::Save(Err(SaveError::NotValidated)) => {
+                self.validate_before_save_dialog =
+                    Some(ValidateBeforeSaveDialogState::Asking { action: PendingSaveAction::Save });
+            }
             Outcome::SaveAs(result) => {
                 if result.is_ok() {
                     self.dirty = false;
+                } else if let Err(SaveError::NotValidated) = &result
+                    && let Some((pending_request, path)) = &self.pending_project_path
+                    && *pending_request == request
+                {
+                    self.validate_before_save_dialog = Some(ValidateBeforeSaveDialogState::Asking {
+                        action: PendingSaveAction::SaveAs(path.clone()),
+                    });
                 }
                 self.apply_project_path_result(request, result.is_ok());
             }
@@ -502,12 +621,19 @@ impl GuiApp {
                 // `Outcome::NewProject`'s note on why `self.tree` isn't
                 // necessarily fresh yet here, and `Event::TreeChanged`'s
                 // own arm for the fix-up.
-                if result.is_ok() {
+                if let Err(error) = &result {
+                    self.load_error_dialog = Some(error.to_string());
+                } else {
                     self.select_module(Vec::new());
                 }
             }
-            // A brand new project has nothing unsaved to lose yet — same
-            // "starts clean" convention a freshly loaded project follows.
+            // Unlike a freshly loaded project (already sitting on disk,
+            // nothing to lose by closing), a brand new one has no home at
+            // all yet — `NewProject` never touches disk, see `project_path`
+            // and `Command::NewProject`'s own doc comments — so closing
+            // without a Save As would destroy it outright. Starts dirty so
+            // Exit/the OS close button prompt for it just like any other
+            // unsaved change, until a real `Save`/`SaveAs` gives it a path.
             // No path either: `NewProject` doesn't go through
             // `pending_project_path` at all (it can't fail — see
             // `Outcome::NewProject`'s own doc comment — so there's no
@@ -520,7 +646,7 @@ impl GuiApp {
             // already the fresh one and `select_module`'s `display_name`
             // lookup gets the real name immediately, no fix-up needed.
             Outcome::NewProject => {
-                self.dirty = false;
+                self.dirty = true;
                 self.select_module(Vec::new());
             }
             // Whether it succeeded or failed, `Validate` can change what
@@ -532,9 +658,33 @@ impl GuiApp {
             // `met_status` itself is refreshed, never the rest of the
             // form — see `refresh_open_requirement_met_status`'s own doc
             // comment on why that's safe even mid-edit.
-            Outcome::Validate(_) => {
+            Outcome::Validate(result) => {
                 self.refresh_open_requirement_met_status();
                 self.refresh_open_module_summary();
+                // If this is the validation `validate_before_save_dialog`
+                // itself kicked off (not a plain toolbar "Validate"
+                // click, which never populates this dialog), resolve it:
+                // success retries the save it was blocking, failure shows
+                // the errors in place of the "Validate now?" prompt.
+                if let Some(ValidateBeforeSaveDialogState::Validating { request: pending_request, action }) =
+                    self.validate_before_save_dialog.clone()
+                    && pending_request == request
+                {
+                    match result {
+                        Ok(()) => {
+                            self.validate_before_save_dialog = None;
+                            match action {
+                                PendingSaveAction::Save => self.save_clicked(),
+                                PendingSaveAction::SaveAs(path) => self.save_project_as(path),
+                            }
+                        }
+                        Err(errors) => {
+                            self.validate_before_save_dialog = Some(ValidateBeforeSaveDialogState::Failed {
+                                errors: errors.iter().map(ToString::to_string).collect(),
+                            });
+                        }
+                    }
+                }
             }
             // A successful `Undo`/`Redo` changed the project's content —
             // same "unsaved changes" bookkeeping as any other successful
@@ -560,10 +710,10 @@ impl GuiApp {
             Outcome::AddResult(result) => self.apply_create_result(request, result),
             Outcome::UpdateResult(result) => self.apply_update_result(request, result),
             Outcome::AddModule(result) => self.apply_create_result(request, result),
-            Outcome::RemoveRequirement(true)
-            | Outcome::RemoveTest(true)
-            | Outcome::RemoveResult(true)
-            | Outcome::RemoveModule(true) => self.dirty = true,
+            Outcome::RemoveRequirement(removed)
+            | Outcome::RemoveTest(removed)
+            | Outcome::RemoveResult(removed)
+            | Outcome::RemoveModule(removed) => self.apply_delete_result(request, removed),
             Outcome::RenameModule(result) => {
                 self.apply_module_rename_result(request, result.map_err(|e| e.to_string()))
             }
@@ -624,6 +774,9 @@ impl GuiApp {
             Outcome::ModulePools(pools) if self.pools_request == Some(request) => {
                 self.apply_module_pools(pools);
             }
+            Outcome::ModulePools(pools) if self.sidebar_pools_request == Some(request) => {
+                self.apply_sidebar_pools(pools);
+            }
             Outcome::ModuleSummary(summary) if self.module_summary_request == Some(request) => {
                 self.module_summary_request = None;
                 if let EditorState::ExistingModule(form) = &mut self.editor {
@@ -668,6 +821,13 @@ impl GuiApp {
                 self.record_recent_project(path);
             }
         }
+    }
+
+    /// "Ok" clicked in the "couldn't open project" dialog — just closes it,
+    /// same "no state to undo" shape as `validate_before_save_dismissed`'s
+    /// `Failed` case.
+    fn load_error_dialog_dismissed(&mut self) {
+        self.load_error_dialog = None;
     }
 
     /// Loads the project at `path` — called from the real "Open
@@ -897,6 +1057,28 @@ impl GuiApp {
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
         self.send_command(Command::Validate { request });
+    }
+
+    /// "Validate" clicked in `ValidateBeforeSaveDialogState::Asking` —
+    /// sends the same `Command::Validate` `validate_clicked` does, but
+    /// tracked separately (`Validating`, carrying the `PendingSaveAction`
+    /// to resume) so `apply_outcome`'s `Outcome::Validate` arm knows this
+    /// completion is the dialog's own, not an unrelated toolbar click.
+    fn validate_before_save_confirmed(&mut self) {
+        let Some(ValidateBeforeSaveDialogState::Asking { action }) = self.validate_before_save_dialog.clone() else {
+            return;
+        };
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        self.validate_before_save_dialog = Some(ValidateBeforeSaveDialogState::Validating { request, action });
+        self.send_command(Command::Validate { request });
+    }
+
+    /// "Cancel" clicked in `ValidateBeforeSaveDialogState::Asking`, or
+    /// "Ok" clicked in `::Failed` — either way there's nothing left to
+    /// resume, so this just closes the dialog.
+    fn validate_before_save_dismissed(&mut self) {
+        self.validate_before_save_dialog = None;
     }
 
     /// Re-fetches just the currently-open requirement's `met_status` —
@@ -1184,6 +1366,7 @@ impl GuiApp {
     fn select_module_from_history(&mut self, module: Vec<EntryName>) {
         self.selected_module = module.clone();
         self.selection = None;
+        self.fetch_sidebar_pools(module.clone());
         let display_name = module_display_name(self.tree.as_ref(), &module);
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
@@ -1464,6 +1647,27 @@ impl GuiApp {
                 dialog.error = None;
             }
         }
+    }
+
+    /// Refreshes `sidebar_pools` for `module` — called whenever the
+    /// selected module changes (`select_module_from_history`) and whenever
+    /// the tree itself changes (`Event::TreeChanged`, which also covers
+    /// the modal's own add/remove commands completing).
+    fn fetch_sidebar_pools(&mut self, module: Vec<EntryName>) {
+        let request = self.next_request_id();
+        self.sidebar_pools_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetModulePools { module, request });
+    }
+
+    /// `None` (module not found — can happen if the selected module was
+    /// just deleted) simply clears the sidebar's cache rather than
+    /// closing anything, since unlike `attachments_dialog` there's no
+    /// modal here to close; `render_selected_module_pane` already handles
+    /// a since-deleted selection via `resolve_tree_module` returning
+    /// `None` for its own label.
+    fn apply_sidebar_pools(&mut self, pools: Option<ModulePools>) {
+        self.sidebar_pools = pools;
     }
 
     /// Shared by all four pool-mutating outcomes
@@ -1876,6 +2080,120 @@ impl GuiApp {
         }
     }
 
+    /// The edit form's Delete button — opens the confirmation dialog
+    /// rather than deleting immediately, per the user's request that
+    /// delete always prompts first. Reads the target straight out of
+    /// whichever form is currently open in edit mode; a no-op for a
+    /// create-mode form (nothing saved yet to delete) or the project
+    /// root's own module page (`render_module_page` doesn't offer this
+    /// button there in the first place, but this stays total rather than
+    /// trusting the caller).
+    fn editor_delete_clicked(&mut self) {
+        let (target, label) = match &self.editor {
+            EditorState::NewRequirement(form) => match form.editing_target.clone() {
+                Some(target) => (DeleteTarget::Requirement(target), form.name.clone()),
+                None => return,
+            },
+            EditorState::NewTest(form) => match form.editing_target.clone() {
+                Some(target) => (DeleteTarget::Test(target), form.name.clone()),
+                None => return,
+            },
+            EditorState::NewResult(form) => match form.editing_target.clone() {
+                Some(target) => (DeleteTarget::Result(target), form.name.clone()),
+                None => return,
+            },
+            EditorState::ExistingModule(form) if !form.path.is_empty() => {
+                (DeleteTarget::Module(form.path.clone()), form.display_name.clone())
+            }
+            EditorState::ExistingModule(_) | EditorState::NewModule(_) | EditorState::None => return,
+        };
+        self.delete_confirm_dialog = Some(DeleteConfirmState {
+            target,
+            label,
+            pending_request: None,
+            error: None,
+        });
+    }
+
+    /// "Delete" clicked inside the confirmation dialog — sends the
+    /// `Command::Remove*` matching `DeleteConfirmState::target` and
+    /// starts tracking the reply. Left `pending_request: None` (a no-op)
+    /// if the dialog isn't open, which shouldn't happen since this is
+    /// only ever reached from the dialog's own button.
+    fn delete_confirmed(&mut self) {
+        let Some(dialog) = &self.delete_confirm_dialog else {
+            return;
+        };
+        let target = dialog.target.clone();
+        let request = self.next_request_id();
+        let command = match &target {
+            DeleteTarget::Requirement(target) => Command::RemoveRequirement {
+                target: target.clone(),
+                request,
+            },
+            DeleteTarget::Test(target) => Command::RemoveTest {
+                target: target.clone(),
+                request,
+            },
+            DeleteTarget::Result(target) => Command::RemoveResult {
+                target: target.clone(),
+                request,
+            },
+            DeleteTarget::Module(target) => Command::RemoveModule {
+                target: target.clone(),
+                request,
+            },
+        };
+        self.pending.insert(request, PendingKind::Generic);
+        if let Some(dialog) = &mut self.delete_confirm_dialog {
+            dialog.pending_request = Some(request);
+            dialog.error = None;
+        }
+        self.send_command(command);
+    }
+
+    /// "Cancel" clicked in the confirmation dialog — just closes it.
+    /// Nothing to undo since `delete_confirmed` (the only thing that
+    /// mutates anything) hasn't run yet at that point.
+    fn delete_cancelled(&mut self) {
+        self.delete_confirm_dialog = None;
+    }
+
+    /// Routes a `RemoveRequirement`/`RemoveTest`/`RemoveResult`/
+    /// `RemoveModule` outcome back to the delete-confirmation dialog that
+    /// sent it — a reply for a dialog the user already cancelled is
+    /// ignored, same "stale reply" handling as `apply_create_result`.
+    /// Success marks the project dirty (the removal only reaches disk on
+    /// the next Save — `disk::util::remove_stale_children` reconciles
+    /// then, not immediately) and navigates to the deleted entry's parent
+    /// module, since its own now-gone viewer has nothing left to show.
+    /// Failure (`removed: false` — the entry was already gone) leaves the
+    /// dialog open with an error instead of silently closing on a delete
+    /// that didn't actually happen.
+    fn apply_delete_result(&mut self, request: RequestId, removed: bool) {
+        let is_pending = matches!(&self.delete_confirm_dialog, Some(d) if d.pending_request == Some(request));
+        if !is_pending {
+            return;
+        }
+        if removed {
+            self.dirty = true;
+            let target = self.delete_confirm_dialog.take().expect("just matched Some above").target;
+            let parent = match target {
+                DeleteTarget::Requirement(target) | DeleteTarget::Test(target) | DeleteTarget::Result(target) => {
+                    target.modules
+                }
+                DeleteTarget::Module(target) => {
+                    let len = target.len().saturating_sub(1);
+                    target[..len].to_vec()
+                }
+            };
+            self.select_module(parent);
+        } else if let Some(dialog) = &mut self.delete_confirm_dialog {
+            dialog.pending_request = None;
+            dialog.error = Some("Could not delete — it may have already been removed.".to_string());
+        }
+    }
+
     /// Routes an `AddRequirement`/`AddTest`/`AddResult`/`AddModule`
     /// outcome back into whichever form is still open and waiting on it —
     /// a reply for a form the user already cancelled/closed is ignored,
@@ -2124,6 +2442,41 @@ impl eframe::App for GuiApp {
         // "did this actually change" around.
         ui.ctx().set_theme(self.config.theme);
 
+        // The window's own close control (OS "X" / Alt-F4 / Cmd-Q) — route
+        // it through the same Stage 1/2 exit flow as the Exit button/menu
+        // item rather than letting eframe close the window on its own,
+        // which would skip the unsaved-changes prompt entirely.
+        //
+        // Once `shutdown_sent`, never touch this again — see its own doc
+        // comment on why: Stage 2 below re-requests the close via
+        // `ViewportCommand::Close` when nothing already has one in
+        // flight, and that resurfaces as `close_requested()` on a later
+        // pass exactly like a fresh OS click would, so re-entering this
+        // block for it would cancel that close and (having already
+        // resolved `exit_dialog` to `None`) immediately reopen the
+        // dialog — forever, since the newly reopened dialog's own
+        // eventual `Ready` would just re-request the close and repeat
+        // the cycle. Confirmed as a real regression: a not-dirty
+        // project's window-close button hung in exactly this loop before
+        // `shutdown_sent` was added.
+        let close_requested = ui.ctx().input(|i| i.viewport().close_requested());
+        if close_requested && !self.shutdown_sent {
+            if self.exit_dialog.is_none() {
+                self.on_exit_clicked(); // Asking (dirty) or Ready (not)
+            }
+            if !matches!(self.exit_dialog, Some(ExitDialogState::Ready)) {
+                // Still needs a prompt, or one's already up (including a
+                // repeat click on the window control while it's showing)
+                // — hold the close until it resolves. When `on_exit_clicked`
+                // just set `Ready` above (nothing dirty), deliberately
+                // *don't* cancel: Stage 2 below sees `close_requested`
+                // still true this same pass and lets it complete on its
+                // own rather than roundtripping through another manufactured
+                // `ViewportCommand::Close`.
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+
         self.tick_exit_dialog(Instant::now());
 
         if self.take_ready_to_exit() {
@@ -2135,7 +2488,15 @@ impl eframe::App for GuiApp {
             // itself, or it would defeat this crate's "the exit button
             // always works, nothing can prevent it" guarantee.
             self.core.send(Command::Shutdown);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            self.shutdown_sent = true;
+            if !close_requested {
+                // The Exit button/menu path: nothing's already mid-close,
+                // so this has to ask for one explicitly. The window-close
+                // path left its own `close_requested` uncancelled above
+                // (or never canceled it in the first place), so it's
+                // already on track to complete without this.
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
 
         // See view.rs — menu bar/toolbar/status bar (top-to-bottom
@@ -2153,6 +2514,9 @@ impl eframe::App for GuiApp {
         self.render_new_project_dialog(ui);
         self.render_unsaved_changes_dialog(ui);
         self.render_unsaved_form_dialog(ui);
+        self.render_validate_before_save_dialog(ui);
+        self.render_delete_confirm_dialog(ui);
+        self.render_load_error_dialog(ui);
         self.render_attachments_dialog(ui);
         self.render_path_picker_dialog(ui);
         self.render_exit_dialog(ui);
@@ -3270,6 +3634,153 @@ mod test {
     }
 
     #[test]
+    fn a_not_validated_save_opens_the_validate_before_save_dialog() {
+        let mut app = test_app();
+        app.save_clicked();
+        let request = app.next_request;
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::Save(Err(gui_core::SaveError::NotValidated)),
+        });
+
+        assert_eq!(
+            app.validate_before_save_dialog,
+            Some(ValidateBeforeSaveDialogState::Asking { action: PendingSaveAction::Save })
+        );
+    }
+
+    #[test]
+    fn a_not_validated_save_as_opens_the_dialog_carrying_the_target_path() {
+        let mut app = test_app();
+        let path = std::path::PathBuf::from("/some/project");
+        app.save_project_as(path.clone());
+        let request = app.next_request;
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::SaveAs(Err(gui_core::SaveError::NotValidated)),
+        });
+
+        assert_eq!(
+            app.validate_before_save_dialog,
+            Some(ValidateBeforeSaveDialogState::Asking { action: PendingSaveAction::SaveAs(path) })
+        );
+        // A failed SaveAs must not adopt the path — same guarantee
+        // `a_failed_save_as_does_not_change_the_known_project_path`
+        // exercises on the gui-core side.
+        assert_eq!(app.project_path, None);
+    }
+
+    #[test]
+    fn confirming_the_validate_before_save_dialog_sends_validate_and_tracks_it() {
+        let mut app = test_app();
+        app.save_clicked();
+        let save_request = app.next_request;
+        app.apply_event(Event::Completed {
+            request: save_request,
+            outcome: Outcome::Save(Err(gui_core::SaveError::NotValidated)),
+        });
+
+        app.validate_before_save_confirmed();
+
+        let validate_request = app.next_request;
+        assert_eq!(
+            app.validate_before_save_dialog,
+            Some(ValidateBeforeSaveDialogState::Validating {
+                request: validate_request,
+                action: PendingSaveAction::Save
+            })
+        );
+        assert!(app.pending.contains_key(&validate_request));
+    }
+
+    #[test]
+    fn cancelling_the_validate_before_save_dialog_just_closes_it() {
+        let mut app = test_app();
+        app.save_clicked();
+        let request = app.next_request;
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::Save(Err(gui_core::SaveError::NotValidated)),
+        });
+
+        app.validate_before_save_dismissed();
+
+        assert_eq!(app.validate_before_save_dialog, None);
+    }
+
+    #[test]
+    fn a_successful_validate_from_the_dialog_closes_it_and_retries_save_as() {
+        let mut app = test_app();
+        let path = std::path::PathBuf::from("/some/project");
+        app.save_project_as(path.clone());
+        let save_as_request = app.next_request;
+        app.apply_event(Event::Completed {
+            request: save_as_request,
+            outcome: Outcome::SaveAs(Err(gui_core::SaveError::NotValidated)),
+        });
+        app.validate_before_save_confirmed();
+        let validate_request = app.next_request;
+
+        app.apply_event(Event::Completed {
+            request: validate_request,
+            outcome: Outcome::Validate(Ok(())),
+        });
+
+        assert_eq!(app.validate_before_save_dialog, None);
+        // The completed Validate request is cleared, and the retried
+        // SaveAs is tracked as a new pending request in its place.
+        assert_eq!(app.pending.len(), 1);
+        assert!(!app.pending.contains_key(&validate_request));
+    }
+
+    #[test]
+    fn a_failed_validate_from_the_dialog_shows_the_errors_with_no_auto_retry() {
+        let mut app = test_app();
+        app.save_clicked();
+        let save_request = app.next_request;
+        app.apply_event(Event::Completed {
+            request: save_request,
+            outcome: Outcome::Save(Err(gui_core::SaveError::NotValidated)),
+        });
+        app.validate_before_save_confirmed();
+        let validate_request = app.next_request;
+
+        app.apply_event(Event::Completed {
+            request: validate_request,
+            outcome: Outcome::Validate(Err(vec![logical::validate::ValidationError::DependencyCycle {
+                cycle: vec![LogicalPath::root(disk_entry_name("a"))],
+            }])),
+        });
+
+        match &app.validate_before_save_dialog {
+            Some(ValidateBeforeSaveDialogState::Failed { errors }) => {
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].contains("dependency cycle"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        app.validate_before_save_dismissed();
+        assert_eq!(app.validate_before_save_dialog, None);
+    }
+
+    #[test]
+    fn a_plain_toolbar_validate_does_not_touch_the_save_dialog() {
+        let mut app = test_app();
+        app.validate_clicked();
+        let request = app.next_request;
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::Validate(Ok(())),
+        });
+
+        assert_eq!(app.validate_before_save_dialog, None);
+    }
+
+    #[test]
     fn new_project_dialog_lifecycle() {
         let mut app = test_app();
         assert!(app.new_project_dialog.is_none());
@@ -3295,19 +3806,24 @@ mod test {
     }
 
     #[test]
-    fn a_successful_new_project_clears_dirty() {
+    fn a_successful_new_project_starts_dirty() {
         let mut app = test_app();
         app.new_project_dialog_opened();
         app.new_project_dialog_confirmed();
         let request = app.next_request;
 
-        app.dirty = true;
+        // Starts false so this proves `Outcome::NewProject` itself sets
+        // it, not some leftover state from an earlier mutation.
+        app.dirty = false;
         app.apply_event(Event::Completed {
             request,
             outcome: Outcome::NewProject,
         });
 
-        assert!(!app.dirty);
+        // No path to lose it to yet — see `Outcome::NewProject`'s own
+        // doc comment on why this has to start dirty, unlike a freshly
+        // loaded project.
+        assert!(app.dirty);
     }
 
     #[test]
@@ -4280,7 +4796,10 @@ mod test {
         assert!(form.read_only);
         assert!(form.summary.is_none());
         assert!(app.module_summary_request.is_some());
-        assert_eq!(app.pending.len(), 1);
+        // 2: the `GetModuleSummary` request plus the sidebar's own
+        // `GetModulePools` fetch (`fetch_sidebar_pools`), both sent by
+        // `select_module`.
+        assert_eq!(app.pending.len(), 2);
     }
 
     #[test]
@@ -4385,9 +4904,9 @@ mod test {
             panic!("expected ExistingModule");
         };
         assert!(form.pending_request.is_some());
-        // 2: the `GetModuleSummary` `select_module` itself sent, plus this
-        // rename.
-        assert_eq!(app.pending.len(), 2);
+        // 3: the `GetModuleSummary` and `GetModulePools` requests
+        // `select_module` itself sent, plus this rename.
+        assert_eq!(app.pending.len(), 3);
     }
 
     #[test]
@@ -4471,5 +4990,153 @@ mod test {
         assert!(form.path.is_empty());
         assert_eq!(form.display_name, "Renamed Project");
         assert_eq!(app.selected_module, Vec::<gui_core::EntryName>::new());
+    }
+
+    #[test]
+    fn editor_delete_clicked_on_an_editing_requirement_opens_the_confirmation() {
+        let mut app = app_editing_a_requirement();
+
+        app.editor_delete_clicked();
+
+        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should be open");
+        assert_eq!(dialog.target, DeleteTarget::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        assert_eq!(dialog.label, "definition");
+        assert!(dialog.pending_request.is_none());
+    }
+
+    #[test]
+    fn editor_delete_clicked_is_a_no_op_for_a_create_mode_form() {
+        let mut app = test_app();
+        app.new_requirement_clicked();
+
+        app.editor_delete_clicked();
+
+        assert!(app.delete_confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn editor_delete_clicked_is_a_no_op_for_the_project_root() {
+        let mut app = test_app();
+        app.select_module(Vec::new());
+        app.editor_edit_clicked();
+
+        app.editor_delete_clicked();
+
+        assert!(app.delete_confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn editor_delete_clicked_on_an_editing_module_opens_the_confirmation() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+
+        app.editor_delete_clicked();
+
+        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should be open");
+        assert_eq!(dialog.target, DeleteTarget::Module(vec![disk_entry_name("setup")]));
+    }
+
+    #[test]
+    fn delete_cancelled_closes_the_dialog_without_sending_anything() {
+        let mut app = app_editing_a_requirement();
+        app.editor_delete_clicked();
+        let pending_before = app.pending.len();
+
+        app.delete_cancelled();
+
+        assert!(app.delete_confirm_dialog.is_none());
+        assert_eq!(app.pending.len(), pending_before);
+    }
+
+    #[test]
+    fn delete_confirmed_sends_the_matching_remove_command_and_tracks_it() {
+        let mut app = app_editing_a_requirement();
+        app.editor_delete_clicked();
+
+        app.delete_confirmed();
+
+        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should still be open while pending");
+        assert!(dialog.pending_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_successful_delete_closes_the_dialog_marks_dirty_and_selects_the_parent_module() {
+        let mut app = app_editing_a_requirement();
+        app.editor_delete_clicked();
+        app.delete_confirmed();
+        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+
+        assert!(app.delete_confirm_dialog.is_none());
+        assert!(app.dirty);
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule after navigating to the parent module");
+        };
+        assert!(form.path.is_empty());
+    }
+
+    #[test]
+    fn a_failed_delete_leaves_the_dialog_open_with_an_error() {
+        let mut app = app_editing_a_requirement();
+        app.editor_delete_clicked();
+        app.delete_confirmed();
+        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RemoveRequirement(false),
+        });
+
+        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should stay open on failure");
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn a_delete_reply_for_an_already_cancelled_dialog_is_ignored() {
+        let mut app = app_editing_a_requirement();
+        app.editor_delete_clicked();
+        app.delete_confirmed();
+        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+        app.delete_cancelled();
+
+        // The reply for the now-abandoned dialog arrives late.
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+
+        assert!(app.delete_confirm_dialog.is_none());
+        assert!(!app.dirty);
+        // Still the requirement form — a stale reply must not redirect it.
+        assert!(matches!(app.editor, EditorState::NewRequirement(_)));
+    }
+
+    #[test]
+    fn a_successful_module_delete_selects_the_parent_module() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        app.editor_delete_clicked();
+        app.delete_confirmed();
+        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RemoveModule(true),
+        });
+
+        assert!(app.delete_confirm_dialog.is_none());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule after navigating to the parent module");
+        };
+        assert!(form.path.is_empty());
     }
 }

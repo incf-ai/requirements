@@ -56,8 +56,8 @@ mod test {
     use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
-    fn sample_project_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
     /// Builds a minimal valid `results/<stage>/` folder in a fresh tempdir.
@@ -77,14 +77,14 @@ mod test {
     }
 
     #[test]
-    fn loads_the_definition_result_from_the_sample_project() -> Result<(), Error> {
-        let dir = sample_project_dir().join("results/definition");
+    fn loads_the_design_result_from_the_test_project() -> Result<(), Error> {
+        let dir = test_project_dir().join("results/design");
         let result = load_result(&StdFilesystem, &FixedGit, &dir)?;
 
-        assert_eq!(result.definition.title, "Definition");
+        assert_eq!(result.definition.title, "Design");
         assert_eq!(
             result.definition.requirement_path.0,
-            "requirements/definition"
+            "requirements/design"
         );
         assert!(matches!(
             result.definition.status,

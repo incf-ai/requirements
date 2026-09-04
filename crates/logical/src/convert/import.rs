@@ -135,8 +135,8 @@ mod test {
     use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
-    fn sample_project_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
     #[test]
@@ -233,45 +233,45 @@ mod test {
     }
 
     #[test]
-    fn imports_the_whole_sample_project() {
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+    fn imports_the_whole_test_project() {
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
-        assert_eq!(draft.definition.name, "Capstone");
-        assert_eq!(draft.tree.requirements.len(), 5);
-        assert_eq!(draft.tree.tests.len(), 5);
-        assert_eq!(draft.tree.results.len(), 5);
-        assert_eq!(draft.tree.modules.len(), 5);
+        assert_eq!(draft.definition.name, "Test Project");
+        assert_eq!(draft.tree.requirements.len(), 3);
+        assert_eq!(draft.tree.tests.len(), 3);
+        assert_eq!(draft.tree.results.len(), 3);
+        assert_eq!(draft.tree.modules.len(), 2);
     }
 
     #[test]
     fn imports_a_requirement_with_a_test_and_dependency_reference() {
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
-        let definition = draft
+        let external = draft
             .tree
             .requirements
-            .get(&disk::EntryName("definition".to_string()))
+            .get(&disk::EntryName("external".to_string()))
             .unwrap();
-        assert_eq!(definition.title, "Definition");
-        assert_eq!(definition.tests.len(), 1);
-        assert_eq!(definition.dependencies.len(), 1);
+        assert_eq!(external.title, "External");
+        assert_eq!(external.tests.len(), 1);
+        assert_eq!(external.dependencies.len(), 1);
     }
 
     #[test]
     fn imports_local_and_module_attachment_references() {
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
-        let discovery = draft
+        let design = draft
             .tree
             .requirements
-            .get(&disk::EntryName("discovery".to_string()))
+            .get(&disk::EntryName("design".to_string()))
             .unwrap();
-        assert_eq!(discovery.attachment_refs.len(), 1);
+        assert_eq!(design.attachment_refs.len(), 1);
         assert!(matches!(
-            discovery.attachment_refs[0],
+            design.attachment_refs[0],
             disk::AttachmentReferenceKind::LocalAttachmentReferenceV1 { .. }
         ));
 
@@ -280,42 +280,46 @@ mod test {
 
     #[test]
     fn imports_a_test_with_local_and_module_template_references() {
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
-        let review = draft
+        let alpha = draft
             .tree
-            .tests
-            .get(&disk::EntryName("example_review".to_string()))
+            .modules
+            .get(&disk::EntryName("alpha".to_string()))
             .unwrap();
-        assert_eq!(review.template_refs.len(), 2);
+        let alpha_test = alpha
+            .tests
+            .get(&disk::EntryName("alpha_test".to_string()))
+            .unwrap();
+        assert_eq!(alpha_test.template_refs.len(), 2);
         assert!(!draft.tree.templates.is_empty());
     }
 
     #[test]
     fn imports_a_result_with_requirement_and_test_commit_pairs() {
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
-        let definition = draft
+        let design = draft
             .tree
             .results
-            .get(&disk::EntryName("definition".to_string()))
+            .get(&disk::EntryName("design".to_string()))
             .unwrap();
-        assert_eq!(definition.requirement_path.0, "requirements/definition");
-        assert_eq!(definition.test_path.0, "/tests/generic_inspection");
+        assert_eq!(design.requirement_path.0, "requirements/design");
+        assert_eq!(design.test_path.0, "tests/smoke");
     }
 
     #[test]
     fn imports_an_empty_submodule() {
-        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &sample_project_dir()).unwrap();
+        let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
         assert!(
             draft
                 .tree
                 .modules
-                .contains_key(&disk::EntryName("setup".to_string()))
+                .contains_key(&disk::EntryName("beta".to_string()))
         );
     }
 }

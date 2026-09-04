@@ -101,8 +101,8 @@ mod test {
     use crate::test_support::{FixedGit, git_commit_all, init_scratch_git_repo};
     use syscalls::{StdFilesystem, SystemGit};
 
-    fn sample_project_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
     /// Builds a minimal valid `requirements/<stage>/` folder in a fresh tempdir.
@@ -140,11 +140,11 @@ mod test {
     }
 
     #[test]
-    fn loads_the_definition_stage_from_the_sample_project() -> Result<(), Error> {
-        let dir = sample_project_dir().join("requirements/definition");
+    fn loads_the_external_stage_from_the_test_project() -> Result<(), Error> {
+        let dir = test_project_dir().join("requirements/external");
         let requirement = load_requirement_stage(&StdFilesystem, &FixedGit, &dir)?;
 
-        assert_eq!(requirement.definition.title, "Definition");
+        assert_eq!(requirement.definition.title, "External");
         assert_eq!(requirement.requirement_text, "");
         assert_eq!(requirement.requirement_guidance, Some(String::new()));
         assert_eq!(requirement.test_guidance, Some(String::new()));
@@ -155,8 +155,8 @@ mod test {
     }
 
     #[test]
-    fn loads_the_implementation_stage_submodules_dependency() -> Result<(), Error> {
-        let dir = sample_project_dir().join("requirements/implementation");
+    fn loads_the_external_stage_submodules_dependency() -> Result<(), Error> {
+        let dir = test_project_dir().join("requirements/external");
         let requirement = load_requirement_stage(&StdFilesystem, &FixedGit, &dir)?;
 
         assert!(matches!(

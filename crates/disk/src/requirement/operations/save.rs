@@ -90,14 +90,14 @@ mod test {
     use crate::test_support::FixedGit;
     use syscalls::StdFilesystem;
 
-    fn sample_project_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
     #[test]
     fn round_trips_a_requirement_stage_through_a_tempdir() -> Result<(), Box<dyn std::error::Error>>
     {
-        let dir = sample_project_dir().join("requirements/definition");
+        let dir = test_project_dir().join("requirements/external");
         let original = load_requirement_stage(&StdFilesystem, &FixedGit, &dir)?;
 
         let tempdir = std::env::temp_dir().join(format!(

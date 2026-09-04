@@ -281,6 +281,52 @@ pub(crate) fn load_named_children<T, E: std::error::Error + 'static>(
         .collect()
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum RemoveStaleChildrenError {
+    #[error("io error reading directory {path}: {source}")]
+    ReadDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("io error removing {path}: {source}")]
+    Remove {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Deletes every immediate subdirectory of `dir` whose `EntryName` isn't in
+/// `keep` — the delete-side counterpart to `load_named_children`/the
+/// per-entry save loops, which are purely additive and never notice an
+/// in-memory entry that's gone missing. `dir` is assumed to already exist
+/// (callers `create_dir_all` it first, same as the save loops do).
+pub(crate) fn remove_stale_children(
+    fs: &dyn Filesystem,
+    dir: &Path,
+    keep: &std::collections::BTreeSet<EntryName>,
+) -> Result<(), RemoveStaleChildrenError> {
+    let entries = fs
+        .read_dir(dir)
+        .map_err(|source| RemoveStaleChildrenError::ReadDir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+
+    for entry in entries.into_iter().filter(|entry| fs.is_dir(entry)) {
+        if !keep.contains(&EntryName::of(&entry)) {
+            fs.remove_dir_all(&entry)
+                .map_err(|source| RemoveStaleChildrenError::Remove {
+                    path: entry.clone(),
+                    source,
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -439,6 +485,57 @@ mod test {
             EntryName("definition".to_string()).to_string(),
             "definition"
         );
+    }
+
+    #[test]
+    fn remove_stale_children_deletes_directories_not_in_keep() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-util-remove-stale-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(dir.join("keep-me")).unwrap();
+        std::fs::create_dir_all(dir.join("stale")).unwrap();
+        std::fs::write(dir.join("not-a-dir.txt"), "hello").unwrap();
+
+        let keep = std::collections::BTreeSet::from([EntryName("keep-me".to_string())]);
+        remove_stale_children(&StdFilesystem, &dir, &keep).unwrap();
+
+        assert!(dir.join("keep-me").exists());
+        assert!(!dir.join("stale").exists());
+        assert!(dir.join("not-a-dir.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_stale_children_reports_generic_read_dir_io_errors() {
+        let dir = Path::new("/nonexistent/does-not-matter-stale-dir");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir, io::ErrorKind::PermissionDenied);
+
+        let err =
+            remove_stale_children(&fs, dir, &std::collections::BTreeSet::new()).unwrap_err();
+        assert!(matches!(err, RemoveStaleChildrenError::ReadDir { .. }));
+    }
+
+    #[test]
+    fn remove_stale_children_reports_generic_remove_io_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-util-remove-stale-io-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(dir.join("stale")).unwrap();
+
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("stale"), io::ErrorKind::PermissionDenied);
+
+        let err =
+            remove_stale_children(&fs, &dir, &std::collections::BTreeSet::new()).unwrap_err();
+        assert!(matches!(err, RemoveStaleChildrenError::Remove { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

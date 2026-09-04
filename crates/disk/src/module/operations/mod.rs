@@ -14,7 +14,9 @@ use crate::result::operations::load::Error as LoadResultError;
 use crate::result::operations::save::Error as SaveResultError;
 use crate::test::operations::load::Error as LoadTestError;
 use crate::test::operations::save::Error as SaveTestError;
-use crate::util::{LoadNamedChildrenError, load_named_children};
+use crate::util::{
+    LoadNamedChildrenError, RemoveStaleChildrenError, load_named_children, remove_stale_children,
+};
 
 pub mod load;
 pub mod save;
@@ -115,6 +117,14 @@ pub(crate) enum SaveModuleTreeError {
         #[source]
         source: SaveSubmoduleError,
     },
+    #[error("failed to remove stale requirements: {0}")]
+    StaleRequirements(RemoveStaleChildrenError),
+    #[error("failed to remove stale tests: {0}")]
+    StaleTests(RemoveStaleChildrenError),
+    #[error("failed to remove stale results: {0}")]
+    StaleResults(RemoveStaleChildrenError),
+    #[error("failed to remove stale modules: {0}")]
+    StaleModules(RemoveStaleChildrenError),
 }
 
 pub(crate) fn save_module_tree(
@@ -132,6 +142,12 @@ pub(crate) fn save_module_tree(
             path: requirements_dir.clone(),
             source,
         })?;
+    remove_stale_children(
+        fs,
+        &requirements_dir,
+        &tree.requirements.iter().map(|r| r.name.clone()).collect(),
+    )
+    .map_err(SaveModuleTreeError::StaleRequirements)?;
     for requirement in &tree.requirements {
         crate::requirement::operations::save_requirement_stage(
             fs,
@@ -150,6 +166,12 @@ pub(crate) fn save_module_tree(
             path: tests_dir.clone(),
             source,
         })?;
+    remove_stale_children(
+        fs,
+        &tests_dir,
+        &tree.tests.iter().map(|t| t.name.clone()).collect(),
+    )
+    .map_err(SaveModuleTreeError::StaleTests)?;
     for test in &tree.tests {
         crate::test::operations::save_test(fs, &tests_dir.join(&test.name), test).map_err(
             |source| SaveModuleTreeError::Test {
@@ -165,6 +187,12 @@ pub(crate) fn save_module_tree(
             path: results_dir.clone(),
             source,
         })?;
+    remove_stale_children(
+        fs,
+        &results_dir,
+        &tree.results.iter().map(|r| r.name.clone()).collect(),
+    )
+    .map_err(SaveModuleTreeError::StaleResults)?;
     for result in &tree.results {
         crate::result::operations::save_result(fs, &results_dir.join(&result.name), result)
             .map_err(|source| SaveModuleTreeError::Result {
@@ -179,6 +207,12 @@ pub(crate) fn save_module_tree(
             path: modules_dir.clone(),
             source,
         })?;
+    remove_stale_children(
+        fs,
+        &modules_dir,
+        &tree.modules.iter().map(|m| m.name.clone()).collect(),
+    )
+    .map_err(SaveModuleTreeError::StaleModules)?;
     for submodule in &tree.modules {
         save_submodule(fs, &modules_dir.join(&submodule.name), submodule).map_err(|source| {
             SaveModuleTreeError::Module {
@@ -459,5 +493,55 @@ mod test {
         assert!(matches!(err, SaveModuleTreeError::Module { .. }));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Saving a tree that no longer mentions a previously-saved entry
+    /// deletes that entry's on-disk directory instead of leaving it behind
+    /// (the additive save loops above never notice a removal on their own).
+    #[test]
+    fn save_module_tree_deletes_children_no_longer_in_the_tree() {
+        let dir = temp_dir("stale-children");
+        let tree_with_one_of_each = ModuleTree {
+            requirements: vec![minimal_requirement("foo")],
+            tests: vec![minimal_test("foo")],
+            results: vec![minimal_result("foo")],
+            modules: vec![minimal_submodule("foo")],
+            ..Default::default()
+        };
+        save_module_tree(&StdFilesystem, &dir, &tree_with_one_of_each).unwrap();
+        assert!(dir.join("requirements/foo").exists());
+        assert!(dir.join("tests/foo").exists());
+        assert!(dir.join("results/foo").exists());
+        assert!(dir.join("modules/foo").exists());
+
+        save_module_tree(&StdFilesystem, &dir, &ModuleTree::default()).unwrap();
+        assert!(!dir.join("requirements/foo").exists());
+        assert!(!dir.join("tests/foo").exists());
+        assert!(!dir.join("results/foo").exists());
+        assert!(!dir.join("modules/foo").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_module_tree_reports_io_errors_removing_stale_children() {
+        let cases: [(&str, fn(&SaveModuleTreeError) -> bool); 4] = [
+            ("requirements", |e| matches!(e, SaveModuleTreeError::StaleRequirements(_))),
+            ("tests", |e| matches!(e, SaveModuleTreeError::StaleTests(_))),
+            ("results", |e| matches!(e, SaveModuleTreeError::StaleResults(_))),
+            ("modules", |e| matches!(e, SaveModuleTreeError::StaleModules(_))),
+        ];
+        for (sub, expect_variant) in cases {
+            let dir = temp_dir(&format!("stale-io-{sub}"));
+            std::fs::create_dir_all(dir.join(sub).join("stale")).unwrap();
+
+            let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+            fs.inject(dir.join(sub).join("stale"), io::ErrorKind::PermissionDenied);
+
+            let err = save_module_tree(&fs, &dir, &ModuleTree::default()).unwrap_err();
+            assert!(expect_variant(&err), "expected a stale-removal failure for {sub}");
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

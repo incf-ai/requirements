@@ -14,6 +14,7 @@ pub trait Filesystem {
     fn exists(&self, path: &Path) -> bool;
     fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -48,6 +49,10 @@ impl Filesystem for StdFilesystem {
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_dir_all(path)
     }
 }
 
@@ -126,10 +131,17 @@ impl<F: Filesystem> Filesystem for FaultInjectingFilesystem<F> {
         }
         self.inner.create_dir_all(path)
     }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        if let Some(err) = self.fault(path) {
+            return Err(err);
+        }
+        self.inner.remove_dir_all(path)
+    }
 }
 
 /// Wraps another `Filesystem`, sleeping `delay` before every *mutating*
-/// call (`write`/`create_dir_all`) — letting tests make a real save
+/// call (`write`/`create_dir_all`/`remove_dir_all`) — letting tests make a real save
 /// artificially slow instead of racing however fast the real filesystem
 /// happens to be, without also slowing down reads (so loading a project
 /// through this wrapper stays fast; only saving one is affected). Real
@@ -180,6 +192,11 @@ impl<F: Filesystem> Filesystem for SlowFilesystem<F> {
         std::thread::sleep(self.delay);
         self.inner.create_dir_all(path)
     }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        std::thread::sleep(self.delay);
+        self.inner.remove_dir_all(path)
+    }
 }
 
 pub trait Git {
@@ -195,6 +212,24 @@ pub trait Git {
     fn commit_for_path(&self, path: &Path) -> Result<String, CommitForPathError> {
         self.commit_for_path_excluding(path, &[])
     }
+
+    /// Whether `dir` is inside a git working tree at all. Every other
+    /// method on this trait assumes it is (a project's commit lookups
+    /// fail, confusingly, one leaf at a time otherwise) — callers that can
+    /// give a clear up-front error should check this first. Defaults to
+    /// `true` so the fakes used across the workspace's tests, which never
+    /// touch a real `.git`, keep behaving as if everything's a repository
+    /// without each needing its own override.
+    fn is_repository(&self, _dir: &Path) -> bool {
+        true
+    }
+
+    /// `git init`s `dir` in place. Defaults to a no-op for the same reason
+    /// as `is_repository`'s default — only `SystemGit` needs this for
+    /// real.
+    fn init_repository(&self, _dir: &Path) -> Result<(), InitRepositoryError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -208,6 +243,17 @@ pub enum CommitForPathError {
     CommandFailed { status: ExitStatus, stderr: String },
     #[error("no commit touches {path}")]
     NotTracked { path: PathBuf },
+}
+
+#[derive(Debug, Error)]
+pub enum InitRepositoryError {
+    #[error("failed to run git init: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("git init exited with {status}: {stderr}")]
+    CommandFailed { status: ExitStatus, stderr: String },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -255,6 +301,31 @@ impl Git for SystemGit {
         }
 
         Ok(hash)
+    }
+
+    fn is_repository(&self, dir: &Path) -> bool {
+        Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn init_repository(&self, dir: &Path) -> Result<(), InitRepositoryError> {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .arg("init")
+            .output()
+            .map_err(|source| InitRepositoryError::Spawn { source })?;
+
+        if !output.status.success() {
+            return Err(InitRepositoryError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -482,7 +553,8 @@ mod tests {
         assert!(fs.exists(&file));
         assert!(fs.is_dir(&dir));
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs.remove_dir_all(&dir).unwrap();
+        assert!(!fs.exists(&dir));
     }
 
     #[test]
@@ -512,7 +584,9 @@ mod tests {
         assert!(before_create.elapsed() >= Duration::from_millis(50));
         assert!(fs.is_dir(&subdir));
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        let before_remove = std::time::Instant::now();
+        fs.remove_dir_all(&dir).unwrap();
+        assert!(before_remove.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]
@@ -532,7 +606,11 @@ mod tests {
         fs.clear(&file);
         assert_eq!(fs.read_to_string(&file).unwrap(), "hello");
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs.inject(&dir, io::ErrorKind::PermissionDenied);
+        let err = fs.remove_dir_all(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        fs.clear(&dir);
+        fs.remove_dir_all(&dir).unwrap();
     }
 
     /// Sets up an isolated scratch git repo (not this repository's own
@@ -582,6 +660,45 @@ mod tests {
 
         let hash = SystemGit.commit_for_path(&dir.join("tracked.txt")).unwrap();
         assert_eq!(hash, expected);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_is_repository_is_true_inside_a_repo() {
+        let dir = scratch_git_repo("is-repository-true");
+
+        assert!(SystemGit.is_repository(&dir));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_is_repository_is_false_outside_a_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-git-is-repository-false-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!SystemGit.is_repository(&dir));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_init_repository_makes_is_repository_true() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-git-init-repository-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!SystemGit.is_repository(&dir));
+        SystemGit.init_repository(&dir).unwrap();
+        assert!(SystemGit.is_repository(&dir));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -439,8 +439,8 @@ mod test {
     }
 
     #[test]
-    fn loads_and_validates_the_whole_sample_project_cleanly() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project");
+    fn loads_and_validates_the_whole_test_project_cleanly() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project");
         let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &dir).unwrap();
         let draft = crate::convert::import_project(on_disk);
 

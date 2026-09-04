@@ -35,6 +35,11 @@ thiserror = { workspace = true }
 [dev-dependencies]
 accesskit = "0.24.1"
 egui_kittest = { version = "0.36.1", features = ["eframe"] }
+# Only for constructing `ValidationError` values in
+# `validate_before_save_dialog` tests — gui-ui otherwise talks to
+# gui-core exclusively through its `Command`/`Outcome` API, never
+# `logical` directly.
+logical = { workspace = true }
 # For the randomized nav_history test only — always seeded, never system
 # randomness, so runs stay reproducible. Already resolved in Cargo.lock at
 # this version via `rfd`'s own `ashpd` dependency, so this adds no new

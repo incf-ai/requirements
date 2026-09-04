@@ -12,8 +12,8 @@ use gui_core::{
 
 use crate::{
     AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp, LocalPoolKind,
-    PathPickerTarget, PendingNavigation, PendingProjectAction, ThemeChoice, absolute_reference_path,
-    flatten_leaf_paths, icons, leaf_kind_segment, theme_colors,
+    PathPickerTarget, PendingNavigation, PendingProjectAction, ThemeChoice, ValidateBeforeSaveDialogState,
+    absolute_reference_path, flatten_leaf_paths, icons, leaf_kind_segment, theme_colors,
 };
 
 /// Pops a native OS folder picker (`rfd`) titled `title` — blocking, but
@@ -473,35 +473,73 @@ impl GuiApp {
             // one-frame signal, not a persistent setting.
             let force_open = self.tree_force_open.take();
 
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match &self.tree {
+            // Cloned up front (rather than matching `&self.tree`) so the
+            // borrow doesn't outlive this line — both closures below need
+            // `&mut self` (for `select_module`/`render_selected_module_pane`),
+            // which an immutable borrow of `self.tree` held across them
+            // would conflict with.
+            let tree = self.tree.clone();
+            match &tree {
                 None => {
                     ui.label("No project loaded.");
                 }
                 Some(tree) => {
                     let root = tree.root.clone();
-                    // The root `TreeNode`'s own `name` is the project's
-                    // display name (see `gui-core`'s `build_tree_snapshot`)
-                    // — a label, not a real module-path segment. Unlike
-                    // every other `Module` node, it must never be pushed
-                    // into a path, so the root is rendered specially here
-                    // (its own selector + iterating its children with an
-                    // *empty* path) rather than through `render_tree_node`,
-                    // which pushes `node.name` for every module it handles.
-                    let is_root_current = self.selected_module.is_empty();
-                    ui.horizontal(|ui| {
-                        let glyph = if is_root_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
-                        let mut text = egui::RichText::new(glyph);
-                        if is_root_current {
-                            text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
-                        }
-                        if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked() {
-                            self.select_module(Vec::new());
-                        }
-                        ui.strong(root.name.as_str());
+
+                    // Reserved *before* the top area is drawn: a
+                    // `ScrollArea` with no `max_height` fills all
+                    // available space in its container, so computing
+                    // this split only after rendering the top area
+                    // (as before) left nothing for the bottom area —
+                    // its content was still drawn, just pushed below
+                    // the visible panel.
+                    let bottom_height = ui.available_height() * 0.4;
+                    let top_height = (ui.available_height() - bottom_height - 8.0).max(0.0);
+
+                    egui::ScrollArea::vertical().id_salt("tree_pane_modules").max_height(top_height).auto_shrink(
+                        [false, false],
+                    )
+                    .show(
+                        ui,
+                        |ui| {
+                            // The root `TreeNode`'s own `name` is the
+                            // project's display name (see `gui-core`'s
+                            // `build_tree_snapshot`) — a label, not a real
+                            // module-path segment. Unlike every other
+                            // `Module` node, it must never be pushed into a
+                            // path, so the root is rendered specially here
+                            // (its own selector + iterating its children
+                            // with an *empty* path) rather than through
+                            // `render_tree_node`, which pushes `node.name`
+                            // for every module it handles.
+                            let is_root_current = self.selected_module.is_empty();
+                            ui.horizontal(|ui| {
+                                let glyph =
+                                    if is_root_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
+                                let mut text = egui::RichText::new(glyph);
+                                if is_root_current {
+                                    text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
+                                }
+                                if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked()
+                                {
+                                    self.select_module(Vec::new());
+                                }
+                                ui.strong(root.name.as_str());
+                            });
+                            render_module_children(self, ui, &root.children, &[], force_open);
+                        },
+                    );
+
+                    ui.separator();
+
+                    egui::ScrollArea::vertical().id_salt("tree_pane_selection").max_height(bottom_height).auto_shrink(
+                        [false, false],
+                    )
+                    .show(ui, |ui| {
+                        render_selected_module_pane(self, ui, tree, force_open);
                     });
-                    render_module_children(self, ui, &root.children, &[], force_open);
                 }
-            });
+            }
         });
     }
 
@@ -574,6 +612,7 @@ impl GuiApp {
         let mut create_clicked = false;
         let mut cancel_clicked = false;
         let mut edit_clicked = false;
+        let mut delete_clicked = false;
         let mut add_attachment_clicked = false;
         let mut remove_attachment: Option<PathBuf> = None;
         let mut auto_commit_clicked: Option<(DependencySlot, AutoCommitKind)> = None;
@@ -620,6 +659,11 @@ impl GuiApp {
                     }
                     if ui.button("Cancel").clicked() {
                         cancel_clicked = true;
+                    }
+                    // Only an already-existing entry can be deleted — a
+                    // create-mode form has nothing saved yet.
+                    if editing && ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                        delete_clicked = true;
                     }
                 }
             });
@@ -782,6 +826,8 @@ impl GuiApp {
             self.editor_create_clicked();
         } else if cancel_clicked {
             self.editor_cancel_clicked();
+        } else if delete_clicked {
+            self.editor_delete_clicked();
         } else if add_attachment_clicked {
             self.local_attachment_add_clicked(LocalPoolKind::RequirementAttachment);
         } else if let Some(path) = remove_attachment {
@@ -802,6 +848,7 @@ impl GuiApp {
         let mut create_clicked = false;
         let mut cancel_clicked = false;
         let mut edit_clicked = false;
+        let mut delete_clicked = false;
         let mut add_attachment_clicked = false;
         let mut remove_attachment: Option<PathBuf> = None;
         let mut add_template_clicked = false;
@@ -829,6 +876,11 @@ impl GuiApp {
                     }
                     if ui.button("Cancel").clicked() {
                         cancel_clicked = true;
+                    }
+                    // Only an already-existing entry can be deleted — a
+                    // create-mode form has nothing saved yet.
+                    if editing && ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                        delete_clicked = true;
                     }
                 }
             });
@@ -939,6 +991,8 @@ impl GuiApp {
             self.editor_create_clicked();
         } else if cancel_clicked {
             self.editor_cancel_clicked();
+        } else if delete_clicked {
+            self.editor_delete_clicked();
         } else if add_attachment_clicked {
             self.local_attachment_add_clicked(LocalPoolKind::TestAttachment);
         } else if let Some(path) = remove_attachment {
@@ -954,6 +1008,7 @@ impl GuiApp {
         let mut create_clicked = false;
         let mut cancel_clicked = false;
         let mut edit_clicked = false;
+        let mut delete_clicked = false;
         let mut add_attachment_clicked = false;
         let mut remove_attachment: Option<PathBuf> = None;
         let mut open_picker: Option<PathPickerTarget> = None;
@@ -980,6 +1035,11 @@ impl GuiApp {
                     }
                     if ui.button("Cancel").clicked() {
                         cancel_clicked = true;
+                    }
+                    // Only an already-existing entry can be deleted — a
+                    // create-mode form has nothing saved yet.
+                    if editing && ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                        delete_clicked = true;
                     }
                 }
             });
@@ -1105,6 +1165,8 @@ impl GuiApp {
             self.editor_create_clicked();
         } else if cancel_clicked {
             self.editor_cancel_clicked();
+        } else if delete_clicked {
+            self.editor_delete_clicked();
         } else if add_attachment_clicked {
             self.local_attachment_add_clicked(LocalPoolKind::ResultAttachment);
         } else if let Some(path) = remove_attachment {
@@ -1155,6 +1217,7 @@ impl GuiApp {
         let mut edit_clicked = false;
         let mut save_clicked = false;
         let mut cancel_clicked = false;
+        let mut delete_clicked = false;
         {
             let EditorState::ExistingModule(form) = &mut self.editor else {
                 return;
@@ -1177,6 +1240,12 @@ impl GuiApp {
                     }
                     if ui.button("Cancel").clicked() {
                         cancel_clicked = true;
+                    }
+                    // Never offered for the project root itself — see
+                    // `render_module_page`'s exclusion in the user's
+                    // original request ("except project edit").
+                    if !is_root && ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                        delete_clicked = true;
                     }
                 }
             });
@@ -1227,6 +1296,8 @@ impl GuiApp {
             self.editor_create_clicked();
         } else if cancel_clicked {
             self.editor_cancel_clicked();
+        } else if delete_clicked {
+            self.editor_delete_clicked();
         }
     }
 
@@ -1331,6 +1402,60 @@ impl GuiApp {
         } else if cancelled {
             self.unsaved_form_dialog_cancelled();
         }
+    }
+
+    /// The "must validate before saving" prompt — opens when a `Save`/
+    /// `SaveAs` comes back `SaveError::NotValidated` (see `apply_outcome`).
+    /// `Asking` offers Validate/Cancel; `Validating` is a brief
+    /// non-interactive "please wait" (gui-core answers fast enough that a
+    /// spinner would be overkill — see README's Testing strategy on why
+    /// this crate keeps such states simple); `Failed` swaps in the
+    /// validation errors with a single "Ok" to close, no retry button —
+    /// see `ValidateBeforeSaveDialogState`'s own doc comment on why.
+    pub(crate) fn render_validate_before_save_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(state) = self.validate_before_save_dialog.clone() else {
+            return;
+        };
+
+        egui::Modal::new(egui::Id::new("validate_before_save_dialog")).show(ui.ctx(), |ui| match state {
+            ValidateBeforeSaveDialogState::Asking { .. } => {
+                ui.label("This project must be validated before it can be saved. Validate now?");
+                ui.horizontal(|ui| {
+                    if ui.button("Validate").clicked() {
+                        self.validate_before_save_confirmed();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.validate_before_save_dismissed();
+                    }
+                });
+            }
+            ValidateBeforeSaveDialogState::Validating { .. } => {
+                ui.label("Validating…");
+            }
+            ValidateBeforeSaveDialogState::Failed { errors } => {
+                ui.label("Validation failed:");
+                for error in &errors {
+                    ui.label(format!("\u{2022} {error}"));
+                }
+                if ui.button("Ok").clicked() {
+                    self.validate_before_save_dismissed();
+                }
+            }
+        });
+    }
+
+    pub(crate) fn render_load_error_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(message) = self.load_error_dialog.clone() else {
+            return;
+        };
+
+        egui::Modal::new(egui::Id::new("load_error_dialog")).show(ui.ctx(), |ui| {
+            ui.label("Couldn't open project:");
+            ui.label(message);
+            if ui.button("Ok").clicked() {
+                self.load_error_dialog_dismissed();
+            }
+        });
     }
 
     pub(crate) fn render_exit_dialog(&mut self, ui: &mut egui::Ui) {
@@ -1558,6 +1683,41 @@ impl GuiApp {
         }
     }
 
+    /// The Delete-button confirmation prompt — opens from a Delete button
+    /// on the requirement/test/result/module edit forms (never the
+    /// project root's own page) and always asks before actually sending
+    /// the `Command::Remove*`. See `DeleteConfirmState`'s own doc comment.
+    pub(crate) fn render_delete_confirm_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.delete_confirm_dialog.clone() else {
+            return;
+        };
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let busy = dialog.pending_request.is_some();
+        egui::Modal::new(egui::Id::new("delete_confirm_dialog")).show(ui.ctx(), |ui| {
+            ui.heading("Delete?");
+            ui.label(format!("This will permanently delete \"{}\". This cannot be undone.", dialog.label));
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+        if confirmed {
+            self.delete_confirmed();
+        } else if cancelled {
+            self.delete_cancelled();
+        }
+    }
+
     #[cfg(all(feature = "debug-panel", debug_assertions))]
     pub(crate) fn render_debug_panel(&mut self, ui: &mut egui::Ui) {
         if !self.debug.open {
@@ -1624,65 +1784,52 @@ impl GuiApp {
     }
 }
 
+/// Only ever called for a `Module` node — `render_module_children` filters
+/// to `EntryKind::Module` before recursing here, since the top tree pane
+/// no longer renders leaves at all.
 fn render_tree_node(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName], force_open: Option<bool>) {
-    match node.kind {
-        EntryKind::Module => {
-            // A module with no matching descendant (filter active, no
-            // leaf under it — at any depth — has a fully-qualified path
-            // containing the filter text) is skipped entirely, not just
-            // collapsed — see `node_matches_filter`'s own doc comment.
-            if !node_matches_filter(node, module_path, &app.tree_filter) {
-                return;
-            }
-
-            let mut this_module_path = module_path.to_vec();
-            this_module_path.push(node.name.clone());
-            let is_current = app.selected_module == this_module_path;
-
-            ui.horizontal(|ui| {
-                // A module has no `EntryDetail`/form of its own (see that
-                // type's doc comment) — this button is the only way to
-                // make it the "current module" new entries and the
-                // Attachments dialog target; the CollapsingHeader label
-                // itself only toggles expand/collapse.
-                let glyph = if is_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
-                let mut text = egui::RichText::new(glyph);
-                if is_current {
-                    text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
-                }
-                if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked() {
-                    if app.editor_has_unsaved_edits() {
-                        app.unsaved_form_dialog_opened(PendingNavigation::SelectModule(this_module_path.clone()));
-                    } else {
-                        app.select_module(this_module_path.clone());
-                    }
-                }
-                egui::CollapsingHeader::new(node.name.as_str())
-                    .default_open(false)
-                    .open(force_open)
-                    .show(ui, |ui| {
-                        render_module_children(app, ui, &node.children, &this_module_path, force_open);
-                    });
-            });
-        }
-        // Only reached via `render_leaf_group` below — a module's
-        // children are grouped by kind before being rendered, never
-        // walked one-by-one in raw `TreeNode` order.
-        EntryKind::Requirement | EntryKind::Test | EntryKind::Result => {
-            render_leaf(app, ui, node, module_path);
-        }
+    // A module with no matching descendant module (filter active) is
+    // skipped entirely, not just collapsed — see `module_matches_filter`'s
+    // own doc comment.
+    if !module_matches_filter(node, module_path, &app.tree_filter) {
+        return;
     }
+
+    let mut this_module_path = module_path.to_vec();
+    this_module_path.push(node.name.clone());
+    let is_current = app.selected_module == this_module_path;
+
+    ui.horizontal(|ui| {
+        // A module has no `EntryDetail`/form of its own (see that type's
+        // doc comment) — this button is the only way to make it the
+        // "current module" new entries and the Attachments dialog target;
+        // the CollapsingHeader label itself only toggles expand/collapse.
+        let glyph = if is_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
+        let mut text = egui::RichText::new(glyph);
+        if is_current {
+            text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
+        }
+        if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked() {
+            if app.editor_has_unsaved_edits() {
+                app.unsaved_form_dialog_opened(PendingNavigation::SelectModule(this_module_path.clone()));
+            } else {
+                app.select_module(this_module_path.clone());
+            }
+        }
+        egui::CollapsingHeader::new(node.name.as_str())
+            .default_open(false)
+            .open(force_open)
+            .show(ui, |ui| {
+                render_module_children(app, ui, &node.children, &this_module_path, force_open);
+            });
+    });
 }
 
-/// Renders one module's children: submodules directly (each recursing
-/// back into `render_tree_node`), then requirement/test/result leaves
-/// grouped under three collapsible "requirements"/"tests"/"results"
-/// folders — a real on-disk grouping (`disk`'s own project layout: each
-/// module has separate `requirements/`, `tests/`, `results/`
-/// directories), not just a display convenience, so mirroring it here
-/// keeps the tree's shape legible instead of interleaving three
-/// unrelated kinds of leaf in whatever order `ModuleDraft`'s maps happen
-/// to iterate.
+/// Renders one module's submodules — the top tree pane is a pure module
+/// hierarchy now, so unlike its previous shape this no longer also draws
+/// that module's own requirement/test/result leaves (those belong to the
+/// selected-module pane below the separator; see
+/// `render_selected_module_pane`).
 fn render_module_children(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
@@ -1690,27 +1837,24 @@ fn render_module_children(
     module_path: &[EntryName],
     force_open: Option<bool>,
 ) {
-    let mut rendered_submodule = false;
     for child in children {
         if child.kind == EntryKind::Module {
             render_tree_node(app, ui, child, module_path, force_open);
-            rendered_submodule = true;
         }
     }
-    // Only drawn when a submodule actually rendered above — otherwise an
-    // empty-of-submodules folder would grow a separator with nothing
-    // above it to separate from.
-    if rendered_submodule {
-        ui.separator();
-    }
-    render_leaf_group(app, ui, "requirements", EntryKind::Requirement, children, module_path, force_open);
-    render_leaf_group(app, ui, "tests", EntryKind::Test, children, module_path, force_open);
-    render_leaf_group(app, ui, "results", EntryKind::Result, children, module_path, force_open);
 }
 
 /// One collapsible folder ("requirements"/"tests"/"results") holding
 /// every child of `kind` — omitted entirely when there are none, so an
 /// empty module doesn't grow three empty, useless folders.
+///
+/// The header shows how many of `kind` live directly in this module (the
+/// same count as `matching.len()` below — filtered by `tree_filter`, like
+/// the rows themselves) and, only when this module actually has
+/// submodules (`recursive_total.is_some()`), a second, unfiltered total
+/// covering this module and everything under it — the "how many are
+/// there really" number the module-only top tree can't answer on its own
+/// since it never shows leaves.
 fn render_leaf_group(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
@@ -1718,7 +1862,7 @@ fn render_leaf_group(
     kind: EntryKind,
     children: &[TreeNode],
     module_path: &[EntryName],
-    force_open: Option<bool>,
+    display: LeafGroupDisplay,
 ) {
     let matching: Vec<&TreeNode> = children
         .iter()
@@ -1727,11 +1871,53 @@ fn render_leaf_group(
     if matching.is_empty() {
         return;
     }
-    egui::CollapsingHeader::new(title).default_open(false).open(force_open).show(ui, |ui| {
+    let header = match display.recursive_total {
+        Some(total) => format!("{title} ({} · {total} total)", matching.len()),
+        None => format!("{title} ({})", matching.len()),
+    };
+    // The header text carries a match count that changes as the filter
+    // bar is typed into — an explicit `id_salt` (independent of that
+    // text) keeps this header's open/closed state stable across those
+    // changes. Without it, `CollapsingHeader` falls back to hashing the
+    // label itself as its persistent id (see its own doc comment), so
+    // every count change would silently re-collapse an already-open
+    // group back to `default_open(false)`, hiding leaves that still
+    // match the filter.
+    egui::CollapsingHeader::new(header)
+        .id_salt((title, module_path))
+        .default_open(false)
+        .open(display.force_open)
+        .show(ui, |ui| {
         for leaf in matching {
             render_leaf(app, ui, leaf, module_path);
         }
     });
+}
+
+/// The two per-frame, per-group settings `render_leaf_group` needs beyond
+/// its `TreeNode` data — bundled together so the function stays under
+/// clippy's argument-count lint.
+#[derive(Clone, Copy)]
+struct LeafGroupDisplay {
+    force_open: Option<bool>,
+    recursive_total: Option<usize>,
+}
+
+/// Counts every descendant of `kind` under `node`, including `node`'s own
+/// direct children — the module-recursive total `render_leaf_group`'s
+/// header shows alongside the (possibly filtered) count of just this
+/// module's own children.
+fn count_kind_recursive(node: &TreeNode, kind: EntryKind) -> usize {
+    node.children
+        .iter()
+        .map(|child| {
+            if child.kind == EntryKind::Module {
+                count_kind_recursive(child, kind)
+            } else {
+                usize::from(child.kind == kind)
+            }
+        })
+        .sum()
 }
 
 fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName]) {
@@ -1767,6 +1953,93 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
             app.select(target, node.kind);
         }
     }
+}
+
+/// Walks `root` by `path`, matching only `Module` children at each
+/// segment — the `TreeNode` counterpart of `gui-core`'s own
+/// `resolve_module` (which walks a `ModuleDraft`, not the simplified
+/// read-model tree gui-ui already has in hand each frame). An empty
+/// `path` returns `root` itself, the same "empty means project root"
+/// convention `selected_module` uses.
+fn resolve_tree_module<'a>(root: &'a TreeNode, path: &[EntryName]) -> Option<&'a TreeNode> {
+    let mut current = root;
+    for name in path {
+        current = current
+            .children
+            .iter()
+            .find(|child| child.kind == EntryKind::Module && child.name == *name)?;
+    }
+    Some(current)
+}
+
+/// The bottom half of the tree pane: the requirements/tests/results,
+/// attachments, and templates belonging to `app.selected_module` (or the
+/// project root, if empty) — not its submodules', and not the whole
+/// project's. Mirrors `render_module_children`'s old (pre-split)
+/// requirement/test/result grouping, but against exactly one module's own
+/// `children` instead of recursing into every module in the tree.
+fn render_selected_module_pane(app: &mut GuiApp, ui: &mut egui::Ui, tree: &TreeSnapshot, force_open: Option<bool>) {
+    let module_path = app.selected_module.clone();
+    let Some(node) = resolve_tree_module(&tree.root, &module_path) else {
+        // Can happen if the selected module was just deleted out from
+        // under the selection.
+        ui.label("Selected module no longer exists.");
+        return;
+    };
+    let has_submodules = node.children.iter().any(|child| child.kind == EntryKind::Module);
+    let requirement_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Requirement));
+    let test_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Test));
+    let result_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Result));
+    let children = node.children.clone();
+
+    render_leaf_group(
+        app,
+        ui,
+        "requirements",
+        EntryKind::Requirement,
+        &children,
+        &module_path,
+        LeafGroupDisplay { force_open, recursive_total: requirement_total },
+    );
+    render_leaf_group(
+        app,
+        ui,
+        "tests",
+        EntryKind::Test,
+        &children,
+        &module_path,
+        LeafGroupDisplay { force_open, recursive_total: test_total },
+    );
+    render_leaf_group(
+        app,
+        ui,
+        "results",
+        EntryKind::Result,
+        &children,
+        &module_path,
+        LeafGroupDisplay { force_open, recursive_total: result_total },
+    );
+
+    if let Some(pools) = app.sidebar_pools.clone() {
+        render_pool_group(ui, "attachments", &pools.attachments);
+        render_pool_group(ui, "templates", &pools.templates);
+    }
+}
+
+/// A read-only listing of `paths` under a collapsible `title` folder —
+/// omitted entirely when empty, same convention as `render_leaf_group`.
+/// Unlike a leaf row, these aren't clickable: attachments/templates have
+/// no `EntryDetail`/form of their own to navigate to here (the
+/// Attachments modal is still where they're added/removed).
+fn render_pool_group(ui: &mut egui::Ui, title: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(title).default_open(false).show(ui, |ui| {
+        for path in paths {
+            ui.label(path.display().to_string());
+        }
+    });
 }
 
 /// Three radio buttons switching `dep`'s variant — resets its fields to
@@ -1883,6 +2156,49 @@ fn render_dependency_fields(
         }
         DependencyDraft::Submodules => (false, None, false),
     }
+}
+
+/// Whether `node` (a leaf or a module) should be visible under the left
+/// pane's filter bar — `true` unconditionally when `filter` is empty
+/// (the unfiltered, "show everything" case), otherwise a case-
+/// insensitive substring match. A leaf matches when its own
+/// fully-qualified logical path (the same
+/// `/[modules/<sub>/]*<kind>/<name>` shape `absolute_reference_path`
+/// builds for the Result form's pickers, e.g. `/requirements/definition`
+/// or `/modules/setup/tests/generic_test`) contains `filter`. A module
+/// matches when *any* descendant leaf, at any depth, matches — so a
+/// module containing a single matching leaf three levels down still
+/// shows (collapsed headers and all the way up to the root), while one
+/// with no matching descendant at all is skipped entirely rather than
+/// shown empty. `module_path` is the path *to* `node`, same convention
+/// every other tree-rendering function here uses (does not include
+/// `node.name` itself for a module — the caller pushes that before
+/// recursing, this function does the pushing internally when walking
+/// `node`'s own children).
+/// Whether `node` (always a `Module` — the top tree pane no longer renders
+/// leaves) should be visible under the left pane's filter bar. `true`
+/// unconditionally when `filter` is empty, otherwise true when this
+/// module's own fully-qualified path (`module_path` + `node.name`,
+/// lowercased) contains `filter`, or any submodule matches recursively —
+/// same "show the path to a match, skip everything with no match at all"
+/// shape `node_matches_filter` used for the old combined tree, just scored
+/// against module names instead of leaf paths now that leaves live in a
+/// separate pane.
+fn module_matches_filter(node: &TreeNode, module_path: &[EntryName], filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let filter = filter.to_lowercase();
+    let mut this_module_path = module_path.to_vec();
+    this_module_path.push(node.name.clone());
+    let full_path = this_module_path.iter().map(EntryName::as_str).collect::<Vec<_>>().join("/").to_lowercase();
+    if full_path.contains(&filter) {
+        return true;
+    }
+    node.children
+        .iter()
+        .filter(|child| child.kind == EntryKind::Module)
+        .any(|child| module_matches_filter(child, &this_module_path, &filter))
 }
 
 /// Whether `node` (a leaf or a module) should be visible under the left

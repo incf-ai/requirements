@@ -1168,10 +1168,11 @@ where
         self.mutation_in_flight = true;
         let completions = self.completions.clone();
         let fs = self.fs.clone();
+        let git = self.git.clone();
         tokio::task::spawn_blocking(move || {
             let outcome = match &state {
                 ProjectState::Validated(validated) => {
-                    Outcome::Save(validated.save(&fs, &dir).map_err(SaveError::Save))
+                    Outcome::Save(validated.save(&fs, &git, &dir).map_err(SaveError::Save))
                 }
                 ProjectState::Draft(_) => Outcome::Save(Err(SaveError::NotValidated)),
             };
@@ -1199,9 +1200,10 @@ where
         self.mutation_in_flight = true;
         let completions = self.completions.clone();
         let fs = self.fs.clone();
+        let git = self.git.clone();
         tokio::task::spawn_blocking(move || {
             let (outcome, saved_path) = match &state {
-                ProjectState::Validated(validated) => match validated.save(&fs, &path) {
+                ProjectState::Validated(validated) => match validated.save(&fs, &git, &path) {
                     Ok(()) => (Outcome::SaveAs(Ok(())), Some(path)),
                     Err(err) => (Outcome::SaveAs(Err(SaveError::Save(err))), None),
                 },
@@ -1335,23 +1337,23 @@ mod test {
         }
     }
 
-    fn sample_project_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_project")
+    fn test_project_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project")
     }
 
-    /// A writable copy of `sample_project`, so a `Save` test can actually
+    /// A writable copy of `test_project`, so a `Save` test can actually
     /// write to disk without touching the repository's own fixture. Named
     /// per test/process/line, same convention `disk`'s own tests use for
     /// scratch directories (see `crates/disk/src/project/operations/
     /// load.rs`'s tests) — caller is responsible for `remove_dir_all`.
-    fn scratch_copy_of_sample_project(label: &str) -> PathBuf {
+    fn scratch_copy_of_test_project(label: &str) -> PathBuf {
         let dest = std::env::temp_dir().join(format!("gui-core-actor-test-{label}-{}", std::process::id()));
         std::fs::remove_dir_all(&dest).ok();
         let status = std::process::Command::new("cp")
-            .args(["-r", sample_project_dir().to_str().unwrap(), dest.to_str().unwrap()])
+            .args(["-r", test_project_dir().to_str().unwrap(), dest.to_str().unwrap()])
             .status()
             .unwrap();
-        assert!(status.success(), "failed to copy sample_project to {dest:?}");
+        assert!(status.success(), "failed to copy test_project to {dest:?}");
         dest
     }
 
@@ -1436,7 +1438,7 @@ mod test {
     async fn add_requirement_without_a_loaded_project_reports_no_project_loaded() {
         let (commands, mut events) = spawn_test_actor();
         commands
-            .send(add_requirement_command(vec![], "definition", "Definition", 1))
+            .send(add_requirement_command(vec![], "design", "Design", 1))
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::NoProjectLoaded));
     }
@@ -1446,7 +1448,7 @@ mod test {
         let (commands, mut events) = spawn_test_actor();
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 kind: EntryKind::Requirement,
                 request: 1,
             })
@@ -1460,7 +1462,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1495,7 +1497,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1506,13 +1508,13 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 kind: EntryKind::Requirement,
                 request: 3,
             })
             .unwrap();
         match recv_completed(&mut events, 3).await {
-            // "definition" is a real `sample_project` requirement whose
+            // "design" is a real `test_project` requirement whose
             // own test reference is stale against this repo's real git
             // history (see `crates/gui-ui/tests/interaction.rs`'s
             // `a_validated_requirements_tree_leaf_shows_the_unmet_status_icon`
@@ -1531,7 +1533,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1541,7 +1543,7 @@ mod test {
         // check" reasoning `get_entry_detail`'s own Draft-state test uses.
         commands
             .send(Command::GetRequirementMetStatus {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 request: 2,
             })
             .unwrap();
@@ -1555,12 +1557,12 @@ mod test {
 
         commands
             .send(Command::GetRequirementMetStatus {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 request: 4,
             })
             .unwrap();
         // Same real fact `get_entry_detail_after_validate_reports_the_real_met_status`
-        // establishes: "definition"'s own test reference is genuinely
+        // establishes: "design"'s own test reference is genuinely
         // stale against this repo's real git history.
         assert!(matches!(
             recv_completed(&mut events, 4).await,
@@ -1574,7 +1576,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1583,7 +1585,7 @@ mod test {
         let mut requirement = RequirementDraft::new("Scratch");
         requirement.dependencies.push(disk::DependencyReferenceKind::RequirementReferenceV1(
             disk::LocalGitReference {
-                path: disk::ReferencePath("/requirements/definition".to_string()),
+                path: disk::ReferencePath("/requirements/design".to_string()),
                 commit: "abc123".to_string(),
             },
         ));
@@ -1610,7 +1612,7 @@ mod test {
                 assert!(matches!(
                     &dependencies[0],
                     disk::DependencyReferenceKind::RequirementReferenceV1(local)
-                        if local.path.0 == "/requirements/definition" && local.commit == "abc123"
+                        if local.path.0 == "/requirements/design" && local.commit == "abc123"
                 ));
             }
             other => panic!("expected EntryDetail(Some(_)), got {other:?}"),
@@ -1623,7 +1625,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1644,7 +1646,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1695,7 +1697,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1733,7 +1735,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1796,7 +1798,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1828,7 +1830,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1843,7 +1845,7 @@ mod test {
 
     #[tokio::test]
     async fn validate_then_save_writes_the_new_requirement_to_disk() {
-        let dir = scratch_copy_of_sample_project("save-writes-to-disk");
+        let dir = scratch_copy_of_test_project("save-writes-to-disk");
         let (commands, mut events) = spawn_test_actor();
 
         commands
@@ -1876,7 +1878,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1890,11 +1892,11 @@ mod test {
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 2).await, Outcome::NewProject));
 
-        // The old project's "definition" requirement is gone — this
+        // The old project's "design" requirement is gone — this
         // really replaced the state, not merged into it.
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 kind: EntryKind::Requirement,
                 request: 3,
             })
@@ -1914,7 +1916,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1933,7 +1935,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -1952,7 +1954,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2003,7 +2005,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2038,7 +2040,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2070,7 +2072,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2085,7 +2087,7 @@ mod test {
         // continuation of the in-memory edit above.
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 3,
             })
             .unwrap();
@@ -2104,7 +2106,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2215,7 +2217,7 @@ mod test {
 
     #[tokio::test]
     async fn a_failed_save_as_does_not_change_the_known_project_path() {
-        let dir = scratch_copy_of_sample_project("save-as-failure-keeps-path");
+        let dir = scratch_copy_of_test_project("save-as-failure-keeps-path");
         let (commands, mut events) = spawn_test_actor();
 
         commands
@@ -2257,7 +2259,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2308,7 +2310,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2329,7 +2331,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2360,7 +2362,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2368,7 +2370,7 @@ mod test {
 
         let result = logical::draft::ResultDraft::new(
             "Scratch Result",
-            ReferencePath("/requirements/definition".to_string()),
+            ReferencePath("/requirements/design".to_string()),
             "deadbeef",
             ReferencePath("/tests/generic_test".to_string()),
             "deadbeef",
@@ -2398,7 +2400,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2424,7 +2426,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2465,7 +2467,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2490,7 +2492,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2518,7 +2520,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2528,7 +2530,7 @@ mod test {
         // to correct anything to.
         commands
             .send(Command::RefreshStaleTestReferences {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 request: 2,
             })
             .unwrap();
@@ -2544,7 +2546,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2573,7 +2575,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2582,11 +2584,11 @@ mod test {
         commands.send(Command::Validate { request: 2 }).unwrap();
         assert!(matches!(recv_completed(&mut events, 2).await, Outcome::Validate(Ok(()))));
 
-        // "definition" is genuinely `Unmet` with a `StaleReference` before
+        // "design" is genuinely `Unmet` with a `StaleReference` before
         // the fix — same real fact
         // `get_entry_detail_after_validate_reports_the_real_met_status`
         // establishes.
-        let target = LogicalPath::root(entry_name("definition"));
+        let target = LogicalPath::root(entry_name("design"));
         commands
             .send(Command::RefreshStaleTestReferences {
                 target: target.clone(),
@@ -2601,7 +2603,7 @@ mod test {
         // is already re-`Validated` and this reads the real status
         // straight away, with no separate `Validate` call needed. The
         // reference itself is current now, so the remaining reason (if
-        // any) can no longer be `StaleReference` — `sample_project`'s
+        // any) can no longer be `StaleReference` — `test_project`'s
         // results are all `Incomplete`, not `Pass`, so it's still
         // `Unmet`, just for a different, real reason (`NoPassingResult`)
         // than before the fix.
@@ -2623,7 +2625,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2670,7 +2672,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2678,7 +2680,7 @@ mod test {
 
         let original = logical::draft::ResultDraft::new(
             "Original",
-            ReferencePath("/requirements/definition".to_string()),
+            ReferencePath("/requirements/design".to_string()),
             "deadbeef",
             ReferencePath("/tests/generic_test".to_string()),
             "deadbeef",
@@ -2695,7 +2697,7 @@ mod test {
 
         let updated = logical::draft::ResultDraft::new(
             "Updated",
-            ReferencePath("/requirements/discovery".to_string()),
+            ReferencePath("/requirements/design".to_string()),
             "cafef00d",
             ReferencePath("/tests/generic_test".to_string()),
             "cafef00d",
@@ -2719,7 +2721,7 @@ mod test {
         match recv_completed(&mut events, 4).await {
             Outcome::EntryDetail(Some(EntryDetail::Result { title, requirement_path, .. })) => {
                 assert_eq!(title, "Updated");
-                assert_eq!(requirement_path, "/requirements/discovery");
+                assert_eq!(requirement_path, "/requirements/design");
             }
             other => panic!("expected EntryDetail(Some(Result)), got {other:?}"),
         }
@@ -2731,7 +2733,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2777,7 +2779,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2811,7 +2813,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2830,7 +2832,7 @@ mod test {
         ));
     }
 
-    /// `sample_project`'s root `attachments/glossary.md` is already
+    /// `test_project`'s root `attachments/overview.md` is already
     /// physically present, so loading the project already populates the
     /// root module's pool with it — adding it again should collide.
     #[tokio::test]
@@ -2839,7 +2841,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2848,7 +2850,7 @@ mod test {
         commands
             .send(Command::AddAttachment {
                 module: vec![],
-                path: PathBuf::from("glossary.md"),
+                path: PathBuf::from("overview.md"),
                 request: 2,
             })
             .unwrap();
@@ -2864,7 +2866,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2887,9 +2889,9 @@ mod test {
             .unwrap();
         match recv_completed(&mut events, 3).await {
             Outcome::ModulePools(Some(pools)) => {
-                // The root already carries glossary.md (physically present
-                // in sample_project) plus the one just added.
-                assert!(pools.attachments.contains(&PathBuf::from("glossary.md")));
+                // The root already carries overview.md (physically present
+                // in test_project) plus the one just added.
+                assert!(pools.attachments.contains(&PathBuf::from("overview.md")));
                 assert!(pools.attachments.contains(&PathBuf::from("scratch_attachment.md")));
             }
             other => panic!("expected ModulePools(Some(_)), got {other:?}"),
@@ -2902,7 +2904,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -2923,13 +2925,13 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
-        let target = LogicalPath::root(entry_name("definition"));
+        let target = LogicalPath::root(entry_name("design"));
         commands
             .send(Command::AddRequirementAttachment {
                 target: target.clone(),
@@ -2975,7 +2977,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3000,7 +3002,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3028,13 +3030,13 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
-        let target = LogicalPath::root(entry_name("generic_test"));
+        let target = LogicalPath::root(entry_name("smoke"));
         commands
             .send(Command::AddTestAttachment {
                 target: target.clone(),
@@ -3063,13 +3065,13 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
-        let target = LogicalPath::root(entry_name("generic_test"));
+        let target = LogicalPath::root(entry_name("smoke"));
         commands
             .send(Command::AddTestTemplateFile {
                 target: target.clone(),
@@ -3101,13 +3103,13 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
-        let target = LogicalPath::root(entry_name("definition"));
+        let target = LogicalPath::root(entry_name("design"));
         commands
             .send(Command::AddResultAttachment {
                 target: target.clone(),
@@ -3139,23 +3141,23 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
-        // "setup" is a real submodule in sample_project — add a
+        // "beta" is a real submodule in test_project — add a
         // requirement into it first, to prove the rename doesn't lose
         // the module's existing content.
         commands
-            .send(add_requirement_command(vec![entry_name("setup")], "marker", "Marker", 2))
+            .send(add_requirement_command(vec![entry_name("beta")], "marker", "Marker", 2))
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
 
         commands
             .send(Command::RenameModule {
-                target: vec![entry_name("setup")],
+                target: vec![entry_name("beta")],
                 new_name: entry_name("renamed_setup"),
                 request: 3,
             })
@@ -3165,7 +3167,7 @@ mod test {
         // The old name is gone...
         commands
             .send(Command::GetModulePools {
-                module: vec![entry_name("setup")],
+                module: vec![entry_name("beta")],
                 request: 4,
             })
             .unwrap();
@@ -3194,7 +3196,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3219,7 +3221,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3236,7 +3238,7 @@ mod test {
 
         commands
             .send(Command::RenameModule {
-                target: vec![entry_name("setup")],
+                target: vec![entry_name("beta")],
                 new_name: entry_name("another_module"),
                 request: 3,
             })
@@ -3246,11 +3248,11 @@ mod test {
             Outcome::RenameModule(Err(RenameModuleError::Add(AddNamedChildError::AlreadyExists(_))))
         ));
 
-        // The rename failed, so "setup" must still be there under its
+        // The rename failed, so "beta" must still be there under its
         // original name — not silently removed then never restored.
         commands
             .send(Command::GetModulePools {
-                module: vec![entry_name("setup")],
+                module: vec![entry_name("beta")],
                 request: 4,
             })
             .unwrap();
@@ -3263,7 +3265,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3288,7 +3290,7 @@ mod test {
 
         commands
             .send(Command::ResolveLocalCommit {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 kind: EntryKind::Requirement,
                 request: 1,
             })
@@ -3305,7 +3307,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3313,7 +3315,7 @@ mod test {
 
         commands
             .send(Command::ResolveLocalCommit {
-                target: LogicalPath::root(entry_name("definition")),
+                target: LogicalPath::root(entry_name("design")),
                 kind: EntryKind::Requirement,
                 request: 2,
             })
@@ -3334,24 +3336,24 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
-        // "setup" is a real submodule in `sample_project` with no
+        // "beta" is a real submodule in `test_project` with no
         // requirements of its own yet — add one so there's a nested
         // target to resolve a commit for.
         commands
-            .send(add_requirement_command(vec![entry_name("setup")], "marker", "Marker", 2))
+            .send(add_requirement_command(vec![entry_name("beta")], "marker", "Marker", 2))
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
 
         commands
             .send(Command::ResolveLocalCommit {
                 target: LogicalPath {
-                    modules: vec![entry_name("setup")],
+                    modules: vec![entry_name("beta")],
                     name: entry_name("marker"),
                 },
                 kind: EntryKind::Requirement,
@@ -3361,7 +3363,7 @@ mod test {
         let Outcome::ResolveLocalCommit(result) = recv_completed(&mut events, 3).await else {
             panic!("expected ResolveLocalCommit");
         };
-        let expected = sample_project_dir().join("modules/setup/requirements/marker");
+        let expected = test_project_dir().join("modules/beta/requirements/marker");
         assert_eq!(result.unwrap(), expected.display().to_string());
     }
 
@@ -3476,7 +3478,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3497,7 +3499,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
@@ -3521,7 +3523,7 @@ mod test {
 
         commands
             .send(Command::LoadProject {
-                path: sample_project_dir(),
+                path: test_project_dir(),
                 request: 1,
             })
             .unwrap();
