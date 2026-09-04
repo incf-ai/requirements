@@ -45,7 +45,7 @@ use std::time::Instant;
 
 use gui_core::{
     Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools, Outcome, RequestId,
-    SaveError, TreeNode, TreeSnapshot,
+    RequirementDraft, SaveError, TreeNode, TreeSnapshot,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -200,6 +200,9 @@ pub struct GuiApp {
     /// The Delete-button confirmation prompt — `Some` while it's open. See
     /// `DeleteConfirmState`'s own doc comment.
     delete_confirm_dialog: Option<DeleteConfirmState>,
+    /// The requirement "Recreate" prompt — `Some` while it's open. See
+    /// `RecreateRequirementState`'s own doc comment.
+    recreate_requirement_dialog: Option<RecreateRequirementState>,
     /// A failed `LoadProject`'s error message — `Some` while the "couldn't
     /// open project" dialog is open. Set from `Outcome::LoadProject`'s
     /// `Err` case (e.g. the target directory isn't a git repository) so
@@ -355,6 +358,30 @@ pub enum DeleteTarget {
 pub struct DeleteConfirmState {
     target: DeleteTarget,
     label: String,
+    pending_request: Option<RequestId>,
+    error: Option<String>,
+}
+
+/// The requirement "Recreate" prompt's own state — opened by
+/// `GuiApp::recreate_requirement_clicked` from an already-existing
+/// requirement's form (never a create-mode one, which has no stable name
+/// yet to replace). Confirming with a nonempty name deletes the requirement
+/// at `target` and adds it back under `new_name` with the same content
+/// (`requirement`, a snapshot of the form's `original` taken when the
+/// dialog opened) — two separate `Command`s chained by
+/// `GuiApp::apply_recreate_delete_result`/`apply_recreate_create_result`,
+/// since there's no single "rename this entry's `EntryName`" command for a
+/// requirement (unlike `Command::RenameModule`). `deleted` tracks which of
+/// the two legs is in flight/next: `false` until the delete succeeds, then
+/// `true` for the rest of the dialog's life — including a retry after a
+/// failed create, which by then must only resend the create, not the
+/// (already-succeeded) delete.
+#[derive(Debug, Clone)]
+pub struct RecreateRequirementState {
+    target: LogicalPath,
+    requirement: Box<RequirementDraft>,
+    new_name: String,
+    deleted: bool,
     pending_request: Option<RequestId>,
     error: Option<String>,
 }
@@ -540,6 +567,7 @@ impl GuiApp {
             unsaved_form_dialog: None,
             validate_before_save_dialog: None,
             delete_confirm_dialog: None,
+            recreate_requirement_dialog: None,
             load_error_dialog: None,
             next_request: 0,
         }
@@ -700,7 +728,15 @@ impl GuiApp {
                     self.dirty = true;
                 }
             }
-            Outcome::AddRequirement(result) => self.apply_create_result(request, result),
+            Outcome::AddRequirement(result) => {
+                let is_recreate_pending =
+                    matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
+                if is_recreate_pending {
+                    self.apply_recreate_create_result(request, result);
+                } else {
+                    self.apply_create_result(request, result);
+                }
+            }
             Outcome::UpdateRequirement(result) => self.apply_update_result(request, result),
             Outcome::RefreshStaleTestReferences(result) => {
                 self.apply_refresh_stale_test_references_result(request, result)
@@ -710,10 +746,18 @@ impl GuiApp {
             Outcome::AddResult(result) => self.apply_create_result(request, result),
             Outcome::UpdateResult(result) => self.apply_update_result(request, result),
             Outcome::AddModule(result) => self.apply_create_result(request, result),
-            Outcome::RemoveRequirement(removed)
-            | Outcome::RemoveTest(removed)
-            | Outcome::RemoveResult(removed)
-            | Outcome::RemoveModule(removed) => self.apply_delete_result(request, removed),
+            Outcome::RemoveRequirement(removed) => {
+                let is_recreate_pending =
+                    matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
+                if is_recreate_pending {
+                    self.apply_recreate_delete_result(request, removed);
+                } else {
+                    self.apply_delete_result(request, removed);
+                }
+            }
+            Outcome::RemoveTest(removed) | Outcome::RemoveResult(removed) | Outcome::RemoveModule(removed) => {
+                self.apply_delete_result(request, removed)
+            }
             Outcome::RenameModule(result) => {
                 self.apply_module_rename_result(request, result.map_err(|e| e.to_string()))
             }
@@ -2194,6 +2238,160 @@ impl GuiApp {
         }
     }
 
+    /// Opens the "Recreate" prompt for the requirement currently open in
+    /// the editor — a no-op unless it's an already-existing entry
+    /// (`editing_target: Some(_)`; a create-mode form has no stable name
+    /// yet to replace). Snapshots `form.original` as the content to carry
+    /// over, same as `editor_delete_clicked` snapshots the target/label:
+    /// both close over what's true right now rather than re-reading the
+    /// form later, since the form itself may have changed (or closed) by
+    /// the time the dialog is actually confirmed.
+    fn recreate_requirement_clicked(&mut self) {
+        let EditorState::NewRequirement(form) = &self.editor else {
+            return;
+        };
+        let Some(target) = form.editing_target.clone() else {
+            return;
+        };
+        self.recreate_requirement_dialog = Some(RecreateRequirementState {
+            target,
+            requirement: form.original.clone(),
+            new_name: String::new(),
+            deleted: false,
+            pending_request: None,
+            error: None,
+        });
+    }
+
+    /// "Cancel" clicked in the Recreate prompt — closes it. Only ever
+    /// reachable before the delete leg has gone out (the dialog's own
+    /// render only offers Cancel while `deleted` is `false` — see
+    /// `render_recreate_requirement_dialog`), so there's nothing on disk
+    /// or in the draft to undo, same as `delete_cancelled`.
+    fn recreate_requirement_cancelled(&mut self) {
+        self.recreate_requirement_dialog = None;
+    }
+
+    /// "Recreate" clicked inside the prompt — a no-op if the name field is
+    /// still empty (see this requirement's own doc comment: cancel is the
+    /// only way out of the dialog without a nonempty name). Sends the
+    /// delete leg first time through (`deleted: false`); a retry after a
+    /// failed create (`deleted: true` — see `apply_recreate_create_result`)
+    /// resends only the create, since the delete already succeeded and
+    /// isn't repeatable against an entry that's already gone.
+    fn recreate_requirement_confirmed(&mut self) {
+        let Some(dialog) = self.recreate_requirement_dialog.clone() else {
+            return;
+        };
+        let new_name = dialog.new_name.trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        let request = self.next_request_id();
+        let command = if dialog.deleted {
+            Command::AddRequirement {
+                module: dialog.target.modules.clone(),
+                name: EntryName(new_name),
+                requirement: dialog.requirement.clone(),
+                request,
+            }
+        } else {
+            Command::RemoveRequirement {
+                target: dialog.target.clone(),
+                request,
+            }
+        };
+        self.pending.insert(request, PendingKind::Generic);
+        if let Some(dialog) = &mut self.recreate_requirement_dialog {
+            dialog.pending_request = Some(request);
+            dialog.error = None;
+        }
+        self.send_command(command);
+    }
+
+    /// Routes a `RemoveRequirement` outcome back to the Recreate dialog's
+    /// delete leg — `false` (not this dialog's reply) falls through to
+    /// `apply_delete_result` in the caller, same "stale/foreign reply is
+    /// ignored" shape every other `apply_*` here follows. On success,
+    /// immediately chains into the create leg rather than waiting for
+    /// another button click — the whole point of "Recreate" is one action,
+    /// not two. On failure the dialog stays open with an error and
+    /// `deleted` unset, so a retry resends the delete (nothing succeeded
+    /// yet to make that unsafe).
+    fn apply_recreate_delete_result(&mut self, request: RequestId, removed: bool) -> bool {
+        let is_pending =
+            matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
+        if !is_pending {
+            return false;
+        }
+        if !removed {
+            if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                dialog.pending_request = None;
+                dialog.error = Some("Could not delete the existing requirement — it may have already been removed.".to_string());
+            }
+            return true;
+        }
+        self.dirty = true;
+        let add_request = self.next_request_id();
+        self.pending.insert(add_request, PendingKind::Generic);
+        let dialog = self
+            .recreate_requirement_dialog
+            .as_mut()
+            .expect("just matched Some above");
+        dialog.deleted = true;
+        let module = dialog.target.modules.clone();
+        let name = EntryName(dialog.new_name.trim().to_string());
+        let requirement = dialog.requirement.clone();
+        dialog.pending_request = Some(add_request);
+        self.send_command(Command::AddRequirement {
+            module,
+            name,
+            requirement,
+            request: add_request,
+        });
+        true
+    }
+
+    /// Routes an `AddRequirement` outcome back to the Recreate dialog's
+    /// create leg — `false` (not this dialog's reply) falls through to
+    /// `apply_create_result` in the caller. Success closes the dialog, the
+    /// form, and navigates to the newly-created entry — its old
+    /// `LogicalPath` no longer resolves to anything (the requirement it
+    /// named is gone), so there's nothing left to leave the editor showing.
+    /// Failure leaves the dialog open — the old requirement is genuinely
+    /// gone by this point (the delete leg already succeeded), so this
+    /// reports that plainly rather than pretending Cancel is still a safe
+    /// no-op, and lets the user retry the create (e.g. under a different
+    /// name) via `recreate_requirement_confirmed`'s `deleted: true` branch.
+    fn apply_recreate_create_result(&mut self, request: RequestId, result: Result<(), gui_core::AddChildError>) -> bool {
+        let is_pending =
+            matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
+        if !is_pending {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                self.dirty = true;
+                let dialog = self.recreate_requirement_dialog.take().expect("just matched Some above");
+                let new_target = LogicalPath {
+                    modules: dialog.target.modules,
+                    name: EntryName(dialog.new_name.trim().to_string()),
+                };
+                self.select(new_target, EntryKind::Requirement);
+            }
+            Err(err) => {
+                if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                    dialog.pending_request = None;
+                    dialog.error = Some(format!(
+                        "The old requirement was already deleted, but creating \"{}\" failed: {err}. Enter a different name and try again.",
+                        dialog.new_name
+                    ));
+                }
+            }
+        }
+        true
+    }
+
     /// Routes an `AddRequirement`/`AddTest`/`AddResult`/`AddModule`
     /// outcome back into whichever form is still open and waiting on it —
     /// a reply for a form the user already cancelled/closed is ignored,
@@ -2516,6 +2714,7 @@ impl eframe::App for GuiApp {
         self.render_unsaved_form_dialog(ui);
         self.render_validate_before_save_dialog(ui);
         self.render_delete_confirm_dialog(ui);
+        self.render_recreate_requirement_dialog(ui);
         self.render_load_error_dialog(ui);
         self.render_attachments_dialog(ui);
         self.render_path_picker_dialog(ui);
@@ -5117,6 +5316,170 @@ mod test {
         assert!(!app.dirty);
         // Still the requirement form — a stale reply must not redirect it.
         assert!(matches!(app.editor, EditorState::NewRequirement(_)));
+    }
+
+    #[test]
+    fn recreate_requirement_clicked_on_an_editing_requirement_opens_the_dialog() {
+        let mut app = app_editing_a_requirement();
+
+        app.recreate_requirement_clicked();
+
+        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog should be open");
+        assert_eq!(dialog.target, LogicalPath::root(disk_entry_name("definition")));
+        assert!(dialog.new_name.is_empty());
+        assert!(!dialog.deleted);
+        assert!(dialog.pending_request.is_none());
+    }
+
+    #[test]
+    fn recreate_requirement_clicked_is_a_no_op_for_a_create_mode_form() {
+        let mut app = test_app();
+        app.new_requirement_clicked();
+
+        app.recreate_requirement_clicked();
+
+        assert!(app.recreate_requirement_dialog.is_none());
+    }
+
+    #[test]
+    fn recreate_requirement_confirmed_with_an_empty_name_sends_nothing() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+
+        app.recreate_requirement_confirmed();
+
+        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog stays open");
+        assert!(dialog.pending_request.is_none());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn recreate_requirement_confirmed_sends_a_remove_command_first() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+
+        app.recreate_requirement_confirmed();
+
+        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog should still be open while pending");
+        assert!(dialog.pending_request.is_some());
+        assert!(!dialog.deleted);
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_successful_delete_leg_immediately_chains_into_the_create_leg() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_requirement_confirmed();
+        let delete_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+
+        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog stays open for the create leg");
+        assert!(dialog.deleted);
+        let create_request = dialog.pending_request.expect("create leg should now be pending");
+        assert_ne!(create_request, delete_request);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn a_failed_delete_leg_leaves_the_dialog_open_without_marking_it_deleted() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_requirement_confirmed();
+        let request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RemoveRequirement(false),
+        });
+
+        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog should stay open on failure");
+        assert!(!dialog.deleted);
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn a_successful_full_recreate_closes_the_dialog_and_navigates_to_the_new_entry() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_requirement_confirmed();
+        let delete_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+        let create_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddRequirement(Ok(())),
+        });
+
+        assert!(app.recreate_requirement_dialog.is_none());
+        assert!(app.dirty);
+        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("renamed"))));
+    }
+
+    #[test]
+    fn a_failed_create_leg_leaves_the_dialog_open_for_a_retry() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_requirement_confirmed();
+        let delete_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+        let create_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddRequirement(Err(gui_core::AddChildError::ModuleNotFound)),
+        });
+
+        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog stays open so the user can retry");
+        assert!(dialog.deleted);
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+
+        // Retrying only resends the create — the delete already happened.
+        app.recreate_requirement_confirmed();
+        let dialog = app.recreate_requirement_dialog.as_ref().unwrap();
+        assert!(dialog.pending_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn recreate_requirement_cancelled_closes_the_dialog_without_sending_anything() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        let pending_before = app.pending.len();
+
+        app.recreate_requirement_cancelled();
+
+        assert!(app.recreate_requirement_dialog.is_none());
+        assert_eq!(app.pending.len(), pending_before);
     }
 
     #[test]

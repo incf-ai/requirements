@@ -126,6 +126,30 @@ fn has_stale_test_reference(status: &RequirementMetStatus) -> bool {
     )
 }
 
+/// A multiline text box the user can drag taller or shorter, for the
+/// requirement text/guidance fields — these routinely run longer than the
+/// default handful of rows `text_edit_multiline` allows before scrolling.
+/// Only resizes vertically; width already tracks the surrounding panel via
+/// `desired_width(f32::INFINITY)`. `id_salt` must be unique among the
+/// resizable boxes on the same form, since `egui::Resize` remembers each
+/// box's size by id.
+fn resizable_multiline(ui: &mut egui::Ui, id_salt: &str, text: &mut String) -> egui::Response {
+    egui::Resize::default()
+        .id_salt(id_salt)
+        .resizable([false, true])
+        .default_height(80.0)
+        .min_height(40.0)
+        .show(ui, |ui| {
+            // `TextEdit` otherwise only grows to fit its text (or
+            // `desired_rows`' default of 4 lines) rather than the space
+            // `Resize` just gave it, so the drag handle would visibly move
+            // the frame without the box inside it following — `add_sized`
+            // with the ui's own available size is what makes it fill the
+            // frame instead.
+            ui.add_sized(ui.available_size(), egui::TextEdit::multiline(text))
+        })
+}
+
 /// `count / total` as a percentage, `0.0` for an empty `total` rather than
 /// dividing by zero — the module/project page's Pass/Fail/Incomplete and
 /// "Requirements met" lines all go through this.
@@ -618,6 +642,7 @@ impl GuiApp {
         let mut auto_commit_clicked: Option<(DependencySlot, AutoCommitKind)> = None;
         let mut pick_dependency_path_clicked: Option<DependencySlot> = None;
         let mut refresh_stale_test_references_clicked = false;
+        let mut recreate_clicked = false;
         {
             let EditorState::NewRequirement(form) = &mut self.editor else {
                 return;
@@ -665,6 +690,16 @@ impl GuiApp {
                     if editing && ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
                         delete_clicked = true;
                     }
+                    // Recreate is the only way to change a saved
+                    // requirement's stable name — delete-then-recreate
+                    // under a new name, rather than an in-place rename
+                    // (there's no `RenameRequirement` command; see
+                    // `RecreateRequirementState`'s own doc comment). Only
+                    // offered for an already-existing entry, same as
+                    // Delete.
+                    if editing && ui.button("Recreate…").clicked() {
+                        recreate_clicked = true;
+                    }
                 }
             });
             ui.horizontal(|ui| {
@@ -708,15 +743,15 @@ impl GuiApp {
                     }
                 });
                 ui.label("Requirement text:");
-                if ui.text_edit_multiline(&mut form.requirement_text).changed() {
+                if resizable_multiline(ui, "requirement_text", &mut form.requirement_text).changed() {
                     form.edited = true;
                 }
                 ui.label("Requirement guidance:");
-                if ui.text_edit_multiline(&mut form.requirement_guidance).changed() {
+                if resizable_multiline(ui, "requirement_guidance", &mut form.requirement_guidance).changed() {
                     form.edited = true;
                 }
                 ui.label("Test guidance:");
-                if ui.text_edit_multiline(&mut form.test_guidance).changed() {
+                if resizable_multiline(ui, "test_guidance", &mut form.test_guidance).changed() {
                     form.edited = true;
                 }
             }
@@ -828,6 +863,8 @@ impl GuiApp {
             self.editor_cancel_clicked();
         } else if delete_clicked {
             self.editor_delete_clicked();
+        } else if recreate_clicked {
+            self.recreate_requirement_clicked();
         } else if add_attachment_clicked {
             self.local_attachment_add_clicked(LocalPoolKind::RequirementAttachment);
         } else if let Some(path) = remove_attachment {
@@ -1715,6 +1752,62 @@ impl GuiApp {
             self.delete_confirmed();
         } else if cancelled {
             self.delete_cancelled();
+        }
+    }
+
+    /// The requirement "Recreate" prompt — opens from the "Recreate…"
+    /// button next to a saved requirement's stable name. Cancel is only
+    /// offered before the delete leg has gone out (`!dialog.deleted`):
+    /// once the old requirement is actually gone, closing the dialog
+    /// without finishing the create would just lose it, so at that point
+    /// entering a name and clicking "Recreate" (to retry the create) is
+    /// the only way out other than the name field going empty being
+    /// rejected outright. See `RecreateRequirementState`'s own doc
+    /// comment.
+    pub(crate) fn render_recreate_requirement_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.recreate_requirement_dialog.clone() else {
+            return;
+        };
+
+        let mut new_name = dialog.new_name;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let busy = dialog.pending_request.is_some();
+        egui::Modal::new(egui::Id::new("recreate_requirement_dialog")).show(ui.ctx(), |ui| {
+            ui.heading("Recreate Requirement");
+            ui.label(format!(
+                "This deletes \"{}\" and creates a new requirement with the same contents under a new stable name.",
+                dialog.target.name
+            ));
+            ui.horizontal(|ui| {
+                ui.label("New name:");
+                ui.text_edit_singleline(&mut new_name);
+            });
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy && !new_name.trim().is_empty(), egui::Button::new("Recreate"))
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+                if ui.add_enabled(!busy && !dialog.deleted, egui::Button::new("Cancel")).clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+        if confirmed {
+            if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                dialog.new_name = new_name;
+            }
+            self.recreate_requirement_confirmed();
+        } else if cancelled {
+            self.recreate_requirement_cancelled();
+        } else if let Some(dialog) = &mut self.recreate_requirement_dialog {
+            dialog.new_name = new_name;
         }
     }
 
