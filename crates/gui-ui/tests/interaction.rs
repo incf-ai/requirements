@@ -481,6 +481,15 @@ fn new_project_then_save_as_creates_and_persists_a_project_from_scratch() {
     fields[2].type_text("scratch");
     fields[3].focus();
     fields[3].type_text("Scratch Requirement");
+    // Requirement text is a required field — a real `AddRequirement`
+    // refuses an empty one — and, being a multiline `TextEdit`, reports
+    // as `Role::MultilineTextInput` rather than `Role::TextInput` (see
+    // the `commit_all` dialog's own comment on this a few lines up).
+    // It's the first of the form's three multiline fields (requirement
+    // text, requirement guidance, test guidance).
+    let multiline_fields: Vec<_> = harness.get_all_by_role(Role::MultilineTextInput).collect();
+    multiline_fields[0].focus();
+    multiline_fields[0].type_text("Scratch requirement text.");
     harness.step();
     harness
         .get_by_role_and_label(Role::Button, "Create")
@@ -2741,6 +2750,18 @@ fn saving_an_edit_to_an_existing_requirement_closes_the_form_and_marks_dirty() {
     title_field.type_text(" (edited)");
     harness.step();
 
+    // `test_project`'s "design" fixture has empty requirement text on
+    // disk — the same non-empty-main-text rule the create form enforces
+    // now applies to edits too, so it has to be filled in here for Save
+    // to succeed.
+    let requirement_text_field = harness
+        .get_all_by_role(Role::MultilineTextInput)
+        .next()
+        .expect("requirement text field not found");
+    requirement_text_field.focus();
+    requirement_text_field.type_text("Some requirement text.");
+    harness.step();
+
     // The form's own Save button — the second "Save" in tree order (the
     // toolbar's persistent one, rendered earlier in the frame, is first —
     // see the previous test's comment on this same ambiguity). Pinned
@@ -3125,30 +3146,43 @@ fn a_requirements_dependency_can_be_viewed_removed_and_a_new_one_added() {
         2
     );
 
-    // name(2), title(3), then the composer's own path(4)/commit(5) —
-    // the existing dependency's two fields are gone now that it's been
-    // removed.
+    // The composer's fields stay hidden until "Add dependency" is
+    // clicked once to reveal them.
     harness
-        .get_all_by_role(Role::TextInput)
-        .nth(4)
-        .expect("dependency composer path field not found")
-        .focus();
-    harness
-        .get_all_by_role(Role::TextInput)
-        .nth(4)
-        .unwrap()
-        .type_text("/requirements/external");
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
     harness.step();
-    harness
-        .get_all_by_role(Role::TextInput)
-        .nth(5)
-        .expect("dependency composer commit field not found")
-        .focus();
-    harness
-        .get_all_by_role(Role::TextInput)
-        .nth(5)
-        .unwrap()
-        .type_text("newcommit");
+    harness.step();
+    // Opening the composer now opens a modal dialog (a separate
+    // `egui::Modal` overlay), which needs one more `step()` to settle
+    // before its own fields are reliably interactable — same rule as
+    // `close_button_closes_the_attachments_dialog` (see this file's
+    // module doc comment).
+    harness.step();
+
+    // The modal renders its own heading plus exactly two `TextInput`s
+    // (path, then commit) — scoping the query to the heading's parent
+    // container, rather than indexing into the whole form's flat
+    // `TextInput` list, stays correct regardless of how many other
+    // fields (existing rows, the always-present attachment field) sit
+    // elsewhere in the accessibility tree.
+    fn dependency_composer_field<'h>(
+        harness: &'h Harness<'_, GuiApp>,
+        idx: usize,
+    ) -> egui_kittest::Node<'h> {
+        harness
+            .get_by_role_and_label(Role::Label, "Add Dependency")
+            .parent()
+            .expect("dependency composer modal container not found")
+            .get_all_by_role(Role::TextInput)
+            .nth(idx)
+            .expect("dependency composer field not found")
+    }
+    dependency_composer_field(&harness, 0).focus();
+    dependency_composer_field(&harness, 0).type_text("/requirements/external");
+    harness.step();
+    dependency_composer_field(&harness, 1).focus();
+    dependency_composer_field(&harness, 1).type_text("newcommit");
     harness.step();
 
     harness
@@ -3176,6 +3210,18 @@ fn a_requirements_dependency_can_be_viewed_removed_and_a_new_one_added() {
             .is_some()
     );
     assert!(harness.get_all_by_value("newcommit").next().is_some());
+
+    // `test_project`'s "integration" fixture has empty requirement text
+    // on disk — the same non-empty-main-text rule the create form
+    // enforces now applies to edits too, so it has to be filled in here
+    // for Save to succeed.
+    let requirement_text_field = harness
+        .get_all_by_role(Role::MultilineTextInput)
+        .next()
+        .expect("requirement text field not found");
+    requirement_text_field.focus();
+    requirement_text_field.type_text("Some requirement text.");
+    harness.step();
 
     // Plain `.click()`, not `.click_accesskit()` — Save is pinned next
     // to the heading now (see the earlier Save test's own comment), so
@@ -3296,18 +3342,28 @@ fn requirement_form_dependency_path_picker_fills_the_field() {
             .is_some()
     );
 
+    // The composer's fields stay hidden until "Add dependency" is
+    // clicked once to reveal them.
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
     // The "Add dependency" composer's default `Local` variant carries its
     // own path picker now — same modal mechanics as the Result form's own
     // pickers (see `result_form_requirement_path_picker_fills_the_field`).
-    // Two "Pick…" buttons exist in a fresh create-mode form (no existing
-    // rows of either kind): the dependency composer's own, then the test
-    // reference composer's — the Dependencies section renders first, so
-    // `.next()` reaches the dependency composer's.
+    // The composer itself now renders inside its own `egui::Modal`, so its
+    // "Pick…" button is scoped by walking up from the composer's own
+    // heading rather than indexing into a flat, whole-document list.
     harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
         .get_all_by_role_and_label(Role::Button, "Pick…")
         .next()
         .expect("dependency composer Pick button not found")
-        .click();
+        .click_accesskit();
     harness.step();
     harness.step(); // let the modal settle, same as the Result form's own test.
 
@@ -3353,11 +3409,22 @@ fn requirement_form_dependency_auto_button_fetches_the_commit() {
         .click();
     harness.step();
 
+    // The composer's fields stay hidden until "Add dependency" is
+    // clicked once to reveal them.
     harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
         .get_all_by_role_and_label(Role::Button, "Pick…")
         .next()
         .expect("dependency composer Pick button not found")
-        .click();
+        .click_accesskit();
     harness.step();
     harness.step();
     harness
@@ -3368,31 +3435,38 @@ fn requirement_form_dependency_auto_button_fetches_the_commit() {
     harness.step();
     harness.step();
 
-    // Two "Auto" buttons exist here too (dependency composer, then test
-    // reference composer) — `.next()` reaches the dependency composer's,
-    // same as the "Pick…" button above. Clicking it round-trips through
-    // the real `CoreHandle`'s actor, which shells out to real `git`
-    // against `test_project` (a real, tracked directory in this very
-    // repo — see `open_test_project`'s own doc comment) to resolve
-    // `requirements/design`'s latest commit.
+    // The dependency composer's own "Auto" button, scoped the same way as
+    // its "Pick…" button above — the modal's own container has exactly
+    // one "Auto" button (the composer's own; there are no existing
+    // dependency rows in this fresh create-mode form to add another).
+    // Clicking it round-trips through the real `CoreHandle`'s actor, which
+    // shells out to real `git` against `test_project` (a real, tracked
+    // directory in this very repo — see `open_test_project`'s own doc
+    // comment) to resolve `requirements/design`'s latest commit.
     harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
         .get_all_by_role_and_label(Role::Button, "Auto")
         .next()
         .expect("dependency composer Auto button not found")
         .click();
     harness.step();
 
-    // The commit field is the composer's own second `Role::TextInput` —
-    // name(2), title(3), then path(4)/commit(5), same indexing
-    // `adding_a_local_attachment_to_an_existing_requirement_appears_in_the_list`'s
-    // own comment documents (there are no existing dependencies here to
-    // shift the composer's fields further down). Asserted by shape (40
-    // hex characters — a real commit hash), not a specific value, since
-    // the actual commit depends on this repo's own history rather than
-    // anything `test_project`'s fixture data pins in place.
+    // The commit field is the modal's own second `Role::TextInput` (path,
+    // then commit) — scoped via the composer's own heading rather than a
+    // flat whole-document index, same technique as
+    // `a_requirements_dependency_can_be_viewed_removed_and_a_new_one_added`.
+    // Asserted by shape (40 hex characters — a real commit hash), not a
+    // specific value, since the actual commit depends on this repo's own
+    // history rather than anything `test_project`'s fixture data pins in
+    // place.
     wait_until(&mut harness, |h| {
-        h.get_all_by_role(Role::TextInput)
-            .nth(5)
+        h.get_by_role_and_label(Role::Label, "Add Dependency")
+            .parent()
+            .expect("dependency composer modal container not found")
+            .get_all_by_role(Role::TextInput)
+            .nth(1)
             .and_then(|field| field.value())
             .is_some_and(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
     });
@@ -3409,6 +3483,14 @@ fn requirement_form_remote_dependency_auto_button_fetches_the_commit() {
         .click();
     harness.step();
 
+    // The composer's fields stay hidden until "Add dependency" is
+    // clicked once to reveal them.
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
     // Switches the "Add dependency" composer from its default `Local`
     // variant to `Remote` — a real, separate code path in
     // `render_dependency_fields`/`dependency_commit_auto_clicked`
@@ -3416,16 +3498,23 @@ fn requirement_form_remote_dependency_auto_button_fetches_the_commit() {
     // rather than `Git::commit_for_path`), untested until now (the
     // existing Auto tests only ever exercise the `Local` variant).
     harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
         .get_by_role_and_label(Role::RadioButton, "Remote")
-        .click();
+        .click_accesskit();
+    harness.step();
     harness.step();
 
-    // name(2), title(3), then the composer's own URL(4)/Path(5)/Commit(6)
-    // — same indexing convention as the `Local` variant's test, just with
-    // `Remote`'s three fields instead of two.
+    // The modal's own URL(0)/Path(1)/Commit(2) fields, scoped via the
+    // composer's own heading rather than a flat whole-document index —
+    // same technique as the `Local` variant's own test.
     let url_field = harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
         .get_all_by_role(Role::TextInput)
-        .nth(4)
+        .next()
         .expect("url field not found");
     url_field.focus();
     // This repo's own root, addressed as a `file://` remote — a real git
@@ -3440,18 +3529,22 @@ fn requirement_form_remote_dependency_auto_button_fetches_the_commit() {
     harness.step();
 
     let path_field = harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
         .get_all_by_role(Role::TextInput)
-        .nth(5)
+        .nth(1)
         .expect("path field not found");
     path_field.focus();
     path_field.type_text("test_project/requirements/design");
     harness.step();
 
-    // Two "Auto" buttons exist (this `Remote` dependency composer's own,
-    // then the test reference composer's) — `.next()` reaches the
-    // dependency composer's, same reasoning as the `Local` variant's own
-    // test.
+    // The dependency composer's own "Auto" button, scoped the same way as
+    // the `Local` variant's own test.
     harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
         .get_all_by_role_and_label(Role::Button, "Auto")
         .next()
         .expect("dependency composer Auto button not found")
@@ -3462,8 +3555,117 @@ fn requirement_form_remote_dependency_auto_button_fetches_the_commit() {
     // variant's own test — the real commit depends on this repo's own
     // history.
     wait_until(&mut harness, |h| {
-        h.get_all_by_role(Role::TextInput)
-            .nth(6)
+        h.get_by_role_and_label(Role::Label, "Add Dependency")
+            .parent()
+            .expect("dependency composer modal container not found")
+            .get_all_by_role(Role::TextInput)
+            .nth(2)
+            .and_then(|field| field.value())
+            .is_some_and(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
+    });
+}
+
+#[test]
+fn requirement_form_dependency_composer_pick_auto_populates_the_commit() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "New Requirement")
+        .click();
+    harness.step();
+
+    // The composer's fields stay hidden until "Add dependency" is
+    // clicked once to reveal them.
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
+        .get_all_by_role_and_label(Role::Button, "Pick…")
+        .next()
+        .expect("dependency composer Pick button not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+    harness
+        .get_all_by_label("design")
+        .last()
+        .expect("modal row not found")
+        .click();
+    harness.step();
+    harness.step();
+
+    // No "Auto" click here — picking a target now implies it, same as
+    // `path_picker_dialog_selected`'s `DependencySlot::Existing` case
+    // (see `an_existing_dependencys_own_pick_and_auto_buttons_update_that_row`)
+    // extended to the composer's own not-yet-added row.
+    wait_until(&mut harness, |h| {
+        h.get_by_role_and_label(Role::Label, "Add Dependency")
+            .parent()
+            .expect("dependency composer modal container not found")
+            .get_all_by_role(Role::TextInput)
+            .nth(1)
+            .and_then(|field| field.value())
+            .is_some_and(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
+    });
+}
+
+#[test]
+fn requirement_form_test_reference_composer_pick_auto_populates_the_commit() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "New Requirement")
+        .click();
+    harness.step();
+
+    // The composer's fields stay hidden until "Add test reference" is
+    // clicked once to reveal them.
+    harness
+        .get_by_role_and_label(Role::Button, "Add test reference")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Label, "Add Test Reference")
+        .parent()
+        .expect("test reference composer modal container not found")
+        .get_all_by_role_and_label(Role::Button, "Pick…")
+        .next()
+        .expect("test reference composer Pick button not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    // "smoke" is a real test leaf in `test_project` (see `tests/smoke`
+    // in `requirement.ron`'s fixtures).
+    harness
+        .get_all_by_label("smoke")
+        .last()
+        .expect("modal row not found")
+        .click();
+    harness.step();
+    harness.step();
+
+    // Same "Pick… implies Auto" shortcut as the dependency composer's own
+    // test above, exercising `TestRefSlot::New` through
+    // `test_ref_commit_auto_clicked` instead.
+    wait_until(&mut harness, |h| {
+        h.get_by_role_and_label(Role::Label, "Add Test Reference")
+            .parent()
+            .expect("test reference composer modal container not found")
+            .get_all_by_role(Role::TextInput)
+            .nth(1)
             .and_then(|field| field.value())
             .is_some_and(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
     });
@@ -3578,18 +3780,18 @@ fn adding_a_local_attachment_to_an_existing_requirement_appears_in_the_list() {
     // pane's own filter field(1) — both always first — then name(2),
     // title(3), then — "integration" has one real dependency in
     // `test_project` (on "design") — its own path(4)/commit(5)
-    // fields, then the "Add dependency" composer's own default `Local`
-    // path(6)/commit(7) fields (always present, even with zero
-    // dependencies to add), then — "integration" also has two real test
-    // references (`tests/smoke`, `tests/contract` — see `requirement.ron`)
-    // — their own path(8)/commit(9) and path(10)/commit(11) fields, then
-    // the "Add test reference" composer's own path(12)/commit(13) fields
-    // (always present too), then — since this form is in edit mode — the
-    // local-attachment path field(14). Fragile to reordering singleline
-    // fields specifically, which is why this comment exists.
+    // fields (the "Add dependency" composer's own fields stay hidden
+    // until "Add dependency" is clicked, so they don't appear here), then
+    // — "integration" also has two real test references (`tests/smoke`,
+    // `tests/contract` — see `requirement.ron`) — their own path(6)/
+    // commit(7) and path(8)/commit(9) fields (the "Add test reference"
+    // composer's fields are likewise hidden by default), then — since
+    // this form is in edit mode — the local-attachment path field(10).
+    // Fragile to reordering singleline fields specifically, which is why
+    // this comment exists.
     let attachment_path_field = harness
         .get_all_by_role(Role::TextInput)
-        .nth(14)
+        .nth(10)
         .expect("local-attachment path field not found");
     attachment_path_field.focus();
     attachment_path_field.type_text("interaction_test_attachment.md");

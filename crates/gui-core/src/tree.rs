@@ -153,6 +153,7 @@ pub(crate) fn get_entry_detail(state: &ProjectState, target: &LogicalPath, kind:
         }),
         EntryKind::Test => module.tests.get(&target.name).map(|test| EntryDetail::Test {
             title: test.title.clone(),
+            test_text: test.test_text.clone(),
             result_kind: test.result_kind.clone(),
             attachments: test.attachments.iter().cloned().collect(),
             template_files: test.template.iter().cloned().collect(),

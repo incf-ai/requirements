@@ -406,6 +406,7 @@ mod test {
         let mut project = create_project("Capstone");
 
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -419,6 +420,7 @@ mod test {
             .unwrap();
 
         let mut test = TestDraft::new("Generic Test", ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
         test.commit = Some("t1".to_string());
         project.tree.add_test("generic_test", test).unwrap();
 
@@ -527,6 +529,7 @@ mod test {
     fn not_met_when_the_requirements_own_test_reference_is_stale() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         // References an old version of the test — "stale" != test.commit.
         requirement
@@ -541,6 +544,7 @@ mod test {
             .unwrap();
 
         let mut test = TestDraft::new("Generic Test", ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
         test.commit = Some("t1".to_string());
         project.tree.add_test("generic_test", test).unwrap();
         project
@@ -560,6 +564,7 @@ mod test {
     fn refreshed_test_references_fixes_a_stale_reference() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -573,6 +578,7 @@ mod test {
             .unwrap();
 
         let mut test = TestDraft::new("Generic Test", ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
         test.commit = Some("t1".to_string());
         project.tree.add_test("generic_test", test).unwrap();
 
@@ -597,6 +603,7 @@ mod test {
     fn refreshed_test_references_leaves_an_unresolved_reference_unchanged() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -631,6 +638,7 @@ mod test {
     fn not_met_with_no_tests_at_all() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         project
             .tree
@@ -683,6 +691,7 @@ mod test {
     fn not_met_when_the_test_reference_is_malformed() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -713,6 +722,7 @@ mod test {
     fn not_met_when_the_referenced_test_does_not_exist() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -745,6 +755,7 @@ mod test {
     fn not_met_when_the_referenced_test_was_never_persisted() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -757,13 +768,9 @@ mod test {
             .add_requirement("definition", requirement)
             .unwrap();
         // No `commit` set — never persisted.
-        project
-            .tree
-            .add_test(
-                "generic_test",
-                TestDraft::new("Generic Test", ResultKindV1::FreeForm),
-            )
-            .unwrap();
+        let mut test = TestDraft::new("Generic Test", ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
+        project.tree.add_test("generic_test", test).unwrap();
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
@@ -777,6 +784,7 @@ mod test {
     fn not_met_when_the_result_names_a_different_requirement() {
         let mut project = project_with_current_requirement_and_test();
         let mut requirement = RequirementDraft::new("Other");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         project.tree.add_requirement("other", requirement).unwrap();
 
@@ -834,6 +842,7 @@ mod test {
             .unwrap();
 
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -846,6 +855,7 @@ mod test {
             .unwrap();
 
         let mut test = TestDraft::new("Generic Test", ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
         test.commit = Some("t1".to_string());
         submodule.add_test("generic_test", test).unwrap();
 
@@ -874,6 +884,7 @@ mod test {
         let mut project = create_project("Capstone");
         for (name, target) in [("a", Some("b")), ("b", Some("c")), ("c", None)] {
             let mut requirement = RequirementDraft::new(name);
+            requirement.requirement_text = "Text".to_string();
             requirement.commit = Some("c1".to_string());
             if let Some(target) = target {
                 requirement
@@ -907,6 +918,7 @@ mod test {
             &[("a", &["b", "c"]), ("b", &["d"]), ("c", &["d"]), ("d", &[])];
         for (name, targets) in edges {
             let mut requirement = RequirementDraft::new(*name);
+            requirement.requirement_text = "Text".to_string();
             requirement.commit = Some("c1".to_string());
             for target in *targets {
                 requirement
@@ -944,6 +956,7 @@ mod test {
     fn dependency_chain_skips_a_dependency_that_does_not_resolve() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("A");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -971,6 +984,7 @@ mod test {
     fn dependency_chain_skips_a_malformed_dependency_reference() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("A");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -994,6 +1008,7 @@ mod test {
     fn dependency_chain_skips_non_local_dependencies() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("A");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -1024,6 +1039,7 @@ mod test {
             .get_mut(&disk::EntryName("embeddings".to_string()))
             .unwrap();
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         submodule
             .add_requirement("definition", requirement)

@@ -33,20 +33,29 @@ mod test {
     use crate::draft::{RequirementDraft as Req, TestDraft as Test};
     use disk::ResultKindV1;
 
+    fn requirement_draft(title: &str) -> Req {
+        let mut requirement = Req::new(title);
+        requirement.requirement_text = "Text".to_string();
+        requirement
+    }
+
+    fn test_draft(title: &str) -> Test {
+        let mut test = Test::new(title, ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
+        test
+    }
+
     fn sample_tree() -> ModuleDraft {
         let mut root = ModuleDraft::default();
-        root.add_requirement("definition", Req::new("Definition"))
+        root.add_requirement("definition", requirement_draft("Definition"))
             .unwrap();
-        root.add_test(
-            "generic_test",
-            Test::new("Generic Test", ResultKindV1::FreeForm),
-        )
-        .unwrap();
+        root.add_test("generic_test", test_draft("Generic Test"))
+            .unwrap();
         root.add_module("embeddings").unwrap();
         root.modules
             .get_mut(&EntryName("embeddings".to_string()))
             .unwrap()
-            .add_requirement("nested", Req::new("Nested"))
+            .add_requirement("nested", requirement_draft("Nested"))
             .unwrap();
         root
     }

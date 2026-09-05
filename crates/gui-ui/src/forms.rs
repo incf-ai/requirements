@@ -262,6 +262,12 @@ pub struct RequirementFormState {
     /// `dependencies` and reset to `DependencyDraft::default()` when
     /// "Add dependency" is clicked.
     pub new_dependency: DependencyDraft,
+    /// Whether the "Add dependency" composer's fields are currently
+    /// revealed. Starts `false`; the first "Add dependency" click just
+    /// reveals the fields (without adding anything yet), and a second
+    /// click — once the composer is showing — actually pushes
+    /// `new_dependency` onto `dependencies` and hides the composer again.
+    pub adding_dependency: bool,
     /// This requirement's `test`/`tests` field — see `TestRefDraft`'s own
     /// doc comment.
     pub tests: Vec<TestRefDraft>,
@@ -269,6 +275,9 @@ pub struct RequirementFormState {
     /// `tests` and reset to `TestRefDraft::default()` when "Add test
     /// reference" is clicked.
     pub new_test_ref: TestRefDraft,
+    /// Same idea as `adding_dependency`, but for the "Add test reference"
+    /// composer.
+    pub adding_test_ref: bool,
     /// This requirement's own local attachment pool — empty for a
     /// creation-mode form (there's no entry yet to attach anything to;
     /// `Command::AddRequirementAttachment` requires one to already exist),
@@ -323,8 +332,10 @@ impl Default for RequirementFormState {
             error: None,
             dependencies: Vec::new(),
             new_dependency: DependencyDraft::default(),
+            adding_dependency: false,
             tests: Vec::new(),
             new_test_ref: TestRefDraft::default(),
+            adding_test_ref: false,
             attachments: Vec::new(),
             new_attachment_path: String::new(),
             local_pool_error: None,
@@ -392,6 +403,7 @@ impl RequirementFormState {
 pub struct TestFormState {
     pub name: String,
     pub title: String,
+    pub test_text: String,
     pub result_kind: ResultKindV1,
     /// See `RequirementFormState::original`'s own doc comment — same
     /// "clone and overlay only what's editable" reasoning, preserving
@@ -420,6 +432,7 @@ impl Default for TestFormState {
         TestFormState {
             name: String::new(),
             title: String::new(),
+            test_text: String::new(),
             result_kind: ResultKindV1::FreeForm,
             original: Box::new(TestDraft::new(String::new(), ResultKindV1::FreeForm)),
             editing_target: None,
@@ -459,6 +472,7 @@ impl TestFormState {
     pub fn current_contents(&self) -> TestDraft {
         let mut test = (*self.original).clone();
         test.title = self.title.clone();
+        test.test_text = self.test_text.clone();
         test.result_kind = self.result_kind.clone();
         // Same "the form's own live-synced copy, not `original`'s
         // possibly-stale one" reasoning as `RequirementFormState::build_command`.

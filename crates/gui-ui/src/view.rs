@@ -455,6 +455,32 @@ impl GuiApp {
                 if icon_button(ui, true, icons::ATTACHMENTS, "Attachments…").clicked() {
                     self.attachments_dialog_opened();
                 }
+
+                // "Clear", pinned to the toolbar's far right corner — same
+                // `right_to_left` sub-layout technique the menu bar's own
+                // debug-panel toggle and the status bar's zoom controls use.
+                // Pushed into `nav_history` as a `NavTarget::Empty` (see
+                // `clear_center_pane_clicked`) rather than just blanking
+                // `self.editor`/`self.selection` directly, so Back can
+                // still return to whatever was showing before the click —
+                // same "every navigation is Back-able" convention Back/
+                // Forward and the four "New ___" buttons already follow.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(
+                        ui,
+                        self.can_clear_center_pane(),
+                        icons::CLEAR,
+                        "Clear",
+                    )
+                    .clicked()
+                    {
+                        if self.editor_has_unsaved_edits() {
+                            self.unsaved_form_dialog_opened(PendingNavigation::Clear);
+                        } else {
+                            self.clear_center_pane_clicked();
+                        }
+                    }
+                });
             });
         });
     }
@@ -963,12 +989,7 @@ impl GuiApp {
                             ui.label(dep.to_string());
                         }
                     } else {
-                        ui.horizontal(|ui| {
-                            dependency_edited |= render_dependency_kind_picker(ui, dep);
-                            if ui.button("Remove").clicked() {
-                                remove_dependency = Some(i);
-                            }
-                        });
+                        dependency_edited |= render_dependency_kind_picker(ui, dep);
                         let (changed, auto, pick_clicked) =
                             render_dependency_fields(ui, dep, self.tree.as_ref());
                         dependency_edited |= changed;
@@ -977,6 +998,9 @@ impl GuiApp {
                         }
                         if pick_clicked {
                             pick_dependency_path_clicked = Some(DependencySlot::Existing(i));
+                        }
+                        if ui.button("Remove").clicked() {
+                            remove_dependency = Some(i);
                         }
                     }
                 }
@@ -991,27 +1015,47 @@ impl GuiApp {
                     ui.colored_label(egui::Color32::RED, error);
                 }
                 if !read_only {
-                    ui.label("Add dependency:");
-                    ui.horizontal(|ui| {
-                        // Composing a not-yet-added entry isn't itself an
-                        // edit to the form's real content — only actually
-                        // clicking "Add dependency" below is, so this return
-                        // value is deliberately ignored (unlike the existing-
-                        // row loop above).
-                        render_dependency_kind_picker(ui, &mut form.new_dependency);
-                    });
-                    let (_, auto, pick_clicked) =
-                        render_dependency_fields(ui, &mut form.new_dependency, self.tree.as_ref());
-                    if let Some(kind) = auto {
-                        auto_commit_clicked = Some((DependencySlot::New, kind));
-                    }
-                    if pick_clicked {
-                        pick_dependency_path_clicked = Some(DependencySlot::New);
-                    }
-                    if ui.button("Add dependency").clicked() {
-                        form.dependencies.push(form.new_dependency.clone());
-                        form.new_dependency = DependencyDraft::default();
-                        form.edited = true;
+                    if form.adding_dependency {
+                        egui::Modal::new(egui::Id::new("add_dependency_dialog")).show(
+                            ui.ctx(),
+                            |ui| {
+                                ui.heading("Add Dependency");
+                                ui.horizontal(|ui| {
+                                    // Composing a not-yet-added entry isn't
+                                    // itself an edit to the form's real
+                                    // content — only actually clicking "Add
+                                    // dependency" below is, so this return
+                                    // value is deliberately ignored (unlike
+                                    // the existing-row loop above).
+                                    render_dependency_kind_picker(ui, &mut form.new_dependency);
+                                });
+                                let (_, auto, pick_clicked) = render_dependency_fields(
+                                    ui,
+                                    &mut form.new_dependency,
+                                    self.tree.as_ref(),
+                                );
+                                if let Some(kind) = auto {
+                                    auto_commit_clicked = Some((DependencySlot::New, kind));
+                                }
+                                if pick_clicked {
+                                    pick_dependency_path_clicked = Some(DependencySlot::New);
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Add dependency").clicked() {
+                                        form.dependencies.push(form.new_dependency.clone());
+                                        form.new_dependency = DependencyDraft::default();
+                                        form.adding_dependency = false;
+                                        form.edited = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        form.new_dependency = DependencyDraft::default();
+                                        form.adding_dependency = false;
+                                    }
+                                });
+                            },
+                        );
+                    } else if ui.button("Add dependency").clicked() {
+                        form.adding_dependency = true;
                     }
                 }
                 });
@@ -1042,9 +1086,6 @@ impl GuiApp {
                             ui.label(test_ref.to_string());
                         }
                     } else {
-                        if ui.button("Remove").clicked() {
-                            remove_test_ref = Some(i);
-                        }
                         let (changed, auto, pick_clicked) =
                             render_test_ref_fields(ui, test_ref, self.tree.as_ref());
                         test_ref_edited |= changed;
@@ -1053,6 +1094,9 @@ impl GuiApp {
                         }
                         if pick_clicked {
                             pick_test_ref_path_clicked = Some(TestRefSlot::Existing(i));
+                        }
+                        if ui.button("Remove").clicked() {
+                            remove_test_ref = Some(i);
                         }
                     }
                 }
@@ -1067,19 +1111,62 @@ impl GuiApp {
                     ui.colored_label(egui::Color32::RED, error);
                 }
                 if !read_only {
-                    ui.label("Add test reference:");
-                    let (_, auto, pick_clicked) =
-                        render_test_ref_fields(ui, &mut form.new_test_ref, self.tree.as_ref());
-                    if let Some(target) = auto {
-                        test_ref_auto_commit_clicked = Some((TestRefSlot::New, target));
-                    }
-                    if pick_clicked {
-                        pick_test_ref_path_clicked = Some(TestRefSlot::New);
-                    }
-                    if ui.button("Add test reference").clicked() {
-                        form.tests.push(form.new_test_ref.clone());
-                        form.new_test_ref = TestRefDraft::default();
-                        form.edited = true;
+                    if form.adding_test_ref {
+                        egui::Modal::new(egui::Id::new("add_test_reference_dialog")).show(
+                            ui.ctx(),
+                            |ui| {
+                                ui.heading("Add Test Reference");
+                                let (_, auto, pick_clicked) = render_test_ref_fields(
+                                    ui,
+                                    &mut form.new_test_ref,
+                                    self.tree.as_ref(),
+                                );
+                                if let Some(target) = auto {
+                                    test_ref_auto_commit_clicked = Some((TestRefSlot::New, target));
+                                }
+                                if pick_clicked {
+                                    pick_test_ref_path_clicked = Some(TestRefSlot::New);
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Add test reference").clicked() {
+                                        form.tests.push(form.new_test_ref.clone());
+                                        let new_index = form.tests.len() - 1;
+                                        // Auto-populate the new row's commit
+                                        // exactly as if its own "Auto" button
+                                        // had been clicked, so the user
+                                        // doesn't have to do that as a
+                                        // manual follow-up step.
+                                        if let Some(tree) = self.tree.as_ref() {
+                                            let path = form.tests[new_index].path.clone();
+                                            if let Some(target) =
+                                                flatten_leaf_paths(tree, EntryKind::Test)
+                                                    .into_iter()
+                                                    .find(|target| {
+                                                        absolute_reference_path(
+                                                            target,
+                                                            leaf_kind_segment(EntryKind::Test),
+                                                        ) == path
+                                                    })
+                                            {
+                                                test_ref_auto_commit_clicked = Some((
+                                                    TestRefSlot::Existing(new_index),
+                                                    target,
+                                                ));
+                                            }
+                                        }
+                                        form.new_test_ref = TestRefDraft::default();
+                                        form.adding_test_ref = false;
+                                        form.edited = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        form.new_test_ref = TestRefDraft::default();
+                                        form.adding_test_ref = false;
+                                    }
+                                });
+                            },
+                        );
+                    } else if ui.button("Add test reference").clicked() {
+                        form.adding_test_ref = true;
                     }
                 }
                 });
@@ -1265,6 +1352,8 @@ impl GuiApp {
                         ui.label("Title:");
                         ui.label(&form.title);
                     });
+                    ui.label("Test text:");
+                    ui.label(&form.test_text);
                     ui.horizontal(|ui| {
                         ui.label("Result kind:");
                         ui.label(match form.result_kind {
@@ -1279,6 +1368,15 @@ impl GuiApp {
                             form.edited = true;
                         }
                     });
+                    // See the Requirement form's own comment on `entry_id` —
+                    // same reasoning, for this test's `resizable_multiline`.
+                    let entry_id = entry_id_salt(&form.editing_target);
+                    ui.label("Test text:");
+                    if resizable_multiline(ui, &format!("test_text:{entry_id}"), &mut form.test_text)
+                        .changed()
+                    {
+                        form.edited = true;
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Result kind:");
                         if ui
@@ -2322,12 +2420,23 @@ impl GuiApp {
                 ui.label("New name:");
                 ui.text_edit_singleline(&mut new_name);
             });
+            let text_empty = !dialog.deleted && dialog.requirement.requirement_text.trim().is_empty();
+            if text_empty {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "Requirement text is empty — fix it before recreating.",
+                );
+            }
             if let Some(error) = &dialog.error {
                 ui.colored_label(egui::Color32::RED, error);
             }
+            let name_unchanged = !dialog.deleted && new_name.trim() == dialog.target.name.as_str();
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!busy && !new_name.trim().is_empty(), egui::Button::new("Recreate"))
+                    .add_enabled(
+                        !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty,
+                        egui::Button::new("Recreate"),
+                    )
                     .clicked()
                 {
                     confirmed = true;
@@ -2369,12 +2478,20 @@ impl GuiApp {
                 ui.label("New name:");
                 ui.text_edit_singleline(&mut new_name);
             });
+            let text_empty = !dialog.deleted && dialog.test.test_text.trim().is_empty();
+            if text_empty {
+                ui.colored_label(egui::Color32::RED, "Test text is empty — fix it before recreating.");
+            }
             if let Some(error) = &dialog.error {
                 ui.colored_label(egui::Color32::RED, error);
             }
+            let name_unchanged = !dialog.deleted && new_name.trim() == dialog.target.name.as_str();
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!busy && !new_name.trim().is_empty(), egui::Button::new("Recreate"))
+                    .add_enabled(
+                        !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty,
+                        egui::Button::new("Recreate"),
+                    )
                     .clicked()
                 {
                     confirmed = true;

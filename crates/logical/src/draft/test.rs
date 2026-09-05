@@ -11,6 +11,8 @@ use crate::pool::{AddPoolFileError, add_pool_file};
 #[derive(Debug, Clone)]
 pub struct TestDraft {
     pub title: String,
+    /// The test's main body — `disk::TestOnDisk::test_text` (`test.typ`).
+    pub test_text: String,
     pub result_kind: ResultKindV1,
     /// Files physically local to this test's own `attachments/`.
     pub attachments: BTreeSet<PathBuf>,
@@ -31,6 +33,7 @@ impl TestDraft {
     pub fn new(title: impl Into<String>, result_kind: ResultKindV1) -> Self {
         TestDraft {
             title: title.into(),
+            test_text: String::new(),
             result_kind,
             attachments: BTreeSet::new(),
             attachment_refs: Vec::new(),
@@ -68,6 +71,7 @@ mod test {
     fn new_starts_empty_with_everything_included_in_commit() {
         let test = TestDraft::new("Title", ResultKindV1::FreeForm);
         assert_eq!(test.title, "Title");
+        assert_eq!(test.test_text, "");
         assert!(test.attachments.is_empty());
         assert!(test.template.is_empty());
         assert!(test.include_attachments_in_commit);

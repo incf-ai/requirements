@@ -43,16 +43,22 @@ enum Command {
         module: String,
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        /// Left empty, this is autopopulated from `--name`.
+        #[arg(long, default_value = "")]
         title: String,
+        #[arg(long)]
+        text: String,
     },
     AddTest {
         #[arg(long, default_value = "")]
         module: String,
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        /// Left empty, this is autopopulated from `--name`.
+        #[arg(long, default_value = "")]
         title: String,
+        #[arg(long)]
+        text: String,
         #[arg(long, value_enum)]
         result_kind: ResultKindArg,
     },
@@ -230,11 +236,14 @@ fn run_command(
             module,
             name,
             title,
+            text,
         } => {
             mutate(fs, git, dir, |draft| {
                 let target = find_module_mut(&mut draft.tree, &module)
                     .ok_or_else(|| ErrorKind::ModuleNotFound(module.clone()))?;
-                target.add_requirement(&name, RequirementDraft::new(title))?;
+                let mut requirement = RequirementDraft::new(title);
+                requirement.requirement_text = text;
+                target.add_requirement(&name, requirement)?;
                 Ok(())
             })?;
             Ok("added".to_string())
@@ -243,12 +252,15 @@ fn run_command(
             module,
             name,
             title,
+            text,
             result_kind,
         } => {
             mutate(fs, git, dir, |draft| {
                 let target = find_module_mut(&mut draft.tree, &module)
                     .ok_or_else(|| ErrorKind::ModuleNotFound(module.clone()))?;
-                target.add_test(&name, TestDraft::new(title, result_kind.into()))?;
+                let mut test = TestDraft::new(title, result_kind.into());
+                test.test_text = text;
+                target.add_test(&name, test)?;
                 Ok(())
             })?;
             Ok("added".to_string())
@@ -548,6 +560,8 @@ mod test {
                     "add-requirement",
                     "--name",
                     "definition",
+                "--text",
+                "Text",
                     "--title",
                     "Definition"
                 ]
@@ -561,6 +575,8 @@ mod test {
                     "add-test",
                     "--name",
                     "generic_test",
+                "--text",
+                "Text",
                     "--title",
                     "Generic Test",
                     "--result-kind",
@@ -634,6 +650,8 @@ mod test {
                 "add-test",
                 "--name",
                 "templated_test",
+                "--text",
+                "Text",
                 "--title",
                 "Templated Test",
                 "--result-kind",
@@ -646,6 +664,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -694,6 +714,8 @@ mod test {
                     "embeddings",
                     "--name",
                     "definition",
+                "--text",
+                "Text",
                     "--title",
                     "Definition"
                 ]
@@ -719,6 +741,8 @@ mod test {
                 "nonexistent",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ]),
@@ -756,6 +780,8 @@ mod test {
                 "nonexistent",
                 "--name",
                 "x",
+                "--text",
+                "Text",
                 "--title",
                 "X",
                 "--result-kind",
@@ -866,6 +892,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -902,6 +930,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -957,6 +987,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1006,6 +1038,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1053,6 +1087,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1066,6 +1102,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ]),
@@ -1100,6 +1138,8 @@ mod test {
                 "add-test",
                 "--name",
                 "generic_test",
+                "--text",
+                "Text",
                 "--title",
                 "Generic Test",
                 "--result-kind",
@@ -1114,6 +1154,8 @@ mod test {
                     "add-test",
                     "--name",
                     "generic_test",
+                "--text",
+                "Text",
                     "--title",
                     "Generic Test",
                     "--result-kind",
@@ -1164,6 +1206,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1188,6 +1232,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1295,6 +1341,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1357,6 +1405,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1407,6 +1457,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],
@@ -1431,6 +1483,8 @@ mod test {
                 "add-requirement",
                 "--name",
                 "definition",
+                "--text",
+                "Text",
                 "--title",
                 "Definition",
             ],

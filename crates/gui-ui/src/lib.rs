@@ -76,8 +76,8 @@ pub struct GuiApp {
     /// into the editable form (`editor_edit_clicked`) is itself a
     /// navigation, so Back returns to the viewer rather than leaving the
     /// tab on the edit form or jumping past it to whatever was selected
-    /// before. Not bounded — entries are small, and capping this wasn't
-    /// judged worth the complexity for a first pass.
+    /// before. Bounded to `NAV_HISTORY_CAPACITY`, oldest entries dropped
+    /// first — see `push_nav_entry`.
     nav_history: Vec<NavTarget>,
     nav_position: usize,
     pending: HashMap<RequestId, PendingKind>,
@@ -263,6 +263,11 @@ const ZOOM_MIN_PERCENT: u32 = 80;
 const ZOOM_MAX_PERCENT: u32 = 400;
 const ZOOM_DEFAULT_PERCENT: u32 = 100;
 
+/// See `nav_history`'s own doc comment / `push_nav_entry`. Not a number
+/// anyone asked for — a judgment call bounding memory, same spirit as
+/// `gui-core`'s `UNDO_STACK_CAPACITY`.
+const NAV_HISTORY_CAPACITY: usize = 40;
+
 /// Whether a navigation to an existing requirement/test/result lands on
 /// its read-only viewer or its editable form — see `nav_history`'s own
 /// doc comment and `GuiApp::apply_entry_detail`.
@@ -286,6 +291,12 @@ enum NavTarget {
         mode: NavMode,
     },
     Module(Vec<EntryName>),
+    /// The center pane deliberately showing nothing — pushed by the
+    /// toolbar's "Clear" button (`clear_center_pane_clicked`) so that
+    /// action is itself a Back-able navigation, same as a tree click,
+    /// rather than silently discarding whatever was on screen with no way
+    /// back to it.
+    Empty,
 }
 
 /// Which project-switching action the unsaved-changes prompt
@@ -431,6 +442,7 @@ pub enum PendingNavigation {
     SelectModule(Vec<EntryName>),
     Back,
     Forward,
+    Clear,
     NewRequirement,
     NewTest,
     NewResult,
@@ -1211,6 +1223,7 @@ impl GuiApp {
             PendingNavigation::SelectModule(module) => self.select_module(module),
             PendingNavigation::Back => self.back_clicked(),
             PendingNavigation::Forward => self.forward_clicked(),
+            PendingNavigation::Clear => self.clear_center_pane_clicked(),
             PendingNavigation::NewRequirement => self.new_requirement_clicked(),
             PendingNavigation::NewTest => self.new_test_clicked(),
             PendingNavigation::NewResult => self.new_result_clicked(),
@@ -1418,14 +1431,28 @@ impl GuiApp {
     /// `nav_history`. `select_module` is the module/project-root
     /// counterpart of this function.
     fn navigate(&mut self, target: LogicalPath, kind: EntryKind, mode: NavMode) {
-        self.nav_history.truncate(self.nav_position + 1);
-        self.nav_history.push(NavTarget::Leaf {
+        self.push_nav_entry(NavTarget::Leaf {
             target: target.clone(),
             kind,
             mode,
         });
-        self.nav_position = self.nav_history.len() - 1;
         self.select_from_history(target, kind);
+    }
+
+    /// Truncates any "forward" history past `nav_position` (the usual
+    /// "a fresh navigation invalidates forward history" rule), pushes
+    /// `entry`, then drops the oldest entry once past `NAV_HISTORY_CAPACITY`
+    /// so a long session's history doesn't grow without limit — the
+    /// `nav_history` counterpart of `gui-core`'s `push_undo_snapshot`.
+    /// Shared by `navigate`/`select_module`/`clear_center_pane_clicked`,
+    /// the three chokepoints that grow `nav_history`.
+    fn push_nav_entry(&mut self, entry: NavTarget) {
+        self.nav_history.truncate(self.nav_position + 1);
+        self.nav_history.push(entry);
+        if self.nav_history.len() > NAV_HISTORY_CAPACITY {
+            self.nav_history.remove(0);
+        }
+        self.nav_position = self.nav_history.len() - 1;
     }
 
     /// Sets the selection, closes whatever form was open (a stale one
@@ -1480,6 +1507,14 @@ impl GuiApp {
         self.nav_position > 0
     }
 
+    /// Whether the toolbar's "Clear" button has anything to do — false with
+    /// no project loaded at all, or when the center pane is already showing
+    /// its own "nothing selected" placeholder (a click there would just push
+    /// a redundant `NavTarget::Empty` `Back` would have to step through).
+    fn can_clear_center_pane(&self) -> bool {
+        self.tree.is_some() && (self.selection.is_some() || !matches!(self.editor, EditorState::None))
+    }
+
     fn can_go_forward(&self) -> bool {
         self.nav_position + 1 < self.nav_history.len()
     }
@@ -1509,7 +1544,31 @@ impl GuiApp {
         match target {
             NavTarget::Leaf { target, kind, .. } => self.select_from_history(target, kind),
             NavTarget::Module(module) => self.select_module_from_history(module),
+            NavTarget::Empty => self.clear_center_pane_from_history(),
         }
+    }
+
+    /// The toolbar's "Clear" button — truncates any "forward" history past
+    /// the current position, pushes a fresh `NavTarget::Empty`, advances to
+    /// it, then hands off to `clear_center_pane_from_history` to actually do
+    /// the work. Same shape as `navigate`/`select_module`, so clearing the
+    /// pane is itself a Back-able stop rather than a one-way discard.
+    fn clear_center_pane_clicked(&mut self) {
+        self.push_nav_entry(NavTarget::Empty);
+        self.clear_center_pane_from_history();
+    }
+
+    /// Clears the leaf `selection` and closes whatever form was open,
+    /// landing on the center pane's own "nothing selected" placeholder
+    /// (`render_center_pane`'s `Pane::Empty` with `self.selection: None`) —
+    /// everything `clear_center_pane_clicked` does *except* touching
+    /// `nav_history`/`nav_position`, same split as `select_from_history`/
+    /// `select_module_from_history`. Leaves `selected_module` alone: it's
+    /// still where new entries would be created and what the status bar
+    /// shows, neither of which "clear the center pane" implies changing.
+    fn clear_center_pane_from_history(&mut self) {
+        self.selection = None;
+        self.editor = EditorState::None;
     }
 
     /// A module (or the project root, `module: []`) tree node was clicked
@@ -1519,9 +1578,7 @@ impl GuiApp {
     /// `NavTarget::Leaf` push), advances to it, then hands off to
     /// `select_module_from_history` to actually do the work.
     fn select_module(&mut self, module: Vec<EntryName>) {
-        self.nav_history.truncate(self.nav_position + 1);
-        self.nav_history.push(NavTarget::Module(module.clone()));
-        self.nav_position = self.nav_history.len() - 1;
+        self.push_nav_entry(NavTarget::Module(module.clone()));
         self.select_module_from_history(module);
     }
 
@@ -1615,6 +1672,13 @@ impl GuiApp {
                         form.edited = true;
                     }
                 }
+                // Picking a target implies the user wants that target's
+                // current commit, same as pressing "Auto" right after —
+                // saves the extra click for the common case. Applies to the
+                // composer's not-yet-added row too: `dependency_commit_auto_clicked`
+                // and `apply_commit_fetch_result` already branch on `New` vs
+                // `Existing` themselves.
+                self.dependency_commit_auto_clicked(slot, AutoCommitKind::Local(picked));
             }
             PathPickerTarget::TestReference(slot) => {
                 if let EditorState::NewRequirement(form) = &mut self.editor {
@@ -1632,6 +1696,9 @@ impl GuiApp {
                         form.edited = true;
                     }
                 }
+                // Same "Pick… implies Auto" shortcut as the dependency case
+                // above — applies to the composer's not-yet-added row too.
+                self.test_ref_commit_auto_clicked(slot, picked);
             }
         }
     }
@@ -1728,8 +1795,10 @@ impl GuiApp {
                         .map(DependencyDraft::from_core)
                         .collect(),
                     new_dependency: DependencyDraft::default(),
+                    adding_dependency: false,
                     tests,
                     new_test_ref: TestRefDraft::default(),
+                    adding_test_ref: false,
                     attachments,
                     new_attachment_path: String::new(),
                     local_pool_error: None,
@@ -1741,6 +1810,7 @@ impl GuiApp {
             }
             Some(EntryDetail::Test {
                 title,
+                test_text,
                 result_kind,
                 attachments,
                 template_files,
@@ -1748,6 +1818,7 @@ impl GuiApp {
             }) => EditorState::NewTest(TestFormState {
                 name: target.name.as_str().to_string(),
                 title,
+                test_text,
                 result_kind,
                 original,
                 editing_target: Some(target),
@@ -2601,10 +2672,11 @@ impl GuiApp {
         let Some(target) = form.editing_target.clone() else {
             return;
         };
+        let new_name = target.name.as_str().to_string();
         self.recreate_requirement_dialog = Some(RecreateRequirementState {
             target,
             requirement: Box::new(form.current_contents()),
-            new_name: String::new(),
+            new_name,
             deleted: false,
             pending_request: None,
             error: None,
@@ -2633,6 +2705,20 @@ impl GuiApp {
         };
         let new_name = dialog.new_name.trim().to_string();
         if new_name.is_empty() {
+            return;
+        }
+        if !dialog.deleted && new_name == dialog.target.name.as_str() {
+            if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                dialog.error = Some("New name must be different from the current name.".to_string());
+            }
+            return;
+        }
+        if !dialog.deleted && dialog.requirement.requirement_text.trim().is_empty() {
+            if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                dialog.error = Some(
+                    "Requirement text must not be empty — fix it before recreating.".to_string(),
+                );
+            }
             return;
         }
         let request = self.next_request_id();
@@ -2758,10 +2844,11 @@ impl GuiApp {
         let Some(target) = form.editing_target.clone() else {
             return;
         };
+        let new_name = target.name.as_str().to_string();
         self.recreate_test_dialog = Some(RecreateTestState {
             target,
             test: Box::new(form.current_contents()),
-            new_name: String::new(),
+            new_name,
             deleted: false,
             pending_request: None,
             error: None,
@@ -2782,6 +2869,18 @@ impl GuiApp {
         };
         let new_name = dialog.new_name.trim().to_string();
         if new_name.is_empty() {
+            return;
+        }
+        if !dialog.deleted && new_name == dialog.target.name.as_str() {
+            if let Some(dialog) = &mut self.recreate_test_dialog {
+                dialog.error = Some("New name must be different from the current name.".to_string());
+            }
+            return;
+        }
+        if !dialog.deleted && dialog.test.test_text.trim().is_empty() {
+            if let Some(dialog) = &mut self.recreate_test_dialog {
+                dialog.error = Some("Test text must not be empty — fix it before recreating.".to_string());
+            }
             return;
         }
         let request = self.next_request_id();
@@ -2912,7 +3011,37 @@ impl GuiApp {
         match result {
             Ok(()) => {
                 self.dirty = true;
-                self.editor = EditorState::None;
+                let module = self.new_entry_module_path();
+                // Navigate to the newly created entry, same as the
+                // Recreate flow's `apply_recreate_create_result` — leaving
+                // `self.selection` untouched here (as a bare
+                // `self.editor = EditorState::None` used to do) meant
+                // that if the user had something selected before opening
+                // the create form, `render_center_pane`'s `Pane::Empty`
+                // branch would see `self.selection: Some(_)` and show
+                // "Loading…" forever, since nothing was actually pending.
+                match &self.editor {
+                    EditorState::NewRequirement(f) => {
+                        let name = EntryName(f.name.trim().to_string());
+                        self.select(LogicalPath { modules: module, name }, EntryKind::Requirement);
+                    }
+                    EditorState::NewTest(f) => {
+                        let name = EntryName(f.name.trim().to_string());
+                        self.select(LogicalPath { modules: module, name }, EntryKind::Test);
+                    }
+                    EditorState::NewResult(f) => {
+                        let name = EntryName(f.name.trim().to_string());
+                        self.select(LogicalPath { modules: module, name }, EntryKind::Result);
+                    }
+                    EditorState::NewModule(f) => {
+                        let mut new_module = module;
+                        new_module.push(EntryName(f.name.trim().to_string()));
+                        self.select_module(new_module);
+                    }
+                    EditorState::ExistingModule(_) | EditorState::None => {
+                        self.editor = EditorState::None;
+                    }
+                }
             }
             Err(err) => {
                 let message = err.to_string();
@@ -3814,6 +3943,22 @@ mod test {
         app.forward_clicked(); // -> root
         assert_eq!(app.selected_module, Vec::<gui_core::EntryName>::new());
         assert!(!app.can_go_forward());
+    }
+
+    #[test]
+    fn nav_history_is_capped_and_drops_the_oldest_entry() {
+        let mut app = test_app();
+        for i in 0..(NAV_HISTORY_CAPACITY + 5) {
+            app.select_module(vec![disk_entry_name(&format!("m{i}"))]);
+        }
+
+        assert_eq!(app.nav_history.len(), NAV_HISTORY_CAPACITY);
+        assert_eq!(app.nav_position, NAV_HISTORY_CAPACITY - 1);
+        assert!(!app.can_go_forward());
+        assert_eq!(
+            app.nav_history[0],
+            NavTarget::Module(vec![disk_entry_name("m5")])
+        );
     }
 
     // --- Randomized/model-based nav_history fuzz test ---------------------
@@ -4957,6 +5102,10 @@ mod test {
     fn a_successful_create_closes_the_form_and_marks_dirty() {
         let mut app = test_app();
         app.new_module_clicked();
+        let EditorState::NewModule(form) = &mut app.editor else {
+            unreachable!()
+        };
+        form.name = "sub".to_string();
         app.editor_create_clicked();
         let EditorState::NewModule(form) = &app.editor else {
             unreachable!()
@@ -4968,8 +5117,55 @@ mod test {
             outcome: Outcome::AddModule(Ok(())),
         });
 
-        assert!(matches!(app.editor, EditorState::None));
+        // Success navigates to the newly created module — the center
+        // pane must not be left showing a permanent "Loading…" (see
+        // `apply_create_result`'s doc comment).
+        assert!(matches!(app.editor, EditorState::ExistingModule(_)));
+        assert_eq!(app.selected_module, vec![EntryName("sub".to_string())]);
         assert!(app.dirty);
+    }
+
+    #[test]
+    fn a_successful_requirement_create_navigates_to_it_even_with_a_prior_selection() {
+        // Regression test: a successful create used to leave `self.editor`
+        // at `EditorState::None` without touching `self.selection` — if
+        // the user already had something selected before opening the
+        // create form, that combination makes `render_center_pane`'s
+        // `Pane::Empty` branch show "Loading…" forever, since nothing was
+        // actually pending.
+        let mut app = test_app();
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
+        let stale_detail_request = app.detail_request.take().unwrap();
+        app.pending.remove(&stale_detail_request);
+
+        app.new_requirement_clicked();
+        let EditorState::NewRequirement(form) = &mut app.editor else {
+            unreachable!()
+        };
+        form.name = "fresh".to_string();
+        form.title = "Fresh".to_string();
+        form.requirement_text = "Some text.".to_string();
+        app.editor_create_clicked();
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = form.pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::AddRequirement(Ok(())),
+        });
+
+        assert!(matches!(app.editor, EditorState::None));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("fresh")))
+        );
+        assert!(app.detail_request.is_some());
+        assert!(app.pending.contains_key(&app.detail_request.unwrap()));
     }
 
     #[test]
@@ -5068,14 +5264,18 @@ mod test {
             request,
             outcome: Outcome::EntryDetail(Some(gui_core::EntryDetail::Requirement {
                 title: "Definition".to_string(),
-                requirement_text: String::new(),
+                requirement_text: "The system shall...".to_string(),
                 requirement_guidance: None,
                 test_guidance: None,
                 dependencies: Vec::new(),
                 attachments: Vec::new(),
                 met_status: gui_core::RequirementMetStatus::Unvalidated,
                 results: Vec::new(),
-                original: Box::new(gui_core::RequirementDraft::new("Definition")),
+                original: {
+                    let mut requirement = gui_core::RequirementDraft::new("Definition");
+                    requirement.requirement_text = "The system shall...".to_string();
+                    Box::new(requirement)
+                },
             })),
         });
     }
@@ -5106,13 +5306,16 @@ mod test {
             request,
             outcome: Outcome::EntryDetail(Some(gui_core::EntryDetail::Test {
                 title: "Smoke".to_string(),
+                test_text: "Text".to_string(),
                 result_kind: gui_core::ResultKindV1::FreeForm,
                 attachments: Vec::new(),
                 template_files: Vec::new(),
-                original: Box::new(gui_core::TestDraft::new(
-                    "Smoke",
-                    gui_core::ResultKindV1::FreeForm,
-                )),
+                original: {
+                    let mut test =
+                        gui_core::TestDraft::new("Smoke", gui_core::ResultKindV1::FreeForm);
+                    test.test_text = "Text".to_string();
+                    Box::new(test)
+                },
             })),
         });
     }
@@ -5886,6 +6089,88 @@ mod test {
     }
 
     #[test]
+    fn picking_a_path_for_an_existing_dependency_also_auto_fetches_its_commit() {
+        let mut app = app_editing_a_requirement();
+        let EditorState::NewRequirement(form) = &mut app.editor else {
+            unreachable!()
+        };
+        form.dependencies.push(DependencyDraft::LocalRequirement {
+            path: String::new(),
+            commit: String::new(),
+        });
+        app.path_picker_dialog_opened(PathPickerTarget::Dependency(DependencySlot::Existing(0)));
+
+        app.path_picker_dialog_selected(LogicalPath::root(disk_entry_name("discovery")));
+
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert_eq!(
+            form.dependencies[0],
+            DependencyDraft::LocalRequirement {
+                path: "/requirements/discovery".to_string(),
+                commit: String::new(),
+            }
+        );
+        // Picking the path queued the same commit fetch "Auto" would have,
+        // without a separate click.
+        assert_eq!(form.pending_commit_fetches.len(), 1);
+        assert_eq!(
+            *form.pending_commit_fetches.values().next().unwrap(),
+            DependencySlot::Existing(0)
+        );
+    }
+
+    #[test]
+    fn picking_a_path_for_the_new_dependency_composer_also_auto_fetches_its_commit() {
+        let mut app = app_editing_a_requirement();
+        app.path_picker_dialog_opened(PathPickerTarget::Dependency(DependencySlot::New));
+
+        app.path_picker_dialog_selected(LogicalPath::root(disk_entry_name("discovery")));
+
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert_eq!(
+            form.new_dependency,
+            DependencyDraft::LocalRequirement {
+                path: "/requirements/discovery".to_string(),
+                commit: String::new(),
+            }
+        );
+        assert_eq!(form.pending_commit_fetches.len(), 1);
+        assert_eq!(
+            *form.pending_commit_fetches.values().next().unwrap(),
+            DependencySlot::New
+        );
+    }
+
+    #[test]
+    fn picking_a_path_for_an_existing_test_reference_also_auto_fetches_its_commit() {
+        let mut app = app_editing_a_requirement();
+        let EditorState::NewRequirement(form) = &mut app.editor else {
+            unreachable!()
+        };
+        form.tests.push(TestRefDraft {
+            path: String::new(),
+            commit: String::new(),
+        });
+        app.path_picker_dialog_opened(PathPickerTarget::TestReference(TestRefSlot::Existing(0)));
+
+        app.path_picker_dialog_selected(LogicalPath::root(disk_entry_name("smoke")));
+
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert_eq!(form.tests[0].path, "/tests/smoke");
+        assert_eq!(form.pending_test_commit_fetches.len(), 1);
+        assert_eq!(
+            *form.pending_test_commit_fetches.values().next().unwrap(),
+            TestRefSlot::Existing(0)
+        );
+    }
+
+    #[test]
     fn local_attachment_add_clicked_does_nothing_for_a_creation_mode_form() {
         let mut app = test_app();
         app.new_requirement_clicked();
@@ -6284,7 +6569,7 @@ mod test {
             dialog.target,
             LogicalPath::root(disk_entry_name("definition"))
         );
-        assert!(dialog.new_name.is_empty());
+        assert_eq!(dialog.new_name, "definition");
         assert!(!dialog.deleted);
         assert!(dialog.pending_request.is_none());
     }
@@ -6325,6 +6610,9 @@ mod test {
     fn recreate_requirement_confirmed_with_an_empty_name_sends_nothing() {
         let mut app = app_editing_a_requirement();
         app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = String::new();
+        }
 
         app.recreate_requirement_confirmed();
 
@@ -6333,6 +6621,45 @@ mod test {
             .as_ref()
             .expect("dialog stays open");
         assert!(dialog.pending_request.is_none());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn recreate_requirement_confirmed_with_the_unchanged_name_sends_nothing() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+
+        app.recreate_requirement_confirmed();
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert!(dialog.pending_request.is_none());
+        assert!(dialog.error.is_some());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn recreate_requirement_confirmed_with_empty_requirement_text_sends_nothing() {
+        let mut app = app_editing_a_requirement();
+        let EditorState::NewRequirement(form) = &mut app.editor else {
+            panic!("expected NewRequirement editor state");
+        };
+        form.requirement_text = "   ".to_string();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+
+        app.recreate_requirement_confirmed();
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert!(dialog.pending_request.is_none());
+        assert!(dialog.error.is_some());
         assert!(app.pending.is_empty());
     }
 
@@ -6523,7 +6850,7 @@ mod test {
             .as_ref()
             .expect("dialog should be open");
         assert_eq!(dialog.target, LogicalPath::root(disk_entry_name("smoke")));
-        assert!(dialog.new_name.is_empty());
+        assert_eq!(dialog.new_name, "smoke");
         assert!(!dialog.deleted);
         assert!(dialog.pending_request.is_none());
     }
@@ -6559,6 +6886,9 @@ mod test {
     fn recreate_test_confirmed_with_an_empty_name_sends_nothing() {
         let mut app = app_editing_a_test();
         app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = String::new();
+        }
 
         app.recreate_test_confirmed();
 
@@ -6567,6 +6897,45 @@ mod test {
             .as_ref()
             .expect("dialog stays open");
         assert!(dialog.pending_request.is_none());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn recreate_test_confirmed_with_the_unchanged_name_sends_nothing() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+
+        app.recreate_test_confirmed();
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert!(dialog.pending_request.is_none());
+        assert!(dialog.error.is_some());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn recreate_test_confirmed_with_empty_test_text_sends_nothing() {
+        let mut app = app_editing_a_test();
+        let EditorState::NewTest(form) = &mut app.editor else {
+            panic!("expected NewTest editor state");
+        };
+        form.test_text = "   ".to_string();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+
+        app.recreate_test_confirmed();
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert!(dialog.pending_request.is_none());
+        assert!(dialog.error.is_some());
         assert!(app.pending.is_empty());
     }
 

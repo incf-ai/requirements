@@ -119,7 +119,7 @@ fn export_test(name: &EntryName, test: &TestDraft) -> TestOnDisk {
             include_attachments_in_commit: test.include_attachments_in_commit,
             include_template_in_commit: test.include_template_in_commit,
         },
-        test_text: String::new(),
+        test_text: test.test_text.clone(),
         attachments: export_pool(&test.attachments),
         template: export_pool(&test.template),
         commit: test.commit.clone(),

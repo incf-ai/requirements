@@ -539,14 +539,7 @@ where
         self.update_in_module(
             request,
             &modules,
-            move |module| {
-                if let std::collections::btree_map::Entry::Occupied(mut e) = module.requirements.entry(name) {
-                    e.insert(*requirement);
-                    Ok(())
-                } else {
-                    Err(UpdateChildError::NotFound)
-                }
-            },
+            move |module| module.update_requirement(&name, *requirement).map_err(UpdateChildError::from),
             Outcome::UpdateRequirement,
         );
     }
@@ -673,14 +666,7 @@ where
         self.update_in_module(
             request,
             &modules,
-            move |module| {
-                if let std::collections::btree_map::Entry::Occupied(mut e) = module.tests.entry(name) {
-                    e.insert(*test);
-                    Ok(())
-                } else {
-                    Err(UpdateChildError::NotFound)
-                }
-            },
+            move |module| module.update_test(&name, *test).map_err(UpdateChildError::from),
             Outcome::UpdateTest,
         );
     }
@@ -1474,10 +1460,12 @@ mod test {
     }
 
     fn add_requirement_command(module: Vec<EntryName>, name: &str, title: &str, request: RequestId) -> Command {
+        let mut requirement = RequirementDraft::new(title);
+        requirement.requirement_text = "Text".to_string();
         Command::AddRequirement {
             module,
             name: entry_name(name),
-            requirement: Box::new(RequirementDraft::new(title)),
+            requirement: Box::new(requirement),
             request,
         }
     }
@@ -1631,6 +1619,7 @@ mod test {
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
         let mut requirement = RequirementDraft::new("Scratch");
+        requirement.requirement_text = "Text".to_string();
         requirement.dependencies.push(disk::DependencyReferenceKind::RequirementReferenceV1(
             disk::LocalGitReference {
                 path: disk::ReferencePath("/requirements/design".to_string()),
@@ -1790,6 +1779,7 @@ mod test {
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
         let mut broken = RequirementDraft::new("Broken");
+        broken.requirement_text = "Text".to_string();
         broken.tests.push(TestReferenceKind::TestReferenceV1(LocalGitReference {
             path: ReferencePath("/tests/does_not_exist".to_string()),
             commit: "deadbeef".to_string(),
@@ -2385,11 +2375,13 @@ mod test {
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
+        let mut scratch_test = logical::draft::TestDraft::new("Scratch Test", disk::ResultKindV1::FreeForm);
+        scratch_test.test_text = "Text".to_string();
         commands
             .send(Command::AddTest {
                 module: vec![],
                 name: entry_name("scratch_test"),
-                test: Box::new(logical::draft::TestDraft::new("Scratch Test", disk::ResultKindV1::FreeForm)),
+                test: Box::new(scratch_test),
                 request: 2,
             })
             .unwrap();
@@ -2485,10 +2477,12 @@ mod test {
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
 
+        let mut updated_requirement = RequirementDraft::new("Updated");
+        updated_requirement.requirement_text = "Updated text".to_string();
         commands
             .send(Command::UpdateRequirement {
                 target: LogicalPath::root(entry_name("scratch")),
-                requirement: Box::new(RequirementDraft::new("Updated")),
+                requirement: Box::new(updated_requirement),
                 request: 3,
             })
             .unwrap();
@@ -2521,10 +2515,12 @@ mod test {
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
+        let mut updated_requirement = RequirementDraft::new("Updated");
+        updated_requirement.requirement_text = "Updated text".to_string();
         commands
             .send(Command::UpdateRequirement {
                 target: LogicalPath::root(entry_name("does_not_exist")),
-                requirement: Box::new(RequirementDraft::new("Updated")),
+                requirement: Box::new(updated_requirement),
                 request: 2,
             })
             .unwrap();
@@ -2679,20 +2675,24 @@ mod test {
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
+        let mut original_test = logical::draft::TestDraft::new("Original", disk::ResultKindV1::FreeForm);
+        original_test.test_text = "Text".to_string();
         commands
             .send(Command::AddTest {
                 module: vec![],
                 name: entry_name("scratch_test"),
-                test: Box::new(logical::draft::TestDraft::new("Original", disk::ResultKindV1::FreeForm)),
+                test: Box::new(original_test),
                 request: 2,
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddTest(Ok(()))));
 
+        let mut updated_test = logical::draft::TestDraft::new("Updated", disk::ResultKindV1::Template);
+        updated_test.test_text = "Updated text".to_string();
         commands
             .send(Command::UpdateTest {
                 target: LogicalPath::root(entry_name("scratch_test")),
-                test: Box::new(logical::draft::TestDraft::new("Updated", disk::ResultKindV1::Template)),
+                test: Box::new(updated_test),
                 request: 3,
             })
             .unwrap();

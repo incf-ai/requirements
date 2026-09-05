@@ -33,6 +33,39 @@ pub enum AddNamedChildError {
     InvalidName(#[from] InvalidNameError),
     #[error("`{0}` already exists")]
     AlreadyExists(EntryName),
+    #[error("{0} must not be empty")]
+    EmptyText(&'static str),
+}
+
+/// Mirrors `AddNamedChildError`'s "one error type shared across every
+/// sibling operation" reasoning, but for `update_requirement`/
+/// `update_test`: the name isn't changing (so no `InvalidName`/
+/// `AlreadyExists`), just whether the entry exists to update, plus the
+/// same main-text-must-not-be-empty rule `add_requirement`/`add_test`
+/// enforce — see those methods' own doc comments.
+#[derive(Debug, Error)]
+pub enum UpdateNamedChildError {
+    #[error("no entry with that name exists yet — use add instead")]
+    NotFound,
+    #[error("{0} must not be empty")]
+    EmptyText(&'static str),
+}
+
+/// Turns a sanitized entry name like `foo_bar_baz` into a human display
+/// title, `Foo Bar Baz` — underscores become spaces, each word capitalized.
+/// Used to autopopulate an empty title when adding a requirement/test.
+fn title_case_from_name(name: &str) -> String {
+    name.split('_')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn add_named<T>(
@@ -57,11 +90,20 @@ impl ModuleDraft {
         self.modules.remove(&EntryName(name.to_string()))
     }
 
+    /// Refuses an empty `requirement_text` (there's nothing to check
+    /// against) and autopopulates an empty `title` from `name` (title
+    /// case, underscores removed) rather than saving a blank one.
     pub fn add_requirement(
         &mut self,
         name: &str,
-        requirement: RequirementDraft,
+        mut requirement: RequirementDraft,
     ) -> Result<(), AddNamedChildError> {
+        if requirement.requirement_text.trim().is_empty() {
+            return Err(AddNamedChildError::EmptyText("requirement text"));
+        }
+        if requirement.title.trim().is_empty() {
+            requirement.title = title_case_from_name(name);
+        }
         add_named(&mut self.requirements, name, requirement)
     }
 
@@ -69,12 +111,62 @@ impl ModuleDraft {
         self.requirements.remove(&EntryName(name.to_string()))
     }
 
-    pub fn add_test(&mut self, name: &str, test: TestDraft) -> Result<(), AddNamedChildError> {
+    /// See `add_requirement`'s doc comment — same empty-text refusal and
+    /// title autopopulation apply to editing an existing requirement, not
+    /// just creating one.
+    pub fn update_requirement(
+        &mut self,
+        name: &EntryName,
+        mut requirement: RequirementDraft,
+    ) -> Result<(), UpdateNamedChildError> {
+        if requirement.requirement_text.trim().is_empty() {
+            return Err(UpdateNamedChildError::EmptyText("requirement text"));
+        }
+        if requirement.title.trim().is_empty() {
+            requirement.title = title_case_from_name(name.as_str());
+        }
+        match self.requirements.entry(name.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                e.insert(requirement);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Vacant(_) => Err(UpdateNamedChildError::NotFound),
+        }
+    }
+
+    /// See `add_requirement`'s doc comment — same empty-text refusal and
+    /// title autopopulation, against `test_text` instead of
+    /// `requirement_text`.
+    pub fn add_test(&mut self, name: &str, mut test: TestDraft) -> Result<(), AddNamedChildError> {
+        if test.test_text.trim().is_empty() {
+            return Err(AddNamedChildError::EmptyText("test text"));
+        }
+        if test.title.trim().is_empty() {
+            test.title = title_case_from_name(name);
+        }
         add_named(&mut self.tests, name, test)
     }
 
     pub fn remove_test(&mut self, name: &str) -> Option<TestDraft> {
         self.tests.remove(&EntryName(name.to_string()))
+    }
+
+    /// See `update_requirement`'s doc comment — same idea, against
+    /// `test_text` instead of `requirement_text`.
+    pub fn update_test(&mut self, name: &EntryName, mut test: TestDraft) -> Result<(), UpdateNamedChildError> {
+        if test.test_text.trim().is_empty() {
+            return Err(UpdateNamedChildError::EmptyText("test text"));
+        }
+        if test.title.trim().is_empty() {
+            test.title = title_case_from_name(name.as_str());
+        }
+        match self.tests.entry(name.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                e.insert(test);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Vacant(_) => Err(UpdateNamedChildError::NotFound),
+        }
     }
 
     pub fn add_result(
@@ -110,6 +202,18 @@ impl ModuleDraft {
 mod test {
     use super::*;
     use disk::ResultKindV1;
+
+    fn requirement_draft(title: &str) -> RequirementDraft {
+        let mut requirement = RequirementDraft::new(title);
+        requirement.requirement_text = "Text".to_string();
+        requirement
+    }
+
+    fn test_draft(title: &str) -> TestDraft {
+        let mut test = TestDraft::new(title, ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
+        test
+    }
 
     #[test]
     fn add_module_then_remove_round_trips() {
@@ -149,7 +253,7 @@ mod test {
     fn add_requirement_then_remove_round_trips() {
         let mut module = ModuleDraft::default();
         module
-            .add_requirement("definition", RequirementDraft::new("Definition"))
+            .add_requirement("definition", requirement_draft("Definition"))
             .unwrap();
         assert!(module.remove_requirement("definition").is_some());
     }
@@ -158,12 +262,64 @@ mod test {
     fn add_test_then_remove_round_trips() {
         let mut module = ModuleDraft::default();
         module
+            .add_test("generic_test", test_draft("Generic Test"))
+            .unwrap();
+        assert!(module.remove_test("generic_test").is_some());
+    }
+
+    #[test]
+    fn add_requirement_rejects_empty_requirement_text() {
+        let mut module = ModuleDraft::default();
+        let err = module
+            .add_requirement("definition", RequirementDraft::new("Definition"))
+            .unwrap_err();
+        assert!(matches!(err, AddNamedChildError::EmptyText("requirement text")));
+        assert!(module.requirements.is_empty());
+    }
+
+    #[test]
+    fn add_requirement_autopopulates_an_empty_title_from_the_name() {
+        let mut module = ModuleDraft::default();
+        module
+            .add_requirement("some_definition", requirement_draft(""))
+            .unwrap();
+        assert_eq!(
+            module
+                .requirements
+                .get(&EntryName("some_definition".to_string()))
+                .unwrap()
+                .title,
+            "Some Definition"
+        );
+    }
+
+    #[test]
+    fn add_test_rejects_empty_test_text() {
+        let mut module = ModuleDraft::default();
+        let err = module
             .add_test(
                 "generic_test",
                 TestDraft::new("Generic Test", ResultKindV1::FreeForm),
             )
+            .unwrap_err();
+        assert!(matches!(err, AddNamedChildError::EmptyText("test text")));
+        assert!(module.tests.is_empty());
+    }
+
+    #[test]
+    fn add_test_autopopulates_an_empty_title_from_the_name() {
+        let mut module = ModuleDraft::default();
+        module
+            .add_test("some_test", test_draft(""))
             .unwrap();
-        assert!(module.remove_test("generic_test").is_some());
+        assert_eq!(
+            module
+                .tests
+                .get(&EntryName("some_test".to_string()))
+                .unwrap()
+                .title,
+            "Some Test"
+        );
     }
 
     #[test]
@@ -194,10 +350,10 @@ mod test {
     fn add_requirement_rejects_a_duplicate_name() {
         let mut module = ModuleDraft::default();
         module
-            .add_requirement("definition", RequirementDraft::new("Definition"))
+            .add_requirement("definition", requirement_draft("Definition"))
             .unwrap();
         let err = module
-            .add_requirement("definition", RequirementDraft::new("Definition"))
+            .add_requirement("definition", requirement_draft("Definition"))
             .unwrap_err();
         assert!(matches!(err, AddNamedChildError::AlreadyExists(_)));
     }
@@ -206,16 +362,10 @@ mod test {
     fn add_test_rejects_a_duplicate_name() {
         let mut module = ModuleDraft::default();
         module
-            .add_test(
-                "generic_test",
-                TestDraft::new("Generic Test", ResultKindV1::FreeForm),
-            )
+            .add_test("generic_test", test_draft("Generic Test"))
             .unwrap();
         let err = module
-            .add_test(
-                "generic_test",
-                TestDraft::new("Generic Test", ResultKindV1::FreeForm),
-            )
+            .add_test("generic_test", test_draft("Generic Test"))
             .unwrap_err();
         assert!(matches!(err, AddNamedChildError::AlreadyExists(_)));
     }

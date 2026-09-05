@@ -97,6 +97,7 @@ fn import_test(test: TestOnDisk) -> TestDraft {
 
     TestDraft {
         title: definition.title,
+        test_text: test.test_text,
         result_kind: definition.result_kind,
         attachments: attachment_paths(test.attachments),
         attachment_refs,

@@ -413,6 +413,7 @@ mod test {
         let mut project = create_project("Capstone");
 
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -426,6 +427,7 @@ mod test {
             .unwrap();
 
         let mut test = TestDraft::new("Generic Test", ResultKindV1::FreeForm);
+        test.test_text = "Text".to_string();
         test.commit = Some("t1".to_string());
         project.tree.add_test("generic_test", test).unwrap();
 
@@ -456,6 +458,7 @@ mod test {
     fn reports_an_unresolved_test_reference() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -483,6 +486,7 @@ mod test {
     fn reports_a_malformed_dependency_reference_path() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -511,6 +515,7 @@ mod test {
     fn reports_a_malformed_reference_path() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -538,6 +543,7 @@ mod test {
         let mut project = create_project("Capstone");
         for name in ["a", "b"] {
             let mut requirement = RequirementDraft::new(name);
+            requirement.requirement_text = "Text".to_string();
             requirement.commit = Some("c1".to_string());
             requirement
                 .dependencies
@@ -567,6 +573,7 @@ mod test {
         let mut project = create_project("Capstone");
         for (name, target) in [("a", "b"), ("b", "a")] {
             let mut requirement = RequirementDraft::new(name);
+            requirement.requirement_text = "Text".to_string();
             requirement.commit = Some("c1".to_string());
             requirement
                 .dependencies
@@ -591,6 +598,7 @@ mod test {
     fn a_submodules_dependency_never_needs_resolution() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -607,6 +615,7 @@ mod test {
     fn a_resolvable_remote_dependency_is_accepted() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -632,6 +641,7 @@ mod test {
         // `path: None`.
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -667,6 +677,7 @@ mod test {
     fn reports_a_failing_remote_dependency() {
         let mut project = create_project("Capstone");
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .dependencies
@@ -874,6 +885,7 @@ mod test {
         let mut project = create_project("Capstone");
 
         let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
         requirement.commit = Some("c1".to_string());
         requirement
             .tests
@@ -889,6 +901,7 @@ mod test {
         project.tree.add_template(Path::new("shared.typ")).unwrap();
 
         let mut test = TestDraft::new("Generic Test", ResultKindV1::Template);
+        test.test_text = "Text".to_string();
         test.commit = Some("t1".to_string());
         test.add_template_file(Path::new("spec.typ")).unwrap();
         test.template_refs
@@ -1010,6 +1023,7 @@ mod test {
             .unwrap();
 
         let mut requirement_a = RequirementDraft::new("A");
+        requirement_a.requirement_text = "Text".to_string();
         requirement_a.commit = Some("c1".to_string());
         requirement_a
             .dependencies
@@ -1022,6 +1036,7 @@ mod test {
         submodule.add_requirement("a", requirement_a).unwrap();
 
         let mut requirement_b = RequirementDraft::new("B");
+        requirement_b.requirement_text = "Text".to_string();
         requirement_b.commit = Some("c1".to_string());
         submodule.add_requirement("b", requirement_b).unwrap();
 

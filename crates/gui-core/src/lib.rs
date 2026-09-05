@@ -525,6 +525,17 @@ pub enum UpdateChildError {
     ModuleNotFound,
     #[error("no entry with that name exists yet — use add instead")]
     NotFound,
+    #[error("{0} must not be empty")]
+    EmptyText(&'static str),
+}
+
+impl From<logical::draft::UpdateNamedChildError> for UpdateChildError {
+    fn from(err: logical::draft::UpdateNamedChildError) -> Self {
+        match err {
+            logical::draft::UpdateNamedChildError::NotFound => UpdateChildError::NotFound,
+            logical::draft::UpdateNamedChildError::EmptyText(field) => UpdateChildError::EmptyText(field),
+        }
+    }
 }
 
 /// `rename_module`'s own error type, not shared with anything else —
@@ -658,6 +669,7 @@ pub enum EntryDetail {
     },
     Test {
         title: String,
+        test_text: String,
         result_kind: ResultKindV1,
         attachments: Vec<PathBuf>,
         /// Distinct from `attachments` — see `Command::AddTestTemplateFile`'s
