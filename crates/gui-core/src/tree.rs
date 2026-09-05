@@ -148,6 +148,7 @@ pub(crate) fn get_entry_detail(state: &ProjectState, target: &LogicalPath, kind:
             dependencies: requirement.dependencies.clone(),
             attachments: requirement.attachments.iter().cloned().collect(),
             met_status: requirement_met_status(state, target),
+            results: logical::results_for_requirement(&draft.tree, target),
             original: Box::new(requirement.clone()),
         }),
         EntryKind::Test => module.tests.get(&target.name).map(|test| EntryDetail::Test {

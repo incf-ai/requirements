@@ -112,7 +112,7 @@ mod test {
             test_text: String::new(),
             attachments: Vec::new(),
             template: Vec::new(),
-            commit: "deadbeef".to_string(),
+            commit: Some("deadbeef".to_string()),
         }
     }
 

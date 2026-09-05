@@ -230,6 +230,20 @@ pub trait Git {
     fn init_repository(&self, _dir: &Path) -> Result<(), InitRepositoryError> {
         Ok(())
     }
+
+    /// Every path under `dir` that a `commit_all` would sweep up right
+    /// now — staged, unstaged, and untracked — as paths relative to
+    /// `dir` (so callers get something directly displayable/sortable
+    /// without stripping a repo-root prefix themselves). Order is
+    /// whatever `git status` happens to emit; callers that want a
+    /// specific order (e.g. shallow-paths-first) sort it themselves.
+    fn changed_paths(&self, dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError>;
+
+    /// Stages every change under `dir` (`git add -A`) and commits it with
+    /// `message` (`git commit -m`). Fails as `NothingToCommit` rather than
+    /// letting `git commit` itself error, so callers can distinguish "the
+    /// repo really has nothing pending" from a genuine git failure.
+    fn commit_all(&self, dir: &Path, message: &str) -> Result<(), CommitAllError>;
 }
 
 #[derive(Debug, Error)]
@@ -256,6 +270,30 @@ pub enum InitRepositoryError {
     CommandFailed { status: ExitStatus, stderr: String },
 }
 
+#[derive(Debug, Error)]
+pub enum ChangedPathsError {
+    #[error("failed to run git: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("git exited with {status}: {stderr}")]
+    CommandFailed { status: ExitStatus, stderr: String },
+}
+
+#[derive(Debug, Error)]
+pub enum CommitAllError {
+    #[error("failed to run git: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("git exited with {status}: {stderr}")]
+    CommandFailed { status: ExitStatus, stderr: String },
+    #[error("nothing to commit")]
+    NothingToCommit,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemGit;
 
@@ -270,6 +308,27 @@ impl Git for SystemGit {
         } else {
             path.parent().unwrap_or(path)
         };
+
+        // A repository with no commits at all (an "unborn" branch) has no
+        // HEAD for `git log` to walk, so it fails outright rather than
+        // reporting an empty match — check for that case first (but only
+        // inside an actual repository, so a path outside any repo still
+        // reports `CommandFailed`) and treat it the same as "no commit
+        // touches this path".
+        if self.is_repository(cwd) {
+            let head_exists = Command::new("git")
+                .current_dir(cwd)
+                .args(["rev-parse", "--verify", "-q", "HEAD"])
+                .output()
+                .map_err(|source| CommitForPathError::Spawn { source })?
+                .status
+                .success();
+            if !head_exists {
+                return Err(CommitForPathError::NotTracked {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
 
         let mut command = Command::new("git");
         command
@@ -327,6 +386,69 @@ impl Git for SystemGit {
 
         Ok(())
     }
+
+    fn changed_paths(&self, dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()
+            .map_err(|source| ChangedPathsError::Spawn { source })?;
+
+        if !output.status.success() {
+            return Err(ChangedPathsError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let paths = stdout
+            .lines()
+            .filter_map(|line| {
+                // Each line is "XY <path>" or, for a detected rename,
+                // "XY <old> -> <new>" — the status codes always occupy the
+                // first two columns followed by a space, per `git status
+                // --porcelain`'s documented (stable) format.
+                let rest = line.get(3..)?;
+                let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+                Some(PathBuf::from(path))
+            })
+            .collect();
+
+        Ok(paths)
+    }
+
+    fn commit_all(&self, dir: &Path, message: &str) -> Result<(), CommitAllError> {
+        if self.changed_paths(dir).map_or(true, |paths| paths.is_empty()) {
+            return Err(CommitAllError::NothingToCommit);
+        }
+
+        let add_output = Command::new("git")
+            .current_dir(dir)
+            .args(["add", "-A"])
+            .output()
+            .map_err(|source| CommitAllError::Spawn { source })?;
+        if !add_output.status.success() {
+            return Err(CommitAllError::CommandFailed {
+                status: add_output.status,
+                stderr: String::from_utf8_lossy(&add_output.stderr).into_owned(),
+            });
+        }
+
+        let commit_output = Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-m", message])
+            .output()
+            .map_err(|source| CommitAllError::Spawn { source })?;
+        if !commit_output.status.success() {
+            return Err(CommitAllError::CommandFailed {
+                status: commit_output.status,
+                stderr: String::from_utf8_lossy(&commit_output.stderr).into_owned(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 /// Wraps another `Git`, letting tests force `commit_for_path` on specific
@@ -367,6 +489,14 @@ impl<G: Git> Git for FaultInjectingGit<G> {
             });
         }
         self.inner.commit_for_path_excluding(path, excludes)
+    }
+
+    fn changed_paths(&self, dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+        self.inner.changed_paths(dir)
+    }
+
+    fn commit_all(&self, dir: &Path, message: &str) -> Result<(), CommitAllError> {
+        self.inner.commit_all(dir, message)
     }
 }
 
@@ -786,6 +916,88 @@ mod tests {
             .commit_for_path(&dir.join("untracked.txt"))
             .unwrap_err();
         assert!(matches!(err, CommitForPathError::NotTracked { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_reports_not_tracked_for_a_repo_with_no_commits_at_all() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-git-unborn-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = Command::new("git")
+            .current_dir(&dir)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(dir.join("file.txt"), "hello").unwrap();
+
+        let err = SystemGit.commit_for_path(&dir.join("file.txt")).unwrap_err();
+        assert!(matches!(err, CommitForPathError::NotTracked { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changed_paths_reports_nothing_in_a_clean_repo() {
+        let dir = scratch_git_repo("changed-paths-clean");
+
+        assert_eq!(SystemGit.changed_paths(&dir).unwrap(), Vec::<PathBuf>::new());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changed_paths_reports_modified_and_untracked_paths() {
+        let dir = scratch_git_repo("changed-paths-mixed");
+        std::fs::write(dir.join("tracked.txt"), "modified").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/new.txt"), "new").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "untracked").unwrap();
+
+        let mut paths = SystemGit.changed_paths(&dir).unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("sub/new.txt"),
+                PathBuf::from("tracked.txt"),
+                PathBuf::from("untracked.txt"),
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_all_reports_nothing_to_commit_in_a_clean_repo() {
+        let dir = scratch_git_repo("commit-all-clean");
+
+        let err = SystemGit.commit_all(&dir, "nothing pending").unwrap_err();
+        assert!(matches!(err, CommitAllError::NothingToCommit));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_all_stages_and_commits_every_pending_change() {
+        let dir = scratch_git_repo("commit-all-mixed");
+        std::fs::write(dir.join("tracked.txt"), "modified").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "untracked").unwrap();
+
+        SystemGit.commit_all(&dir, "commit everything").unwrap();
+
+        assert_eq!(SystemGit.changed_paths(&dir).unwrap(), Vec::<PathBuf>::new());
+        let log = Command::new("git")
+            .current_dir(&dir)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "commit everything");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

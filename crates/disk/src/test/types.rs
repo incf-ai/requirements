@@ -99,6 +99,8 @@ pub struct TestOnDisk {
     /// subfolders, resolved via `syscalls::Git::commit_for_path_excluding`
     /// at load time — not persisted in `test.ron`. Excludes `attachments/`
     /// and/or `template/` when `definition.include_attachments_in_commit`/
-    /// `definition.include_template_in_commit` is `false`.
-    pub commit: String,
+    /// `definition.include_template_in_commit` is `false`. `None` if the
+    /// folder has never been committed (e.g. just saved by the GUI and not
+    /// yet committed).
+    pub commit: Option<String>,
 }

@@ -293,6 +293,45 @@ impl ValidatedProject {
     }
 }
 
+/// One result whose `requirement_path` resolves to a given requirement —
+/// backs the read-only requirement viewer's own "Results" list. Unlike
+/// `requirement_unmet_reason`'s `NoPassingResult` check, this doesn't
+/// filter on currency or `status`: every result referencing the
+/// requirement is included, current or historical, passing or not, so the
+/// viewer can show the requirement's full result history rather than just
+/// today's verdict.
+#[derive(Debug, Clone)]
+pub struct RequirementResult {
+    pub path: LogicalPath,
+    pub title: String,
+    pub status: StatusV1,
+}
+
+/// Every result anywhere in `tree` whose `requirement_path` resolves
+/// (relative to that result's own module) to `requirement`. A free
+/// function over the raw `ModuleDraft` tree, not a `ValidatedProject`
+/// method — listing existing results doesn't depend on the currency
+/// checks validation exists for, only on `parse_reference_path`, which is
+/// private to this crate and so must be called from here.
+pub fn results_for_requirement(tree: &ModuleDraft, requirement: &LogicalPath) -> Vec<RequirementResult> {
+    collect_results(tree, &[])
+        .into_iter()
+        .filter_map(|(result_path, result)| {
+            let resolved =
+                parse_reference_path(&result.requirement_path, &result_path.modules, "requirements").ok()?;
+            if &resolved == requirement {
+                Some(RequirementResult {
+                    path: result_path,
+                    title: result.title.clone(),
+                    status: result.status.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn result_satisfies(
     result: &ResultDraft,

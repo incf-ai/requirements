@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gui_core::{
-    Command, DependencyReferenceKind, EntryName, LocalGitReference, LogicalPath, ReferencePath, RemoteGitReference,
-    RequestId, RequirementDraft, ResultDraft, ResultKindV1, TestDraft,
+    Command, DependencyReferenceKind, EntryName, LocalGitReference, LogicalPath, ReferencePath,
+    RemoteGitReference, RequestId, RequirementDraft, ResultDraft, ResultKindV1, TestDraft,
+    TestReferenceKind,
 };
 
 fn non_empty(text: &str) -> Option<String> {
@@ -45,7 +46,11 @@ pub enum DependencyDraft {
     /// remote repository's own root), same as the on-disk `Option`
     /// collapsing to an empty field here — see `RemoteGitReference`'s own
     /// doc comment on what an absent path means.
-    Remote { url: String, path: String, commit: String },
+    Remote {
+        url: String,
+        path: String,
+        commit: String,
+    },
     /// The bare `Submodules` variant — no fields, satisfied when every
     /// requirement in the current module's entire submodule subtree is
     /// met (see `logical`'s README on "Validation questions — answered").
@@ -55,10 +60,12 @@ pub enum DependencyDraft {
 impl DependencyDraft {
     pub fn from_core(kind: DependencyReferenceKind) -> DependencyDraft {
         match kind {
-            DependencyReferenceKind::RequirementReferenceV1(local) => DependencyDraft::LocalRequirement {
-                path: local.path.0,
-                commit: local.commit,
-            },
+            DependencyReferenceKind::RequirementReferenceV1(local) => {
+                DependencyDraft::LocalRequirement {
+                    path: local.path.0,
+                    commit: local.commit,
+                }
+            }
             DependencyReferenceKind::RemoteReferenceV1(remote) => DependencyDraft::Remote {
                 url: remote.url,
                 path: remote.path.map(|p| p.0).unwrap_or_default(),
@@ -79,7 +86,11 @@ impl DependencyDraft {
             DependencyDraft::Remote { url, path, commit } => {
                 DependencyReferenceKind::RemoteReferenceV1(RemoteGitReference {
                     url: url.clone(),
-                    path: if path.trim().is_empty() { None } else { Some(ReferencePath(path.clone())) },
+                    path: if path.trim().is_empty() {
+                        None
+                    } else {
+                        Some(ReferencePath(path.clone()))
+                    },
                     commit: commit.clone(),
                 })
             }
@@ -104,7 +115,9 @@ impl std::fmt::Display for DependencyDraft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DependencyDraft::LocalRequirement { path, commit } => write!(f, "{path} @ {commit}"),
-            DependencyDraft::Remote { url, path, commit } if path.is_empty() => write!(f, "{url} @ {commit}"),
+            DependencyDraft::Remote { url, path, commit } if path.is_empty() => {
+                write!(f, "{url} @ {commit}")
+            }
             DependencyDraft::Remote { url, path, commit } => write!(f, "{url}{path} @ {commit}"),
             DependencyDraft::Submodules => write!(f, "Submodules (all submodules must be met)"),
         }
@@ -137,7 +150,59 @@ pub enum AutoCommitKind {
     /// `render_dependency_fields`'s doc comment on why this can fail
     /// silently (no matching entry, or no tree loaded yet).
     Local(LogicalPath),
-    Remote { url: String, path: Option<ReferencePath> },
+    Remote {
+        url: String,
+        path: Option<ReferencePath>,
+    },
+}
+
+/// A requirement's `test`/`tests` field, one entry per test reference, in
+/// the plain-`String`-fields shape `egui`'s text widgets need — converted
+/// to/from `gui_core::TestReferenceKind` at the form's edges (`from_core`/
+/// `to_core`), never held as the wire type itself. Same "plain local form
+/// state, submitted whole via `Command::UpdateRequirement`/`AddRequirement`
+/// on Save — no per-item round trip" reasoning as `DependencyDraft`.
+/// `TestReferenceKind` has only one variant (`TestReferenceV1`, a local
+/// git reference), so unlike `DependencyDraft` there's no kind to pick —
+/// just a path and a pinned commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TestRefDraft {
+    pub path: String,
+    pub commit: String,
+}
+
+impl TestRefDraft {
+    pub fn from_core(kind: TestReferenceKind) -> TestRefDraft {
+        let TestReferenceKind::TestReferenceV1(local) = kind;
+        TestRefDraft {
+            path: local.path.0,
+            commit: local.commit,
+        }
+    }
+
+    pub fn to_core(&self) -> TestReferenceKind {
+        TestReferenceKind::TestReferenceV1(LocalGitReference {
+            path: ReferencePath(self.path.clone()),
+            commit: self.commit.clone(),
+        })
+    }
+}
+
+impl std::fmt::Display for TestRefDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} @ {}", self.path, self.commit)
+    }
+}
+
+/// Identifies one of a `RequirementFormState`'s test-reference slots — an
+/// existing `tests[index]` row, or the "Add test reference" composer's own
+/// `new_test_ref`. Same role as `DependencySlot`, kept as its own type
+/// since it keys a distinct map (`pending_test_commit_fetches`) and a
+/// distinct `PathPickerTarget` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestRefSlot {
+    Existing(usize),
+    New,
 }
 
 #[derive(Debug)]
@@ -152,7 +217,7 @@ pub struct RequirementFormState {
     /// (plus `attachments`, kept in sync separately — see that field's
     /// own doc comment) rather than building a bare `RequirementDraft::new(...)`
     /// from scratch, so an `UpdateRequirement` round-trips every field
-    /// this form has no UI for (`tests`, `attachment_refs`,
+    /// this form has no UI for (`attachment_refs`,
     /// `include_attachments_in_commit`, `commit`) instead of silently
     /// resetting them — `Command::UpdateRequirement`'s own doc comment
     /// on being a wholesale replace, not a merge, is exactly why this
@@ -197,6 +262,13 @@ pub struct RequirementFormState {
     /// `dependencies` and reset to `DependencyDraft::default()` when
     /// "Add dependency" is clicked.
     pub new_dependency: DependencyDraft,
+    /// This requirement's `test`/`tests` field — see `TestRefDraft`'s own
+    /// doc comment.
+    pub tests: Vec<TestRefDraft>,
+    /// The "Add test reference" composer's in-progress entry — pushed onto
+    /// `tests` and reset to `TestRefDraft::default()` when "Add test
+    /// reference" is clicked.
+    pub new_test_ref: TestRefDraft,
     /// This requirement's own local attachment pool — empty for a
     /// creation-mode form (there's no entry yet to attach anything to;
     /// `Command::AddRequirementAttachment` requires one to already exist),
@@ -218,6 +290,20 @@ pub struct RequirementFormState {
     /// dependency-scoped action that shouldn't read as "the whole form
     /// failed to save."
     pub commit_fetch_error: Option<String>,
+    /// Same as `pending_commit_fetches`, but for `tests[index]`/
+    /// `new_test_ref`'s own "Auto" button — kept as a separate map since a
+    /// test reference's commit resolves against `EntryKind::Test`, not
+    /// `EntryKind::Requirement`, and shares no slot type with dependencies.
+    pub pending_test_commit_fetches: HashMap<RequestId, TestRefSlot>,
+    /// Same as `commit_fetch_error`, but for a failed test-reference commit
+    /// fetch.
+    pub test_commit_fetch_error: Option<String>,
+    /// Every result anywhere in the project that references this
+    /// requirement — read-only display data, straight from
+    /// `EntryDetail::Requirement`'s own `results` field; never edited by
+    /// this form and not part of `build_command`'s payload. Empty for a
+    /// create-mode form (nothing saved yet to reference).
+    pub results: Vec<gui_core::RequirementResult>,
 }
 
 impl Default for RequirementFormState {
@@ -237,32 +323,30 @@ impl Default for RequirementFormState {
             error: None,
             dependencies: Vec::new(),
             new_dependency: DependencyDraft::default(),
+            tests: Vec::new(),
+            new_test_ref: TestRefDraft::default(),
             attachments: Vec::new(),
             new_attachment_path: String::new(),
             local_pool_error: None,
             pending_commit_fetches: HashMap::new(),
             commit_fetch_error: None,
+            pending_test_commit_fetches: HashMap::new(),
+            test_commit_fetch_error: None,
+            results: Vec::new(),
         }
     }
 }
 
 impl RequirementFormState {
     /// Starts from `self.original` — everything this form has no field
-    /// for (`tests`, `attachment_refs`, `include_attachments_in_commit`,
-    /// `commit`) rides along unchanged — and overlays only what's
-    /// actually editable here. See `original`'s own doc comment.
+    /// for (`attachment_refs`, `include_attachments_in_commit`, `commit`)
+    /// rides along unchanged — and overlays only what's actually editable
+    /// here. See `original`'s own doc comment. Also the basis for the
+    /// "Recreate" flow (`GuiApp::recreate_requirement_clicked`), which
+    /// needs this same live-edited snapshot rather than bare `original` —
+    /// see `current_contents`.
     pub fn build_command(&self, module: Vec<EntryName>, request: RequestId) -> Command {
-        let mut requirement = (*self.original).clone();
-        requirement.title = self.title.clone();
-        requirement.requirement_text = self.requirement_text.clone();
-        requirement.requirement_guidance = non_empty(&self.requirement_guidance);
-        requirement.test_guidance = non_empty(&self.test_guidance);
-        requirement.dependencies = self.dependencies.iter().map(DependencyDraft::to_core).collect();
-        // `self.original.attachments` reflects the pool as of the last
-        // `GetEntryDetail`, not necessarily now — `self.attachments` is
-        // the one `apply_local_pool_change` keeps live, so that's the
-        // one to send.
-        requirement.attachments = self.attachments.iter().cloned().collect();
+        let requirement = self.current_contents();
         match &self.editing_target {
             Some(target) => Command::UpdateRequirement {
                 target: target.clone(),
@@ -276,6 +360,31 @@ impl RequirementFormState {
                 request,
             },
         }
+    }
+
+    /// `self.original` overlaid with every live-editable field — what
+    /// `build_command` sends, minus the `Command` wrapping. Also used by
+    /// `GuiApp::recreate_requirement_clicked`, which needs this form's
+    /// current (possibly unsaved) contents rather than the possibly-stale
+    /// `original` it used to send directly.
+    pub fn current_contents(&self) -> RequirementDraft {
+        let mut requirement = (*self.original).clone();
+        requirement.title = self.title.clone();
+        requirement.requirement_text = self.requirement_text.clone();
+        requirement.requirement_guidance = non_empty(&self.requirement_guidance);
+        requirement.test_guidance = non_empty(&self.test_guidance);
+        requirement.dependencies = self
+            .dependencies
+            .iter()
+            .map(DependencyDraft::to_core)
+            .collect();
+        requirement.tests = self.tests.iter().map(TestRefDraft::to_core).collect();
+        // `self.original.attachments` reflects the pool as of the last
+        // `GetEntryDetail`, not necessarily now — `self.attachments` is
+        // the one `apply_local_pool_change` keeps live, so that's the
+        // one to send.
+        requirement.attachments = self.attachments.iter().cloned().collect();
+        requirement
     }
 }
 
@@ -329,13 +438,7 @@ impl Default for TestFormState {
 
 impl TestFormState {
     pub fn build_command(&self, module: Vec<EntryName>, request: RequestId) -> Command {
-        let mut test = (*self.original).clone();
-        test.title = self.title.clone();
-        test.result_kind = self.result_kind.clone();
-        // Same "the form's own live-synced copy, not `original`'s
-        // possibly-stale one" reasoning as `RequirementFormState::build_command`.
-        test.attachments = self.attachments.iter().cloned().collect();
-        test.template = self.template_files.iter().cloned().collect();
+        let test = self.current_contents();
         match &self.editing_target {
             Some(target) => Command::UpdateTest {
                 target: target.clone(),
@@ -349,6 +452,19 @@ impl TestFormState {
                 request,
             },
         }
+    }
+
+    /// See `RequirementFormState::current_contents`'s doc comment — same
+    /// "live-edited snapshot, also used by the Recreate flow" reasoning.
+    pub fn current_contents(&self) -> TestDraft {
+        let mut test = (*self.original).clone();
+        test.title = self.title.clone();
+        test.result_kind = self.result_kind.clone();
+        // Same "the form's own live-synced copy, not `original`'s
+        // possibly-stale one" reasoning as `RequirementFormState::build_command`.
+        test.attachments = self.attachments.iter().cloned().collect();
+        test.template = self.template_files.iter().cloned().collect();
+        test
     }
 }
 
@@ -556,7 +672,10 @@ mod test {
         let DependencyReferenceKind::RemoteReferenceV1(remote) = draft.to_core() else {
             panic!("expected RemoteReferenceV1");
         };
-        assert_eq!(remote.path.map(|p| p.0), Some("/requirements/upstream".to_string()));
+        assert_eq!(
+            remote.path.map(|p| p.0),
+            Some("/requirements/upstream".to_string())
+        );
     }
 
     #[test]
@@ -598,7 +717,10 @@ mod test {
     fn submodules_round_trips_through_core() {
         let draft = DependencyDraft::from_core(DependencyReferenceKind::Submodules);
         assert_eq!(draft, DependencyDraft::Submodules);
-        assert!(matches!(draft.to_core(), DependencyReferenceKind::Submodules));
+        assert!(matches!(
+            draft.to_core(),
+            DependencyReferenceKind::Submodules
+        ));
     }
 
     #[test]
@@ -632,22 +754,20 @@ mod test {
             &requirement.dependencies[0],
             DependencyReferenceKind::RequirementReferenceV1(local) if local.path.0 == "/requirements/discovery"
         ));
-        assert!(matches!(&requirement.dependencies[1], DependencyReferenceKind::Submodules));
+        assert!(matches!(
+            &requirement.dependencies[1],
+            DependencyReferenceKind::Submodules
+        ));
     }
 
     /// Regression test for the bug `original` fixes: before it existed,
     /// `build_command` built a `RequirementDraft` from scratch, so an
     /// `UpdateRequirement` silently reset every field the form has no UI
-    /// for (`tests`, `attachment_refs`, `include_attachments_in_commit`,
-    /// `commit`) back to `RequirementDraft::new`'s defaults — wiping a
-    /// requirement's own test references just by editing its title.
+    /// for (`attachment_refs`, `include_attachments_in_commit`, `commit`)
+    /// back to `RequirementDraft::new`'s defaults.
     #[test]
     fn requirement_form_build_command_preserves_fields_the_form_has_no_ui_for() {
         let mut original = RequirementDraft::new("Old Title");
-        original.tests.push(TestReferenceKind::TestReferenceV1(LocalGitReference {
-            path: ReferencePath("/tests/generic_test".to_string()),
-            commit: "t1".to_string(),
-        }));
         original.include_attachments_in_commit = false;
         original.commit = Some("c1".to_string());
 
@@ -658,20 +778,57 @@ mod test {
             ..Default::default()
         };
 
-        let Command::UpdateRequirement { requirement, .. } = form.build_command(Vec::new(), 1) else {
+        let Command::UpdateRequirement { requirement, .. } = form.build_command(Vec::new(), 1)
+        else {
             panic!("expected UpdateRequirement");
         };
         // The actually-edited field changed...
         assert_eq!(requirement.title, "New Title");
         // ...but everything the form has no field for came along
         // unchanged from `original`.
+        assert!(!requirement.include_attachments_in_commit);
+        assert_eq!(requirement.commit, Some("c1".to_string()));
+    }
+
+    #[test]
+    fn a_test_reference_round_trips_through_core() {
+        let core = TestReferenceKind::TestReferenceV1(LocalGitReference {
+            path: ReferencePath("/tests/generic_test".to_string()),
+            commit: "t1".to_string(),
+        });
+        let draft = TestRefDraft::from_core(core);
+        assert_eq!(
+            draft,
+            TestRefDraft {
+                path: "/tests/generic_test".to_string(),
+                commit: "t1".to_string(),
+            }
+        );
+
+        let TestReferenceKind::TestReferenceV1(local) = draft.to_core();
+        assert_eq!(local.path.0, "/tests/generic_test");
+        assert_eq!(local.commit, "t1");
+    }
+
+    #[test]
+    fn requirement_form_build_command_carries_test_references_through() {
+        let mut form = RequirementFormState {
+            title: "Title".to_string(),
+            ..Default::default()
+        };
+        form.tests.push(TestRefDraft {
+            path: "/tests/generic_test".to_string(),
+            commit: "t1".to_string(),
+        });
+
+        let Command::AddRequirement { requirement, .. } = form.build_command(Vec::new(), 1) else {
+            panic!("expected AddRequirement");
+        };
         assert_eq!(requirement.tests.len(), 1);
         assert!(matches!(
             &requirement.tests[0],
-            TestReferenceKind::TestReferenceV1(local) if local.path.0 == "/tests/generic_test"
+            TestReferenceKind::TestReferenceV1(local) if local.path.0 == "/tests/generic_test" && local.commit == "t1"
         ));
-        assert!(!requirement.include_attachments_in_commit);
-        assert_eq!(requirement.commit, Some("c1".to_string()));
     }
 
     #[test]
@@ -690,10 +847,14 @@ mod test {
             ..Default::default()
         };
 
-        let Command::UpdateRequirement { requirement, .. } = form.build_command(Vec::new(), 1) else {
+        let Command::UpdateRequirement { requirement, .. } = form.build_command(Vec::new(), 1)
+        else {
             panic!("expected UpdateRequirement");
         };
-        assert_eq!(requirement.attachments, BTreeSet::from([PathBuf::from("current.md")]));
+        assert_eq!(
+            requirement.attachments,
+            BTreeSet::from([PathBuf::from("current.md")])
+        );
     }
 
     #[test]
@@ -719,7 +880,10 @@ mod test {
         assert!(!test.include_attachments_in_commit);
         assert!(!test.include_template_in_commit);
         assert_eq!(test.commit, Some("t1".to_string()));
-        assert_eq!(test.attachments, BTreeSet::from([PathBuf::from("checklist.md")]));
+        assert_eq!(
+            test.attachments,
+            BTreeSet::from([PathBuf::from("checklist.md")])
+        );
         assert_eq!(test.template, BTreeSet::from([PathBuf::from("result.typ")]));
     }
 
@@ -765,7 +929,10 @@ mod test {
     fn module_detail_form_build_command_for_a_nested_module_sends_rename_module() {
         let form = module_detail_form(vec![EntryName("setup".to_string())], "renamed");
 
-        let Command::RenameModule { target, new_name, .. } = form.build_command(1) else {
+        let Command::RenameModule {
+            target, new_name, ..
+        } = form.build_command(1)
+        else {
             panic!("expected RenameModule");
         };
         assert_eq!(target, vec![EntryName("setup".to_string())]);

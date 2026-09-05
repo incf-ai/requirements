@@ -76,7 +76,7 @@ fn import_requirement(requirement: RequirementOnDisk) -> RequirementDraft {
         attachments: attachment_paths(requirement.attachments),
         attachment_refs,
         include_attachments_in_commit: definition.include_attachments_in_commit,
-        commit: Some(requirement.commit),
+        commit: requirement.commit,
     }
 }
 
@@ -104,7 +104,7 @@ fn import_test(test: TestOnDisk) -> TestDraft {
         template_refs,
         include_attachments_in_commit: definition.include_attachments_in_commit,
         include_template_in_commit: definition.include_template_in_commit,
-        commit: Some(test.commit),
+        commit: test.commit,
     }
 }
 
@@ -187,7 +187,7 @@ mod test {
             requirement_guidance: None,
             test_guidance: None,
             attachments: Vec::new(),
-            commit: "c1".to_string(),
+            commit: Some("c1".to_string()),
         };
 
         let draft = import_requirement(requirement);
@@ -225,7 +225,7 @@ mod test {
             test_text: String::new(),
             attachments: Vec::new(),
             template: Vec::new(),
-            commit: "c1".to_string(),
+            commit: Some("c1".to_string()),
         };
 
         let draft = import_test(test);

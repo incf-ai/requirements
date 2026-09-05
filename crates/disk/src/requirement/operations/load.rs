@@ -75,12 +75,16 @@ fn load_requirement_stage_inner(
     } else {
         vec![attachments_dir.as_path()]
     };
-    let commit = git
-        .commit_for_path_excluding(dir, &excludes)
-        .map_err(|source| ErrorKind::Commit {
-            path: dir.to_path_buf(),
-            source,
-        })?;
+    let commit = match git.commit_for_path_excluding(dir, &excludes) {
+        Ok(commit) => Some(commit),
+        Err(CommitForPathError::NotTracked { .. }) => None,
+        Err(source) => {
+            return Err(ErrorKind::Commit {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
 
     Ok(RequirementOnDisk {
         name: EntryName::of(dir),
@@ -149,7 +153,7 @@ mod test {
         assert_eq!(requirement.requirement_guidance, Some(String::new()));
         assert_eq!(requirement.test_guidance, Some(String::new()));
         assert!(requirement.attachments.is_empty());
-        assert_eq!(requirement.commit, "deadbeef");
+        assert_eq!(requirement.commit, Some("deadbeef".to_string()));
 
         Ok(())
     }
@@ -258,6 +262,28 @@ mod test {
     }
 
     #[test]
+    fn a_stage_folder_with_no_commits_loads_with_commit_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-load-no-commits-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        init_scratch_git_repo(&dir);
+        std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::write(
+            dir.join("requirement.ron"),
+            "RequirementDefinitionV1(title: \"Title\")",
+        )
+        .unwrap();
+        std::fs::write(dir.join("requirement.typ"), "").unwrap();
+
+        let requirement = load_requirement_stage(&StdFilesystem, &SystemGit, &dir).unwrap();
+        assert_eq!(requirement.commit, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn include_attachments_in_commit_false_excludes_attachments_from_the_commit() {
         let dir = std::env::temp_dir().join(format!(
             "disk-requirement-load-exclude-attachments-{}-{}",
@@ -278,7 +304,7 @@ mod test {
         git_commit_all(&dir, "touch attachments only");
 
         let requirement = load_requirement_stage(&StdFilesystem, &SystemGit, &dir).unwrap();
-        assert_eq!(requirement.commit, base_commit);
+        assert_eq!(requirement.commit, Some(base_commit));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -304,8 +330,8 @@ mod test {
         let latest_commit = git_commit_all(&dir, "touch attachments only");
 
         let requirement = load_requirement_stage(&StdFilesystem, &SystemGit, &dir).unwrap();
-        assert_ne!(requirement.commit, base_commit);
-        assert_eq!(requirement.commit, latest_commit);
+        assert_ne!(requirement.commit, Some(base_commit));
+        assert_eq!(requirement.commit, Some(latest_commit));
 
         std::fs::remove_dir_all(&dir).ok();
     }

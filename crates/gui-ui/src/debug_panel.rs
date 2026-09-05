@@ -75,7 +75,11 @@ impl DebugPanelState {
         if self.log.len() >= LOG_CAPACITY {
             self.log.pop_front();
         }
-        self.log.push_back(LogEntry { at: Instant::now(), direction, detail });
+        self.log.push_back(LogEntry {
+            at: Instant::now(),
+            direction,
+            detail,
+        });
     }
 
     /// Called for every outgoing `Command`, logging it either way.
@@ -90,7 +94,10 @@ impl DebugPanelState {
             return None;
         }
         if self.tx_stall_until.is_some() {
-            self.push_log(LogDirection::Tx, format!("{command:?} (queued — Tx stalled)"));
+            self.push_log(
+                LogDirection::Tx,
+                format!("{command:?} (queued — Tx stalled)"),
+            );
             self.held_tx.push_back(command);
             return None;
         }

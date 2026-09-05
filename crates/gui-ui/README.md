@@ -81,6 +81,19 @@ confirmation prompt (Continue/Cancel) interrupts any of the three when
 `self.dirty`, rather than silently discarding whatever hasn't been saved
 — see "Unsaved-changes confirmation" below.
 
+A toolbar "Commit all changes…" button, next to Save, opens a modal with a
+resizable multiline commit-message box (`resizable_multiline`, the same
+widget the Requirement/Test text and guidance fields use) and a scrollable,
+read-only list of every path `syscalls::Git::changed_paths` reports for the
+project (fetched fresh each time the dialog opens via a new `GetChangedFiles`
+command), sorted shallowest-path-first and alphabetically within a depth
+(`(components().count(), path)` as the sort key) so root-level files read
+before deeply nested ones. Commit is disabled until the message is
+non-empty; clicking it sends `CommitAll` (stage-everything-and-commit, via
+`syscalls::Git::commit_all`), closes the dialog on success, and reports the
+error inline — dialog left open — on failure, the same success/failure shape
+as the Attachments dialog's own adds/removes.
+
 ## What this crate is for
 
 The single-threaded, synchronous presentation layer. `gui-ui` owns the
@@ -983,13 +996,16 @@ project dirty, the exit dialog's full Asking/Saving/TimedOut/Keep-
 waiting/Exit-anyway/Discard/Cancel set all render and resolve correctly
 against that real dirty state, selecting a real tree leaf opens it
 prefilled in edit mode (with the name field disabled), saving an edit to
-an existing requirement keeps the form open and marks the project dirty,
+an existing requirement closes the form back to its read-only viewer and
+marks the project dirty,
 adding a local attachment to an existing requirement appears in its list,
 the rename-module dialog renames a real module end to end, both of the
 Result form's `ComboBox` path pickers (requirement and test) fill their
 field from a real dropdown selection, editing an existing result/test can
 add a local attachment (plus, for the test form, a local template file),
-the tree's requirements/tests/results grouping (both that the three
+the Commit all changes dialog opens with a real (fake-`Git`-backed) changed-
+files list, Cancel closes it without committing, and committing with a
+message closes it too, the tree's requirements/tests/results grouping (both that the three
 folders render and that an empty module grows none of them), the New
 Project dialog creates a real blank project and its Cancel button
 discards the typed name, a project created from scratch can be

@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use syscalls::{CommitForPathError, CommitForRemoteError, Git, RemoteGit};
+use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, Git, RemoteGit};
 
 /// A `Git` stub that reports a fixed commit for any path — mirrors
 /// `disk`'s own `test_support::FixedGit`, used here for the same reason:
@@ -15,6 +15,14 @@ impl Git for FixedGit {
         _excludes: &[&Path],
     ) -> Result<String, CommitForPathError> {
         Ok("deadbeef".to_string())
+    }
+
+    fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+        Ok(Vec::new())
+    }
+
+    fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+        Ok(())
     }
 }
 

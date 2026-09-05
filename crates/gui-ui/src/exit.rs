@@ -8,8 +8,13 @@ use gui_core::RequestId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitDialogState {
     Asking,
-    Saving { request: RequestId, deadline: Instant },
-    TimedOut { request: RequestId },
+    Saving {
+        request: RequestId,
+        deadline: Instant,
+    },
+    TimedOut {
+        request: RequestId,
+    },
     /// The awaited save completed (or the dialog was dismissed via
     /// Discard/"Exit anyway") — nothing left to show; `GuiApp::ui`
     /// consumes this on the next frame to run Stage 2 (send

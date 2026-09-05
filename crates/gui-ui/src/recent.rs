@@ -86,7 +86,10 @@ mod test {
 
     #[test]
     fn malformed_ron_falls_back_to_an_empty_list_and_reports_the_error() {
-        let dir = std::env::temp_dir().join(format!("gui-ui-recent-test-malformed-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gui-ui-recent-test-malformed-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("recent.ron");
         std::fs::write(&path, "not valid ron (").unwrap();
@@ -100,7 +103,10 @@ mod test {
 
     #[test]
     fn save_then_load_round_trips() {
-        let dir = std::env::temp_dir().join(format!("gui-ui-recent-test-round-trip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gui-ui-recent-test-round-trip-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("recent.ron");
 
@@ -111,14 +117,19 @@ mod test {
 
         let (loaded, error) = RecentProjects::load(&path);
         assert!(error.is_none());
-        assert_eq!(loaded.paths, vec![PathBuf::from("/a/project"), PathBuf::from("/b/project")]);
+        assert_eq!(
+            loaded.paths,
+            vec![PathBuf::from("/a/project"), PathBuf::from("/b/project")]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn save_to_an_unwritable_path_reports_an_io_error() {
-        let err = RecentProjects::default().save(Path::new("/nonexistent-directory/recent.ron")).unwrap_err();
+        let err = RecentProjects::default()
+            .save(Path::new("/nonexistent-directory/recent.ron"))
+            .unwrap_err();
         assert!(matches!(err, SaveError::Io(_)));
     }
 
@@ -134,10 +145,21 @@ mod test {
     #[test]
     fn recording_an_already_present_path_moves_it_to_the_front_instead_of_duplicating() {
         let mut recent = RecentProjects {
-            paths: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")],
+            paths: vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c"),
+            ],
         };
         recent.record(PathBuf::from("/b"));
-        assert_eq!(recent.paths, vec![PathBuf::from("/b"), PathBuf::from("/a"), PathBuf::from("/c")]);
+        assert_eq!(
+            recent.paths,
+            vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/c")
+            ]
+        );
     }
 
     #[test]
@@ -147,7 +169,9 @@ mod test {
         // oldest — the one `truncate` should drop once a new entry pushes
         // the list past the cap.
         let mut recent = RecentProjects {
-            paths: (0..MAX_ENTRIES).map(|i| PathBuf::from(format!("/project-{i}"))).collect(),
+            paths: (0..MAX_ENTRIES)
+                .map(|i| PathBuf::from(format!("/project-{i}")))
+                .collect(),
         };
         recent.record(PathBuf::from("/newest"));
         assert_eq!(recent.paths.len(), MAX_ENTRIES);

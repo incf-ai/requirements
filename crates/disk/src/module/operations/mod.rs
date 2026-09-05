@@ -329,7 +329,7 @@ mod test {
             requirement_guidance: None,
             test_guidance: None,
             attachments: Vec::new(),
-            commit: "deadbeef".to_string(),
+            commit: Some("deadbeef".to_string()),
         }
     }
 
@@ -349,7 +349,7 @@ mod test {
             test_text: String::new(),
             attachments: Vec::new(),
             template: Vec::new(),
-            commit: "deadbeef".to_string(),
+            commit: Some("deadbeef".to_string()),
         }
     }
 

@@ -154,10 +154,17 @@ mod test {
 
     #[test]
     fn an_overridden_field_round_trips() {
-        let dir = std::env::temp_dir().join(format!("gui-ui-config-test-override-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gui-ui-config-test-override-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gui-config.ron");
-        std::fs::write(&path, "GuiConfig(save_on_exit_timeout: Duration(secs: 5, nanos: 0))").unwrap();
+        std::fs::write(
+            &path,
+            "GuiConfig(save_on_exit_timeout: Duration(secs: 5, nanos: 0))",
+        )
+        .unwrap();
 
         let (config, error) = GuiConfig::load(&path);
         assert!(error.is_none());
@@ -168,7 +175,8 @@ mod test {
 
     #[test]
     fn an_empty_file_falls_back_to_default_fields() {
-        let dir = std::env::temp_dir().join(format!("gui-ui-config-test-empty-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("gui-ui-config-test-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gui-config.ron");
         std::fs::write(&path, "GuiConfig()").unwrap();
@@ -182,7 +190,10 @@ mod test {
 
     #[test]
     fn malformed_ron_falls_back_to_default_and_reports_the_error() {
-        let dir = std::env::temp_dir().join(format!("gui-ui-config-test-malformed-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gui-ui-config-test-malformed-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gui-config.ron");
         std::fs::write(&path, "not valid ron (").unwrap();
@@ -196,7 +207,10 @@ mod test {
 
     #[test]
     fn save_then_load_round_trips_every_field() {
-        let dir = std::env::temp_dir().join(format!("gui-ui-config-test-save-round-trip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gui-ui-config-test-save-round-trip-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gui-config.ron");
 
@@ -218,10 +232,17 @@ mod test {
 
     #[test]
     fn save_overwrites_an_existing_file_rather_than_merging() {
-        let dir = std::env::temp_dir().join(format!("gui-ui-config-test-save-overwrites-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gui-ui-config-test-save-overwrites-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gui-config.ron");
-        std::fs::write(&path, "GuiConfig(save_on_exit_timeout: Duration(secs: 5, nanos: 0), zoom_percent: 80)").unwrap();
+        std::fs::write(
+            &path,
+            "GuiConfig(save_on_exit_timeout: Duration(secs: 5, nanos: 0), zoom_percent: 80)",
+        )
+        .unwrap();
 
         GuiConfig::default().save(&path).unwrap();
 
@@ -235,7 +256,9 @@ mod test {
 
     #[test]
     fn save_to_an_unwritable_path_reports_an_io_error() {
-        let err = GuiConfig::default().save(Path::new("/nonexistent-directory/gui-config.ron")).unwrap_err();
+        let err = GuiConfig::default()
+            .save(Path::new("/nonexistent-directory/gui-config.ron"))
+            .unwrap_err();
         assert!(matches!(err, SaveError::Io(_)));
     }
 }

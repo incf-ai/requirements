@@ -313,6 +313,14 @@ mod test {
                 source: std::io::Error::other("injected failure"),
             })
         }
+
+        fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, syscalls::ChangedPathsError> {
+            unreachable!("save_project never looks up commits")
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), syscalls::CommitAllError> {
+            unreachable!("save_project never looks up commits")
+        }
     }
 
     #[test]

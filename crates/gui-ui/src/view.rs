@@ -6,14 +6,15 @@
 use std::path::PathBuf;
 
 use gui_core::{
-    EntryKind, EntryName, EntryStatus, LogicalPath, ReferencePath, RequirementMetStatus, ResultKindV1,
-    TestUnmetReason, TreeNode, TreeSnapshot, UnmetReason,
+    EntryKind, EntryName, EntryStatus, LogicalPath, ReferencePath, RequirementMetStatus,
+    ResultKindV1, TestUnmetReason, TreeNode, TreeSnapshot, UnmetReason,
 };
 
 use crate::{
-    AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp, LocalPoolKind,
-    PathPickerTarget, PendingNavigation, PendingProjectAction, ThemeChoice, ValidateBeforeSaveDialogState,
-    absolute_reference_path, flatten_leaf_paths, icons, leaf_kind_segment, theme_colors,
+    AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp,
+    LocalPoolKind, PathPickerTarget, PendingNavigation, PendingProjectAction, TestRefDraft,
+    TestRefSlot, ThemeChoice, ValidateBeforeSaveDialogState, absolute_reference_path,
+    flatten_leaf_paths, icons, leaf_kind_segment, theme_colors,
 };
 
 /// Pops a native OS folder picker (`rfd`) titled `title` — blocking, but
@@ -36,7 +37,9 @@ fn pick_project_folder(title: &str) -> Option<PathBuf> {
 /// accessibility tree's perspective, and so from these tests' perspective,
 /// nothing about the button's identity changed, only how it's drawn.
 fn icon_button(ui: &mut egui::Ui, enabled: bool, icon: &str, label: &str) -> egui::Response {
-    let response = ui.add_enabled(enabled, egui::Button::new(icon)).on_hover_text(label);
+    let response = ui
+        .add_enabled(enabled, egui::Button::new(icon))
+        .on_hover_text(label);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     response
 }
@@ -74,7 +77,11 @@ fn render_requirement_status(ui: &mut egui::Ui, status: &RequirementMetStatus) {
     let (fg, bg) = theme_colors::status_colors(ui.visuals().dark_mode, entry_status);
     ui.horizontal(|ui| {
         ui.label("Status:");
-        ui.label(egui::RichText::new(icons::status_icon(entry_status)).color(fg).background_color(bg));
+        ui.label(
+            egui::RichText::new(icons::status_icon(entry_status))
+                .color(fg)
+                .background_color(bg),
+        );
         ui.label(label);
     });
     if let RequirementMetStatus::Unmet(reason) = status {
@@ -100,9 +107,13 @@ fn describe_unmet_reason(reason: &UnmetReason) -> Vec<String> {
             .iter()
             .map(|unsatisfied| {
                 let why = match unsatisfied.reason {
-                    TestUnmetReason::UnresolvedReference => "its reference doesn't resolve to a real test",
+                    TestUnmetReason::UnresolvedReference => {
+                        "its reference doesn't resolve to a real test"
+                    }
                     TestUnmetReason::TestNotYetSaved => "the test hasn't been saved yet",
-                    TestUnmetReason::StaleReference => "its reference is stale (pointing at an old commit of the test)",
+                    TestUnmetReason::StaleReference => {
+                        "its reference is stale (pointing at an old commit of the test)"
+                    }
                     TestUnmetReason::NoPassingResult => "no current, passing result exists for it",
                 };
                 format!("Test \"{}\": {why}.", unsatisfied.test)
@@ -126,19 +137,74 @@ fn has_stale_test_reference(status: &RequirementMetStatus) -> bool {
     )
 }
 
+/// A stable-ish string identifying which entry `resizable_multiline` is
+/// being rendered for — `None` (create mode) all share `"new"`, since
+/// there's only ever one create-mode form open at a time.
+fn entry_id_salt(editing_target: &Option<LogicalPath>) -> String {
+    match editing_target {
+        Some(path) => path.to_string(),
+        None => "new".to_string(),
+    }
+}
+
+/// Row height `resizable_multiline` sizes against — matches the previous
+/// static 80px/40px (4-line/2-line) defaults it replaced.
+const MULTILINE_ROW_HEIGHT: f32 = 20.0;
+/// Never smaller than this many rows, even for empty text — big enough to
+/// still read as "a text box" rather than a single-line field, small
+/// enough not to waste space on a field nobody's filled in yet.
+const MULTILINE_MIN_ROWS: usize = 2;
+/// The largest *default* size content growth alone will reach — beyond
+/// this the box stops growing on its own and the user drags it bigger by
+/// hand, same as it always could.
+const MULTILINE_MAX_DEFAULT_ROWS: usize = 4;
+
 /// A multiline text box the user can drag taller or shorter, for the
 /// requirement text/guidance fields — these routinely run longer than the
 /// default handful of rows `text_edit_multiline` allows before scrolling.
 /// Only resizes vertically; width already tracks the surrounding panel via
-/// `desired_width(f32::INFINITY)`. `id_salt` must be unique among the
-/// resizable boxes on the same form, since `egui::Resize` remembers each
-/// box's size by id.
+/// `desired_width(f32::INFINITY)`.
+///
+/// Defaults to a height that tracks `text`'s current line count, clamped
+/// to `MULTILINE_MIN_ROWS..=MULTILINE_MAX_DEFAULT_ROWS` rows — empty or
+/// short text starts small, text with four or more lines starts at the
+/// four-line cap, and the user can still drag past that cap or back down
+/// to the two-line floor. `egui::Resize` only consults `default_height`
+/// the first time it sees a given id, and remembers whatever size the box
+/// ends up at (manually resized or not) for every id it's seen before —
+/// so `id_salt` must be unique per distinct field *and* per distinct
+/// entry being edited (callers fold the entry's identity in), or this
+/// content-tracking default would only ever apply to the very first entry
+/// ever opened in a given box.
 fn resizable_multiline(ui: &mut egui::Ui, id_salt: &str, text: &mut String) -> egui::Response {
+    resizable_multiline_with_max_height(ui, id_salt, text, f32::INFINITY)
+}
+
+/// Same as `resizable_multiline`, but caps how tall the user can drag the
+/// box — for callers (like the commit-all dialog) that aren't inside their
+/// own scroll area and would otherwise let a drag push the surrounding
+/// modal/window past the screen's edge.
+fn resizable_multiline_with_max_height(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    text: &mut String,
+    max_height: f32,
+) -> egui::Response {
+    let default_rows = text
+        .lines()
+        .count()
+        .max(1)
+        .clamp(MULTILINE_MIN_ROWS, MULTILINE_MAX_DEFAULT_ROWS);
+    let available_width = ui.available_width();
     egui::Resize::default()
         .id_salt(id_salt)
         .resizable([false, true])
-        .default_height(80.0)
-        .min_height(40.0)
+        .default_width(available_width)
+        .min_width(available_width)
+        .max_width(available_width)
+        .default_height(MULTILINE_ROW_HEIGHT * default_rows as f32)
+        .min_height(MULTILINE_ROW_HEIGHT * MULTILINE_MIN_ROWS as f32)
+        .max_height(max_height)
         .show(ui, |ui| {
             // `TextEdit` otherwise only grows to fit its text (or
             // `desired_rows`' default of 4 lines) rather than the space
@@ -154,7 +220,11 @@ fn resizable_multiline(ui: &mut egui::Ui, id_salt: &str, text: &mut String) -> e
 /// dividing by zero — the module/project page's Pass/Fail/Incomplete and
 /// "Requirements met" lines all go through this.
 fn percentage(count: usize, total: usize) -> f64 {
-    if total == 0 { 0.0 } else { (count as f64 / total as f64) * 100.0 }
+    if total == 0 {
+        0.0
+    } else {
+        (count as f64 / total as f64) * 100.0
+    }
 }
 
 impl GuiApp {
@@ -166,7 +236,10 @@ impl GuiApp {
     /// `GuiApp::needs_path_before_saving`'s own doc comment.
     fn save_button_clicked(&mut self) {
         if self.needs_path_before_saving() {
-            if let Some(path) = rfd::FileDialog::new().set_title("Save Project As").pick_folder() {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Save Project As")
+                .pick_folder()
+            {
                 self.save_project_as(path);
             }
         } else {
@@ -193,7 +266,8 @@ impl GuiApp {
                         }
                         ui.close();
                     }
-                    if icon_text_button(ui, true, icons::OPEN_PROJECT, "Open Project…").clicked() {
+                    if icon_text_button(ui, true, icons::OPEN_PROJECT, "Open Project…").clicked()
+                    {
                         if self.dirty {
                             self.unsaved_changes_dialog_opened(PendingProjectAction::OpenProject);
                         } else if let Some(path) = pick_project_folder("Open Project") {
@@ -212,7 +286,9 @@ impl GuiApp {
                             for path in self.recent.paths.clone() {
                                 if ui.button(path.display().to_string()).clicked() {
                                     if self.dirty {
-                                        self.unsaved_changes_dialog_opened(PendingProjectAction::OpenRecent(path));
+                                        self.unsaved_changes_dialog_opened(
+                                            PendingProjectAction::OpenRecent(path),
+                                        );
                                     } else {
                                         self.open_project(path);
                                     }
@@ -231,7 +307,10 @@ impl GuiApp {
                         ui.close();
                     }
                     if icon_text_button(ui, has_project, icons::SAVE_AS, "Save As…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_title("Save Project As").pick_folder() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Save Project As")
+                            .pick_folder()
+                        {
                             self.save_project_as(path);
                         }
                         ui.close();
@@ -256,7 +335,11 @@ impl GuiApp {
                 // why.
                 #[cfg(all(feature = "debug-panel", debug_assertions))]
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let icon = if self.debug.open { icons::DEBUG_PANEL_OPEN } else { icons::DEBUG_PANEL_CLOSED };
+                    let icon = if self.debug.open {
+                        icons::DEBUG_PANEL_OPEN
+                    } else {
+                        icons::DEBUG_PANEL_CLOSED
+                    };
                     if icon_text_button(ui, true, icon, "Debug").clicked() {
                         self.debug_panel_button_clicked();
                     }
@@ -285,6 +368,16 @@ impl GuiApp {
                 // menu bar each get a different flavor of icon button.
                 if icon_button(ui, self.tree.is_some(), icons::SAVE, "Save").clicked() {
                     self.save_button_clicked();
+                }
+                if icon_button(
+                    ui,
+                    self.tree.is_some(),
+                    icons::COMMIT_ALL,
+                    "Commit all changes…",
+                )
+                .clicked()
+                {
+                    self.commit_all_button_clicked();
                 }
                 if icon_button(ui, true, icons::VALIDATE, "Validate").clicked() {
                     self.validate_clicked();
@@ -416,7 +509,8 @@ impl GuiApp {
                     // resynced to whatever the real applied value ends
                     // up being) once focus leaves it. See
                     // `GuiApp::zoom_input_submitted`.
-                    let response = ui.add(egui::TextEdit::singleline(&mut self.zoom_input).desired_width(30.0));
+                    let response = ui
+                        .add(egui::TextEdit::singleline(&mut self.zoom_input).desired_width(30.0));
                     if response.lost_focus() {
                         self.zoom_input_submitted();
                     }
@@ -432,7 +526,10 @@ impl GuiApp {
                         .selected_text(self.config.theme.label())
                         .show_ui(ui, |ui| {
                             for choice in ThemeChoice::ALL {
-                                if ui.selectable_label(self.config.theme == choice, choice.label()).clicked() {
+                                if ui
+                                    .selectable_label(self.config.theme == choice, choice.label())
+                                    .clicked()
+                                {
                                     selected_theme = Some(choice);
                                 }
                             }
@@ -454,117 +551,124 @@ impl GuiApp {
             .default_size(240.0)
             .size_range(120.0..=900.0)
             .show(ui, |ui| {
-            // `ScrollArea` auto-shrinks to its content's width by default
-            // (`auto_shrink`'s doc: "shrinks the scroll area to fit its
-            // content"), which fights a resizable `Panel`: the panel
-            // reports the width the user just dragged to, but the
-            // auto-shrunk content immediately reports back a *narrower*
-            // natural size next frame, so the drag can barely move it at
-            // all — the panel keeps snapping back toward content width.
-            // `auto_shrink([false, false])` makes it fill whatever width
-            // the panel actually has instead.
-            ui.horizontal(|ui| {
-                ui.label("Filter:");
-                // A bounded `desired_width`, not the default (which
-                // requests all remaining horizontal space in its row) —
-                // an unbounded singleline field here inflated this
-                // resizable panel's own measured natural width past its
-                // actual rendered width, which pushed the center pane's
-                // content (found via a real interaction test: the Result
-                // form's `ComboBox` trigger ended up positioned partway
-                // past the whole window's right edge, same "widget
-                // reports a rect beyond the visible viewport, so a click
-                // there lands nowhere" shape as the toolbar-overflow and
-                // high-zoom bugs already documented in this crate's
-                // README's Testing strategy).
-                ui.add(egui::TextEdit::singleline(&mut self.tree_filter).desired_width(150.0));
-                if ui.button("×").on_hover_text("Clear filter").clicked() {
-                    self.tree_filter.clear();
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Expand All").clicked() {
-                    self.tree_force_open = Some(true);
-                }
-                if ui.button("Collapse All").clicked() {
-                    self.tree_force_open = Some(false);
-                }
-            });
-            ui.separator();
+                // `ScrollArea` auto-shrinks to its content's width by default
+                // (`auto_shrink`'s doc: "shrinks the scroll area to fit its
+                // content"), which fights a resizable `Panel`: the panel
+                // reports the width the user just dragged to, but the
+                // auto-shrunk content immediately reports back a *narrower*
+                // natural size next frame, so the drag can barely move it at
+                // all — the panel keeps snapping back toward content width.
+                // `auto_shrink([false, false])` makes it fill whatever width
+                // the panel actually has instead.
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    // A bounded `desired_width`, not the default (which
+                    // requests all remaining horizontal space in its row) —
+                    // an unbounded singleline field here inflated this
+                    // resizable panel's own measured natural width past its
+                    // actual rendered width, which pushed the center pane's
+                    // content (found via a real interaction test: the Result
+                    // form's `ComboBox` trigger ended up positioned partway
+                    // past the whole window's right edge, same "widget
+                    // reports a rect beyond the visible viewport, so a click
+                    // there lands nowhere" shape as the toolbar-overflow and
+                    // high-zoom bugs already documented in this crate's
+                    // README's Testing strategy).
+                    ui.add(egui::TextEdit::singleline(&mut self.tree_filter).desired_width(150.0));
+                    if ui.button("×").on_hover_text("Clear filter").clicked() {
+                        self.tree_filter.clear();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Expand All").clicked() {
+                        self.tree_force_open = Some(true);
+                    }
+                    if ui.button("Collapse All").clicked() {
+                        self.tree_force_open = Some(false);
+                    }
+                });
+                ui.separator();
 
-            // Consumed here rather than left in `self` past this frame —
-            // see `tree_force_open`'s own doc comment on why it's a
-            // one-frame signal, not a persistent setting.
-            let force_open = self.tree_force_open.take();
+                // Consumed here rather than left in `self` past this frame —
+                // see `tree_force_open`'s own doc comment on why it's a
+                // one-frame signal, not a persistent setting.
+                let force_open = self.tree_force_open.take();
 
-            // Cloned up front (rather than matching `&self.tree`) so the
-            // borrow doesn't outlive this line — both closures below need
-            // `&mut self` (for `select_module`/`render_selected_module_pane`),
-            // which an immutable borrow of `self.tree` held across them
-            // would conflict with.
-            let tree = self.tree.clone();
-            match &tree {
-                None => {
-                    ui.label("No project loaded.");
-                }
-                Some(tree) => {
-                    let root = tree.root.clone();
+                // Cloned up front (rather than matching `&self.tree`) so the
+                // borrow doesn't outlive this line — both closures below need
+                // `&mut self` (for `select_module`/`render_selected_module_pane`),
+                // which an immutable borrow of `self.tree` held across them
+                // would conflict with.
+                let tree = self.tree.clone();
+                match &tree {
+                    None => {
+                        ui.label("No project loaded.");
+                    }
+                    Some(tree) => {
+                        let root = tree.root.clone();
 
-                    // Reserved *before* the top area is drawn: a
-                    // `ScrollArea` with no `max_height` fills all
-                    // available space in its container, so computing
-                    // this split only after rendering the top area
-                    // (as before) left nothing for the bottom area —
-                    // its content was still drawn, just pushed below
-                    // the visible panel.
-                    let bottom_height = ui.available_height() * 0.4;
-                    let top_height = (ui.available_height() - bottom_height - 8.0).max(0.0);
+                        // Reserved *before* the top area is drawn: a
+                        // `ScrollArea` with no `max_height` fills all
+                        // available space in its container, so computing
+                        // this split only after rendering the top area
+                        // (as before) left nothing for the bottom area —
+                        // its content was still drawn, just pushed below
+                        // the visible panel.
+                        let bottom_height = ui.available_height() * 0.4;
+                        let top_height = (ui.available_height() - bottom_height - 8.0).max(0.0);
 
-                    egui::ScrollArea::vertical().id_salt("tree_pane_modules").max_height(top_height).auto_shrink(
-                        [false, false],
-                    )
-                    .show(
-                        ui,
-                        |ui| {
-                            // The root `TreeNode`'s own `name` is the
-                            // project's display name (see `gui-core`'s
-                            // `build_tree_snapshot`) — a label, not a real
-                            // module-path segment. Unlike every other
-                            // `Module` node, it must never be pushed into a
-                            // path, so the root is rendered specially here
-                            // (its own selector + iterating its children
-                            // with an *empty* path) rather than through
-                            // `render_tree_node`, which pushes `node.name`
-                            // for every module it handles.
-                            let is_root_current = self.selected_module.is_empty();
-                            ui.horizontal(|ui| {
-                                let glyph =
-                                    if is_root_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
-                                let mut text = egui::RichText::new(glyph);
-                                if is_root_current {
-                                    text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
-                                }
-                                if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked()
-                                {
-                                    self.select_module(Vec::new());
-                                }
-                                ui.strong(root.name.as_str());
+                        egui::ScrollArea::vertical()
+                            .id_salt("tree_pane_modules")
+                            .max_height(top_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // The root `TreeNode`'s own `name` is the
+                                // project's display name (see `gui-core`'s
+                                // `build_tree_snapshot`) — a label, not a real
+                                // module-path segment. Unlike every other
+                                // `Module` node, it must never be pushed into a
+                                // path, so the root is rendered specially here
+                                // (its own selector + iterating its children
+                                // with an *empty* path) rather than through
+                                // `render_tree_node`, which pushes `node.name`
+                                // for every module it handles.
+                                let is_root_current = self.selected_module.is_empty();
+                                ui.horizontal(|ui| {
+                                    let glyph = if is_root_current {
+                                        icons::MODULE_CURRENT
+                                    } else {
+                                        icons::MODULE_NOT_CURRENT
+                                    };
+                                    let mut text = egui::RichText::new(glyph);
+                                    if is_root_current {
+                                        text = text.color(theme_colors::module_current_color(
+                                            ui.visuals().dark_mode,
+                                        ));
+                                    }
+                                    if ui
+                                        .add(egui::Button::new(text).small())
+                                        .on_hover_text("Set as current module")
+                                        .clicked()
+                                    {
+                                        self.select_module(Vec::new());
+                                    }
+                                    ui.strong(root.name.as_str());
+                                });
+                                render_module_children(self, ui, &root.children, &[], force_open);
                             });
-                            render_module_children(self, ui, &root.children, &[], force_open);
-                        },
-                    );
 
-                    ui.separator();
+                        ui.separator();
 
-                    egui::ScrollArea::vertical().id_salt("tree_pane_selection").max_height(bottom_height).auto_shrink(
-                        [false, false],
-                    )
-                    .show(ui, |ui| {
-                        render_selected_module_pane(self, ui, tree, force_open);
-                    });
+                        egui::ScrollArea::vertical()
+                            .id_salt("tree_pane_selection")
+                            .max_height(bottom_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                render_selected_module_pane(self, ui, tree, force_open);
+                            });
+                    }
                 }
-            }
-        });
+            });
     }
 
     /// Dispatches on which of five things the center pane currently shows
@@ -592,17 +696,16 @@ impl GuiApp {
         };
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // A form can run longer than the window is tall (a
-            // requirement with several dependencies and local
-            // attachments, say) — without this, content past the bottom
-            // edge is simply unreachable, Save/Cancel included, with no
-            // visible sign anything's missing (same overflow-past-
-            // viewport bug class as the toolbar/zoom/filter-field fixes
-            // — see README's Testing strategy). `auto_shrink([false,
-            // false])` for the same reason the left pane's own
-            // `ScrollArea` needs it: without it, the area shrinks to fit
-            // its content's natural size and never actually scrolls.
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match pane {
+            // Each `render_*_form`/`render_module_page` manages its own
+            // body `ScrollArea` now, so a form can run longer than the
+            // window is tall (a requirement with several dependencies and
+            // local attachments, say) without losing Save/Cancel off the
+            // bottom edge (same overflow-past-viewport bug class as the
+            // toolbar/zoom/filter-field fixes — see README's Testing
+            // strategy) *and* keep its heading and buttons pinned above
+            // that scrolling body. `Pane::Empty` has nothing worth
+            // pinning a header above, so it's left unwrapped.
+            match pane {
                 // `self.editor` being `None` here means either nothing is
                 // selected, or a selection's `GetEntryDetail` reply
                 // hasn't landed yet — `select` clears `editor` up front
@@ -621,7 +724,7 @@ impl GuiApp {
                 Pane::NewResult => self.render_result_form(ui),
                 Pane::NewModule => self.render_module_form(ui),
                 Pane::ExistingModule => self.render_module_page(ui),
-            });
+            }
         });
     }
 
@@ -641,8 +744,15 @@ impl GuiApp {
         let mut remove_attachment: Option<PathBuf> = None;
         let mut auto_commit_clicked: Option<(DependencySlot, AutoCommitKind)> = None;
         let mut pick_dependency_path_clicked: Option<DependencySlot> = None;
+        let mut test_ref_auto_commit_clicked: Option<(TestRefSlot, LogicalPath)> = None;
+        let mut pick_test_ref_path_clicked: Option<TestRefSlot> = None;
         let mut refresh_stale_test_references_clicked = false;
         let mut recreate_clicked = false;
+        // Set by a click on one of the read-only viewer's Dependencies/Test
+        // references/Results links — acted on after `form`'s borrow of
+        // `self.editor` ends below, same reasoning as every other
+        // deferred-click flag in this function.
+        let mut navigate_clicked: Option<(LogicalPath, EntryKind)> = None;
         {
             let EditorState::NewRequirement(form) = &mut self.editor else {
                 return;
@@ -650,7 +760,13 @@ impl GuiApp {
             let editing = form.editing_target.is_some();
             let read_only = form.read_only;
             ui.horizontal(|ui| {
-                ui.heading(if read_only { "Requirement" } else if editing { "Edit Requirement" } else { "New Requirement" });
+                ui.heading(if read_only {
+                    "Requirement"
+                } else if editing {
+                    "Edit Requirement"
+                } else {
+                    "New Requirement"
+                });
                 // Only an already-existing entry's viewer has anything to
                 // switch into editing — a create-mode form is already
                 // editable, nothing to toggle.
@@ -663,7 +779,13 @@ impl GuiApp {
                     if has_stale_test_reference(&form.met_status) {
                         let busy = form.pending_request.is_some();
                         if ui
-                            .add_enabled(!busy, egui::Button::new((icons::UPDATE_STALE_REFERENCES, "Update Stale References")))
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new((
+                                    icons::UPDATE_STALE_REFERENCES,
+                                    "Update Stale References",
+                                )),
+                            )
                             .clicked()
                         {
                             refresh_stale_test_references_clicked = true;
@@ -679,7 +801,10 @@ impl GuiApp {
                     // visibility rather than reachability.
                     let busy = form.pending_request.is_some();
                     let button_label = if editing { "Save" } else { "Create" };
-                    if ui.add_enabled(!busy, egui::Button::new(button_label)).clicked() {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(button_label))
+                        .clicked()
+                    {
                         create_clicked = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -702,159 +827,327 @@ impl GuiApp {
                     }
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Name:");
+        }
+        // The heading and its buttons above render outside this
+        // `ScrollArea` so the whole header row — not just the
+        // Save/Cancel/Delete/Recreate buttons — stays reachable no
+        // matter how long the form runs below.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let EditorState::NewRequirement(form) = &mut self.editor else {
+                    return;
+                };
+                let editing = form.editing_target.is_some();
+                let read_only = form.read_only;
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    if read_only {
+                        ui.label(&form.name);
+                    } else {
+                        // Renaming isn't supported — an edit's target
+                        // LogicalPath is fixed, so the name field is
+                        // display-only once open in edit mode (see
+                        // forms.rs's build_command).
+                        if ui
+                            .add_enabled(!editing, egui::TextEdit::singleline(&mut form.name))
+                            .changed()
+                        {
+                            form.edited = true;
+                        }
+                    }
+                });
+                // Never editable, so it lives outside the read_only/editable
+                // split below — but only meaningful once something's actually
+                // been saved to check `met_status` against (a create-mode
+                // form's `met_status` is always its own `Default`,
+                // `Unvalidated`, which would just be noise to show here).
+                if editing {
+                    render_requirement_status(ui, &form.met_status);
+                }
                 if read_only {
-                    ui.label(&form.name);
+                    ui.horizontal(|ui| {
+                        ui.label("Title:");
+                        ui.label(&form.title);
+                    });
+                    ui.label("Requirement text:");
+                    ui.label(&form.requirement_text);
+                    ui.label("Requirement guidance:");
+                    ui.label(&form.requirement_guidance);
+                    ui.label("Test guidance:");
+                    ui.label(&form.test_guidance);
                 } else {
-                    // Renaming isn't supported — an edit's target
-                    // LogicalPath is fixed, so the name field is
-                    // display-only once open in edit mode (see
-                    // forms.rs's build_command).
-                    if ui.add_enabled(!editing, egui::TextEdit::singleline(&mut form.name)).changed() {
+                    ui.horizontal(|ui| {
+                        ui.label("Title:");
+                        if ui.text_edit_singleline(&mut form.title).changed() {
+                            form.edited = true;
+                        }
+                    });
+                    // Folded into every field's id_salt below so each
+                    // distinct requirement gets its own remembered box size
+                    // (and its own freshly content-tracked default) instead
+                    // of sharing one across whichever requirement happened to
+                    // be edited first — see `resizable_multiline`'s own doc
+                    // comment.
+                    let entry_id = entry_id_salt(&form.editing_target);
+                    ui.label("Requirement text:");
+                    if resizable_multiline(
+                        ui,
+                        &format!("requirement_text:{entry_id}"),
+                        &mut form.requirement_text,
+                    )
+                    .changed()
+                    {
                         form.edited = true;
+                    }
+                    ui.label("Requirement guidance:");
+                    if resizable_multiline(
+                        ui,
+                        &format!("requirement_guidance:{entry_id}"),
+                        &mut form.requirement_guidance,
+                    )
+                    .changed()
+                    {
+                        form.edited = true;
+                    }
+                    ui.label("Test guidance:");
+                    if resizable_multiline(
+                        ui,
+                        &format!("test_guidance:{entry_id}"),
+                        &mut form.test_guidance,
+                    )
+                    .changed()
+                    {
+                        form.edited = true;
+                    }
+                }
+                if let Some(error) = &form.error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+
+                // Dependencies, unlike attachments below, aren't gated on
+                // `editing` — a brand new requirement can have dependencies
+                // set before it's ever created, since they're plain draft
+                // data submitted whole on Save/Create, not a local file pool
+                // requiring the entry to already exist.
+                ui.separator();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label("Dependencies:");
+                let mut remove_dependency: Option<usize> = None;
+                let mut dependency_edited = false;
+                for (i, dep) in form.dependencies.iter_mut().enumerate() {
+                    if read_only {
+                        // Only `LocalRequirement` names another entry in
+                        // this same project — `Remote` points outside it
+                        // (nothing here to navigate to) and `Submodules`
+                        // names no single entry at all, so both stay plain
+                        // labels.
+                        let target = match dep {
+                            DependencyDraft::LocalRequirement { path, .. } => form
+                                .editing_target
+                                .as_ref()
+                                .and_then(|t| {
+                                    gui_core::resolve_reference_path(
+                                        &ReferencePath(path.clone()),
+                                        &t.modules,
+                                        "requirements",
+                                    )
+                                }),
+                            _ => None,
+                        };
+                        if let Some(target) = target {
+                            if ui.link(dep.to_string()).clicked() {
+                                navigate_clicked = Some((target, EntryKind::Requirement));
+                            }
+                        } else {
+                            ui.label(dep.to_string());
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            dependency_edited |= render_dependency_kind_picker(ui, dep);
+                            if ui.button("Remove").clicked() {
+                                remove_dependency = Some(i);
+                            }
+                        });
+                        let (changed, auto, pick_clicked) =
+                            render_dependency_fields(ui, dep, self.tree.as_ref());
+                        dependency_edited |= changed;
+                        if let Some(kind) = auto {
+                            auto_commit_clicked = Some((DependencySlot::Existing(i), kind));
+                        }
+                        if pick_clicked {
+                            pick_dependency_path_clicked = Some(DependencySlot::Existing(i));
+                        }
+                    }
+                }
+                if let Some(i) = remove_dependency {
+                    form.dependencies.remove(i);
+                    dependency_edited = true;
+                }
+                if dependency_edited {
+                    form.edited = true;
+                }
+                if let Some(error) = &form.commit_fetch_error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+                if !read_only {
+                    ui.label("Add dependency:");
+                    ui.horizontal(|ui| {
+                        // Composing a not-yet-added entry isn't itself an
+                        // edit to the form's real content — only actually
+                        // clicking "Add dependency" below is, so this return
+                        // value is deliberately ignored (unlike the existing-
+                        // row loop above).
+                        render_dependency_kind_picker(ui, &mut form.new_dependency);
+                    });
+                    let (_, auto, pick_clicked) =
+                        render_dependency_fields(ui, &mut form.new_dependency, self.tree.as_ref());
+                    if let Some(kind) = auto {
+                        auto_commit_clicked = Some((DependencySlot::New, kind));
+                    }
+                    if pick_clicked {
+                        pick_dependency_path_clicked = Some(DependencySlot::New);
+                    }
+                    if ui.button("Add dependency").clicked() {
+                        form.dependencies.push(form.new_dependency.clone());
+                        form.new_dependency = DependencyDraft::default();
+                        form.edited = true;
+                    }
+                }
+                });
+
+                // Test references, like Dependencies above (and unlike Local
+                // attachments below), aren't gated on `editing` — plain draft
+                // data submitted whole on Save/Create, not a local file pool
+                // requiring the entry to already exist.
+                ui.separator();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label("Test references:");
+                let mut remove_test_ref: Option<usize> = None;
+                let mut test_ref_edited = false;
+                for (i, test_ref) in form.tests.iter_mut().enumerate() {
+                    if read_only {
+                        let target = form.editing_target.as_ref().and_then(|t| {
+                            gui_core::resolve_reference_path(
+                                &ReferencePath(test_ref.path.clone()),
+                                &t.modules,
+                                "tests",
+                            )
+                        });
+                        if let Some(target) = target {
+                            if ui.link(test_ref.to_string()).clicked() {
+                                navigate_clicked = Some((target, EntryKind::Test));
+                            }
+                        } else {
+                            ui.label(test_ref.to_string());
+                        }
+                    } else {
+                        if ui.button("Remove").clicked() {
+                            remove_test_ref = Some(i);
+                        }
+                        let (changed, auto, pick_clicked) =
+                            render_test_ref_fields(ui, test_ref, self.tree.as_ref());
+                        test_ref_edited |= changed;
+                        if let Some(target) = auto {
+                            test_ref_auto_commit_clicked = Some((TestRefSlot::Existing(i), target));
+                        }
+                        if pick_clicked {
+                            pick_test_ref_path_clicked = Some(TestRefSlot::Existing(i));
+                        }
+                    }
+                }
+                if let Some(i) = remove_test_ref {
+                    form.tests.remove(i);
+                    test_ref_edited = true;
+                }
+                if test_ref_edited {
+                    form.edited = true;
+                }
+                if let Some(error) = &form.test_commit_fetch_error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+                if !read_only {
+                    ui.label("Add test reference:");
+                    let (_, auto, pick_clicked) =
+                        render_test_ref_fields(ui, &mut form.new_test_ref, self.tree.as_ref());
+                    if let Some(target) = auto {
+                        test_ref_auto_commit_clicked = Some((TestRefSlot::New, target));
+                    }
+                    if pick_clicked {
+                        pick_test_ref_path_clicked = Some(TestRefSlot::New);
+                    }
+                    if ui.button("Add test reference").clicked() {
+                        form.tests.push(form.new_test_ref.clone());
+                        form.new_test_ref = TestRefDraft::default();
+                        form.edited = true;
+                    }
+                }
+                });
+
+                // Results, unlike Dependencies/Test references above, are
+                // read-only display data even in the editable form — a
+                // result names its requirement, not the other way around
+                // (see `Command::AddResult`), so there's nothing here to
+                // add/remove/edit. Shown only for an already-existing
+                // requirement, same as Local attachments below.
+                if editing {
+                    ui.separator();
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label("Results:");
+                        if form.results.is_empty() {
+                            ui.label("No results reference this requirement yet.");
+                        }
+                        for result in &form.results {
+                            // Unlike Dependencies/Test references above,
+                            // `result.path` is already a resolved
+                            // `LogicalPath` (see `RequirementResult`), so
+                            // there's no parsing step before it's clickable.
+                            if ui
+                                .link(format!(
+                                    "{} ({:?}) — {}",
+                                    result.title, result.status, result.path
+                                ))
+                                .clicked()
+                            {
+                                navigate_clicked = Some((result.path.clone(), EntryKind::Result));
+                            }
+                        }
+                    });
+                }
+
+                // Local attachments only make sense for an already-existing
+                // requirement — see `Command::AddRequirementAttachment`'s doc
+                // comment (the entry has to exist first). The viewer shows
+                // the list but not the Add/Remove controls — those mutate,
+                // which the viewer doesn't do.
+                if editing {
+                    ui.separator();
+                    ui.label("Local attachments:");
+                    for path in &form.attachments {
+                        if read_only {
+                            ui.label(path.display().to_string());
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(path.display().to_string());
+                                if ui.button("Remove").clicked() {
+                                    remove_attachment = Some(path.clone());
+                                }
+                            });
+                        }
+                    }
+                    if !read_only {
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut form.new_attachment_path);
+                            if ui.button("Add").clicked() {
+                                add_attachment_clicked = true;
+                            }
+                        });
+                        if let Some(error) = &form.local_pool_error {
+                            ui.colored_label(egui::Color32::RED, error);
+                        }
                     }
                 }
             });
-            // Never editable, so it lives outside the read_only/editable
-            // split below — but only meaningful once something's actually
-            // been saved to check `met_status` against (a create-mode
-            // form's `met_status` is always its own `Default`,
-            // `Unvalidated`, which would just be noise to show here).
-            if editing {
-                render_requirement_status(ui, &form.met_status);
-            }
-            if read_only {
-                ui.horizontal(|ui| {
-                    ui.label("Title:");
-                    ui.label(&form.title);
-                });
-                ui.label("Requirement text:");
-                ui.label(&form.requirement_text);
-                ui.label("Requirement guidance:");
-                ui.label(&form.requirement_guidance);
-                ui.label("Test guidance:");
-                ui.label(&form.test_guidance);
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Title:");
-                    if ui.text_edit_singleline(&mut form.title).changed() {
-                        form.edited = true;
-                    }
-                });
-                ui.label("Requirement text:");
-                if resizable_multiline(ui, "requirement_text", &mut form.requirement_text).changed() {
-                    form.edited = true;
-                }
-                ui.label("Requirement guidance:");
-                if resizable_multiline(ui, "requirement_guidance", &mut form.requirement_guidance).changed() {
-                    form.edited = true;
-                }
-                ui.label("Test guidance:");
-                if resizable_multiline(ui, "test_guidance", &mut form.test_guidance).changed() {
-                    form.edited = true;
-                }
-            }
-            if let Some(error) = &form.error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-
-            // Dependencies, unlike attachments below, aren't gated on
-            // `editing` — a brand new requirement can have dependencies
-            // set before it's ever created, since they're plain draft
-            // data submitted whole on Save/Create, not a local file pool
-            // requiring the entry to already exist.
-            ui.separator();
-            ui.label("Dependencies:");
-            let mut remove_dependency: Option<usize> = None;
-            let mut dependency_edited = false;
-            for (i, dep) in form.dependencies.iter_mut().enumerate() {
-                if read_only {
-                    ui.label(dep.to_string());
-                } else {
-                    ui.horizontal(|ui| {
-                        dependency_edited |= render_dependency_kind_picker(ui, dep);
-                        if ui.button("Remove").clicked() {
-                            remove_dependency = Some(i);
-                        }
-                    });
-                    let (changed, auto, pick_clicked) = render_dependency_fields(ui, dep, self.tree.as_ref());
-                    dependency_edited |= changed;
-                    if let Some(kind) = auto {
-                        auto_commit_clicked = Some((DependencySlot::Existing(i), kind));
-                    }
-                    if pick_clicked {
-                        pick_dependency_path_clicked = Some(DependencySlot::Existing(i));
-                    }
-                }
-            }
-            if let Some(i) = remove_dependency {
-                form.dependencies.remove(i);
-                dependency_edited = true;
-            }
-            if dependency_edited {
-                form.edited = true;
-            }
-            if let Some(error) = &form.commit_fetch_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-            if !read_only {
-                ui.label("Add dependency:");
-                ui.horizontal(|ui| {
-                    // Composing a not-yet-added entry isn't itself an
-                    // edit to the form's real content — only actually
-                    // clicking "Add dependency" below is, so this return
-                    // value is deliberately ignored (unlike the existing-
-                    // row loop above).
-                    render_dependency_kind_picker(ui, &mut form.new_dependency);
-                });
-                let (_, auto, pick_clicked) = render_dependency_fields(ui, &mut form.new_dependency, self.tree.as_ref());
-                if let Some(kind) = auto {
-                    auto_commit_clicked = Some((DependencySlot::New, kind));
-                }
-                if pick_clicked {
-                    pick_dependency_path_clicked = Some(DependencySlot::New);
-                }
-                if ui.button("Add dependency").clicked() {
-                    form.dependencies.push(form.new_dependency.clone());
-                    form.new_dependency = DependencyDraft::default();
-                    form.edited = true;
-                }
-            }
-
-            // Local attachments only make sense for an already-existing
-            // requirement — see `Command::AddRequirementAttachment`'s doc
-            // comment (the entry has to exist first). The viewer shows
-            // the list but not the Add/Remove controls — those mutate,
-            // which the viewer doesn't do.
-            if editing {
-                ui.separator();
-                ui.label("Local attachments:");
-                for path in &form.attachments {
-                    if read_only {
-                        ui.label(path.display().to_string());
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label(path.display().to_string());
-                            if ui.button("Remove").clicked() {
-                                remove_attachment = Some(path.clone());
-                            }
-                        });
-                    }
-                }
-                if !read_only {
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut form.new_attachment_path);
-                        if ui.button("Add").clicked() {
-                            add_attachment_clicked = true;
-                        }
-                    });
-                    if let Some(error) = &form.local_pool_error {
-                        ui.colored_label(egui::Color32::RED, error);
-                    }
-                }
-            }
-        }
         if edit_clicked {
             self.editor_edit_clicked();
         } else if create_clicked {
@@ -876,8 +1169,17 @@ impl GuiApp {
         if let Some(slot) = pick_dependency_path_clicked {
             self.path_picker_dialog_opened(PathPickerTarget::Dependency(slot));
         }
+        if let Some((target, logical)) = test_ref_auto_commit_clicked {
+            self.test_ref_commit_auto_clicked(target, logical);
+        }
+        if let Some(slot) = pick_test_ref_path_clicked {
+            self.path_picker_dialog_opened(PathPickerTarget::TestReference(slot));
+        }
         if refresh_stale_test_references_clicked {
             self.refresh_stale_test_references_clicked();
+        }
+        if let Some((target, kind)) = navigate_clicked {
+            self.select(target, kind);
         }
     }
 
@@ -890,6 +1192,7 @@ impl GuiApp {
         let mut remove_attachment: Option<PathBuf> = None;
         let mut add_template_clicked = false;
         let mut remove_template: Option<PathBuf> = None;
+        let mut recreate_clicked = false;
         {
             let EditorState::NewTest(form) = &mut self.editor else {
                 return;
@@ -897,7 +1200,13 @@ impl GuiApp {
             let editing = form.editing_target.is_some();
             let read_only = form.read_only;
             ui.horizontal(|ui| {
-                ui.heading(if read_only { "Test" } else if editing { "Edit Test" } else { "New Test" });
+                ui.heading(if read_only {
+                    "Test"
+                } else if editing {
+                    "Edit Test"
+                } else {
+                    "New Test"
+                });
                 if read_only {
                     if ui.button("Edit").clicked() {
                         edit_clicked = true;
@@ -908,7 +1217,10 @@ impl GuiApp {
                     // bottom.
                     let busy = form.pending_request.is_some();
                     let button_label = if editing { "Save" } else { "Create" };
-                    if ui.add_enabled(!busy, egui::Button::new(button_label)).clicked() {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(button_label))
+                        .clicked()
+                    {
                         create_clicked = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -919,109 +1231,134 @@ impl GuiApp {
                     if editing && ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
                         delete_clicked = true;
                     }
+                    // See the Requirement form's own comment on Recreate —
+                    // same reasoning, `RecreateTestState`.
+                    if editing && ui.button("Recreate…").clicked() {
+                        recreate_clicked = true;
+                    }
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                if read_only {
-                    ui.label(&form.name);
-                } else if ui.add_enabled(!editing, egui::TextEdit::singleline(&mut form.name)).changed() {
-                    form.edited = true;
-                }
-            });
-            if read_only {
-                ui.horizontal(|ui| {
-                    ui.label("Title:");
-                    ui.label(&form.title);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Result kind:");
-                    ui.label(match form.result_kind {
-                        ResultKindV1::FreeForm => "Free Form",
-                        ResultKindV1::Template => "Template",
-                    });
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Title:");
-                    if ui.text_edit_singleline(&mut form.title).changed() {
-                        form.edited = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Result kind:");
-                    if ui
-                        .radio(matches!(form.result_kind, ResultKindV1::FreeForm), "Free Form")
-                        .clicked()
-                    {
-                        form.result_kind = ResultKindV1::FreeForm;
-                        form.edited = true;
-                    }
-                    if ui
-                        .radio(matches!(form.result_kind, ResultKindV1::Template), "Template")
-                        .clicked()
-                    {
-                        form.result_kind = ResultKindV1::Template;
-                        form.edited = true;
-                    }
-                });
-            }
-            if let Some(error) = &form.error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-
-            if editing {
-                ui.separator();
-                ui.label("Local attachments:");
-                for path in &form.attachments {
-                    if read_only {
-                        ui.label(path.display().to_string());
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label(path.display().to_string());
-                            if ui.button("Remove").clicked() {
-                                remove_attachment = Some(path.clone());
-                            }
-                        });
-                    }
-                }
-                if !read_only {
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut form.new_attachment_path);
-                        if ui.button("Add").clicked() {
-                            add_attachment_clicked = true;
-                        }
-                    });
-                }
-
-                ui.separator();
-                ui.label("Local template files:");
-                for path in &form.template_files {
-                    if read_only {
-                        ui.label(path.display().to_string());
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label(path.display().to_string());
-                            if ui.button("Remove").clicked() {
-                                remove_template = Some(path.clone());
-                            }
-                        });
-                    }
-                }
-                if !read_only {
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut form.new_template_path);
-                        if ui.button("Add").clicked() {
-                            add_template_clicked = true;
-                        }
-                    });
-
-                    if let Some(error) = &form.local_pool_error {
-                        ui.colored_label(egui::Color32::RED, error);
-                    }
-                }
-            }
         }
+        // See the Requirement form's own comment on why the header
+        // renders outside this `ScrollArea`.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let EditorState::NewTest(form) = &mut self.editor else {
+                    return;
+                };
+                let editing = form.editing_target.is_some();
+                let read_only = form.read_only;
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    if read_only {
+                        ui.label(&form.name);
+                    } else if ui
+                        .add_enabled(!editing, egui::TextEdit::singleline(&mut form.name))
+                        .changed()
+                    {
+                        form.edited = true;
+                    }
+                });
+                if read_only {
+                    ui.horizontal(|ui| {
+                        ui.label("Title:");
+                        ui.label(&form.title);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Result kind:");
+                        ui.label(match form.result_kind {
+                            ResultKindV1::FreeForm => "Free Form",
+                            ResultKindV1::Template => "Template",
+                        });
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Title:");
+                        if ui.text_edit_singleline(&mut form.title).changed() {
+                            form.edited = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Result kind:");
+                        if ui
+                            .radio(
+                                matches!(form.result_kind, ResultKindV1::FreeForm),
+                                "Free Form",
+                            )
+                            .clicked()
+                        {
+                            form.result_kind = ResultKindV1::FreeForm;
+                            form.edited = true;
+                        }
+                        if ui
+                            .radio(
+                                matches!(form.result_kind, ResultKindV1::Template),
+                                "Template",
+                            )
+                            .clicked()
+                        {
+                            form.result_kind = ResultKindV1::Template;
+                            form.edited = true;
+                        }
+                    });
+                }
+                if let Some(error) = &form.error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+
+                if editing {
+                    ui.separator();
+                    ui.label("Local attachments:");
+                    for path in &form.attachments {
+                        if read_only {
+                            ui.label(path.display().to_string());
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(path.display().to_string());
+                                if ui.button("Remove").clicked() {
+                                    remove_attachment = Some(path.clone());
+                                }
+                            });
+                        }
+                    }
+                    if !read_only {
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut form.new_attachment_path);
+                            if ui.button("Add").clicked() {
+                                add_attachment_clicked = true;
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    ui.label("Local template files:");
+                    for path in &form.template_files {
+                        if read_only {
+                            ui.label(path.display().to_string());
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(path.display().to_string());
+                                if ui.button("Remove").clicked() {
+                                    remove_template = Some(path.clone());
+                                }
+                            });
+                        }
+                    }
+                    if !read_only {
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut form.new_template_path);
+                            if ui.button("Add").clicked() {
+                                add_template_clicked = true;
+                            }
+                        });
+
+                        if let Some(error) = &form.local_pool_error {
+                            ui.colored_label(egui::Color32::RED, error);
+                        }
+                    }
+                }
+            });
         if edit_clicked {
             self.editor_edit_clicked();
         } else if create_clicked {
@@ -1030,6 +1367,8 @@ impl GuiApp {
             self.editor_cancel_clicked();
         } else if delete_clicked {
             self.editor_delete_clicked();
+        } else if recreate_clicked {
+            self.recreate_test_clicked();
         } else if add_attachment_clicked {
             self.local_attachment_add_clicked(LocalPoolKind::TestAttachment);
         } else if let Some(path) = remove_attachment {
@@ -1056,7 +1395,13 @@ impl GuiApp {
             let editing = form.editing_target.is_some();
             let read_only = form.read_only;
             ui.horizontal(|ui| {
-                ui.heading(if read_only { "Result" } else if editing { "Edit Result" } else { "New Result" });
+                ui.heading(if read_only {
+                    "Result"
+                } else if editing {
+                    "Edit Result"
+                } else {
+                    "New Result"
+                });
                 if read_only {
                     if ui.button("Edit").clicked() {
                         edit_clicked = true;
@@ -1067,7 +1412,10 @@ impl GuiApp {
                     // bottom.
                     let busy = form.pending_request.is_some();
                     let button_label = if editing { "Save" } else { "Create" };
-                    if ui.add_enabled(!busy, egui::Button::new(button_label)).clicked() {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(button_label))
+                        .clicked()
+                    {
                         create_clicked = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1080,122 +1428,142 @@ impl GuiApp {
                     }
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                if read_only {
-                    ui.label(&form.name);
-                } else if ui.add_enabled(!editing, egui::TextEdit::singleline(&mut form.name)).changed() {
-                    form.edited = true;
-                }
-            });
-            if read_only {
+        }
+        // See the Requirement form's own comment on why the header
+        // renders outside this `ScrollArea`.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let EditorState::NewResult(form) = &mut self.editor else {
+                    return;
+                };
+                let editing = form.editing_target.is_some();
+                let read_only = form.read_only;
                 ui.horizontal(|ui| {
-                    ui.label("Title:");
-                    ui.label(&form.title);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Requirement path:");
-                    ui.label(&form.requirement_path);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Requirement commit:");
-                    ui.label(&form.requirement_commit);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Test path:");
-                    ui.label(&form.test_path);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Test commit:");
-                    ui.label(&form.test_commit);
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Title:");
-                    if ui.text_edit_singleline(&mut form.title).changed() {
-                        form.edited = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Requirement path:");
-                    if ui.text_edit_singleline(&mut form.requirement_path).changed() {
-                        form.edited = true;
-                    }
-                    // A picker, not a replacement for the field above —
-                    // typing the path by hand still works (e.g. pasting
-                    // one, or for when the target hasn't loaded into
-                    // `self.tree` yet). Opens the shared path-picker modal
-                    // (`GuiApp::path_picker_dialog`) rather than an inline
-                    // `ComboBox` — a project with enough requirements
-                    // would otherwise overflow a `ComboBox` popup right
-                    // off the screen, with no way to search it down to
-                    // the one wanted. Selecting an entry there fills this
-                    // same field with the correctly-formatted absolute
-                    // reference path, so the user doesn't have to know
-                    // `logical`'s `/[modules/<sub>/]*requirements/<name>`
-                    // syntax by heart.
-                    if self.tree.is_some() && ui.button("Pick…").clicked() {
-                        open_picker = Some(PathPickerTarget::ResultRequirementPath);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Requirement commit:");
-                    if ui.text_edit_singleline(&mut form.requirement_commit).changed() {
-                        form.edited = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Test path:");
-                    if ui.text_edit_singleline(&mut form.test_path).changed() {
-                        form.edited = true;
-                    }
-                    if self.tree.is_some() && ui.button("Pick…").clicked() {
-                        open_picker = Some(PathPickerTarget::ResultTestPath);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Test commit:");
-                    if ui.text_edit_singleline(&mut form.test_commit).changed() {
-                        form.edited = true;
-                    }
-                });
-                ui.label(
-                    "Commits aren't picked automatically yet — copy the target's \
-                     current commit by hand (see README's Open questions).",
-                );
-            }
-            if let Some(error) = &form.error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-
-            if editing {
-                ui.separator();
-                ui.label("Local attachments:");
-                for path in &form.attachments {
+                    ui.label("Name:");
                     if read_only {
-                        ui.label(path.display().to_string());
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label(path.display().to_string());
-                            if ui.button("Remove").clicked() {
-                                remove_attachment = Some(path.clone());
-                            }
-                        });
+                        ui.label(&form.name);
+                    } else if ui
+                        .add_enabled(!editing, egui::TextEdit::singleline(&mut form.name))
+                        .changed()
+                    {
+                        form.edited = true;
                     }
-                }
-                if !read_only {
+                });
+                if read_only {
                     ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut form.new_attachment_path);
-                        if ui.button("Add").clicked() {
-                            add_attachment_clicked = true;
+                        ui.label("Title:");
+                        ui.label(&form.title);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Requirement path:");
+                        ui.label(&form.requirement_path);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Requirement commit:");
+                        ui.label(&form.requirement_commit);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Test path:");
+                        ui.label(&form.test_path);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Test commit:");
+                        ui.label(&form.test_commit);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Title:");
+                        if ui.text_edit_singleline(&mut form.title).changed() {
+                            form.edited = true;
                         }
                     });
-                    if let Some(error) = &form.local_pool_error {
-                        ui.colored_label(egui::Color32::RED, error);
+                    ui.horizontal(|ui| {
+                        ui.label("Requirement path:");
+                        if ui
+                            .text_edit_singleline(&mut form.requirement_path)
+                            .changed()
+                        {
+                            form.edited = true;
+                        }
+                        // A picker, not a replacement for the field above —
+                        // typing the path by hand still works (e.g. pasting
+                        // one, or for when the target hasn't loaded into
+                        // `self.tree` yet). Opens the shared path-picker modal
+                        // (`GuiApp::path_picker_dialog`) rather than an inline
+                        // `ComboBox` — a project with enough requirements
+                        // would otherwise overflow a `ComboBox` popup right
+                        // off the screen, with no way to search it down to
+                        // the one wanted. Selecting an entry there fills this
+                        // same field with the correctly-formatted absolute
+                        // reference path, so the user doesn't have to know
+                        // `logical`'s `/[modules/<sub>/]*requirements/<name>`
+                        // syntax by heart.
+                        if self.tree.is_some() && ui.button("Pick…").clicked() {
+                            open_picker = Some(PathPickerTarget::ResultRequirementPath);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Requirement commit:");
+                        if ui
+                            .text_edit_singleline(&mut form.requirement_commit)
+                            .changed()
+                        {
+                            form.edited = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Test path:");
+                        if ui.text_edit_singleline(&mut form.test_path).changed() {
+                            form.edited = true;
+                        }
+                        if self.tree.is_some() && ui.button("Pick…").clicked() {
+                            open_picker = Some(PathPickerTarget::ResultTestPath);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Test commit:");
+                        if ui.text_edit_singleline(&mut form.test_commit).changed() {
+                            form.edited = true;
+                        }
+                    });
+                    ui.label(
+                        "Commits aren't picked automatically yet — copy the target's \
+                     current commit by hand (see README's Open questions).",
+                    );
+                }
+                if let Some(error) = &form.error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+
+                if editing {
+                    ui.separator();
+                    ui.label("Local attachments:");
+                    for path in &form.attachments {
+                        if read_only {
+                            ui.label(path.display().to_string());
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(path.display().to_string());
+                                if ui.button("Remove").clicked() {
+                                    remove_attachment = Some(path.clone());
+                                }
+                            });
+                        }
+                    }
+                    if !read_only {
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut form.new_attachment_path);
+                            if ui.button("Add").clicked() {
+                                add_attachment_clicked = true;
+                            }
+                        });
+                        if let Some(error) = &form.local_pool_error {
+                            ui.colored_label(egui::Color32::RED, error);
+                        }
                     }
                 }
-            }
-        }
+            });
         if edit_clicked {
             self.editor_edit_clicked();
         } else if create_clicked {
@@ -1231,7 +1599,10 @@ impl GuiApp {
             }
             let creating = form.pending_request.is_some();
             ui.horizontal(|ui| {
-                if ui.add_enabled(!creating, egui::Button::new("Create")).clicked() {
+                if ui
+                    .add_enabled(!creating, egui::Button::new("Create"))
+                    .clicked()
+                {
                     create_clicked = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -1286,47 +1657,70 @@ impl GuiApp {
                     }
                 }
             });
-
-            if form.read_only {
-                match &form.summary {
-                    None => {
-                        ui.label("Loading…");
-                    }
-                    Some(summary) => {
-                        ui.label(format!("Submodules: {}", summary.submodule_count));
-                        ui.label(format!("Requirements: {}", summary.requirement_count));
-                        ui.label(format!("Tests: {}", summary.test_count));
-                        ui.label(format!("Results: {}", summary.result_count));
-                        ui.separator();
-                        if summary.validated {
-                            let met_pct = percentage(summary.requirements_met, summary.requirement_count);
-                            ui.label(format!(
-                                "Requirements met: {} / {} ({met_pct:.0}%)",
-                                summary.requirements_met, summary.requirement_count
-                            ));
-                            let pass_pct = percentage(summary.results_pass, summary.result_count);
-                            let fail_pct = percentage(summary.results_fail, summary.result_count);
-                            let incomplete_pct = percentage(summary.results_incomplete, summary.result_count);
-                            ui.label(format!("Pass: {} ({pass_pct:.0}%)", summary.results_pass));
-                            ui.label(format!("Fail: {} ({fail_pct:.0}%)", summary.results_fail));
-                            ui.label(format!("Incomplete: {} ({incomplete_pct:.0}%)", summary.results_incomplete));
-                        } else {
-                            ui.label("Project not validated — met/pass/fail statistics unavailable.");
+        }
+        // See the Requirement form's own comment on why the header
+        // renders outside this `ScrollArea`.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let EditorState::ExistingModule(form) = &mut self.editor else {
+                    return;
+                };
+                if form.read_only {
+                    match &form.summary {
+                        None => {
+                            ui.label("Loading…");
+                        }
+                        Some(summary) => {
+                            ui.label(format!("Submodules: {}", summary.submodule_count));
+                            ui.label(format!("Requirements: {}", summary.requirement_count));
+                            ui.label(format!("Tests: {}", summary.test_count));
+                            ui.label(format!("Results: {}", summary.result_count));
+                            ui.separator();
+                            if summary.validated {
+                                let met_pct =
+                                    percentage(summary.requirements_met, summary.requirement_count);
+                                ui.label(format!(
+                                    "Requirements met: {} / {} ({met_pct:.0}%)",
+                                    summary.requirements_met, summary.requirement_count
+                                ));
+                                let pass_pct =
+                                    percentage(summary.results_pass, summary.result_count);
+                                let fail_pct =
+                                    percentage(summary.results_fail, summary.result_count);
+                                let incomplete_pct =
+                                    percentage(summary.results_incomplete, summary.result_count);
+                                ui.label(format!(
+                                    "Pass: {} ({pass_pct:.0}%)",
+                                    summary.results_pass
+                                ));
+                                ui.label(format!(
+                                    "Fail: {} ({fail_pct:.0}%)",
+                                    summary.results_fail
+                                ));
+                                ui.label(format!(
+                                    "Incomplete: {} ({incomplete_pct:.0}%)",
+                                    summary.results_incomplete
+                                ));
+                            } else {
+                                ui.label(
+                                    "Project not validated — met/pass/fail statistics unavailable.",
+                                );
+                            }
                         }
                     }
-                }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    if ui.text_edit_singleline(&mut form.new_name).changed() {
-                        form.edited = true;
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        if ui.text_edit_singleline(&mut form.new_name).changed() {
+                            form.edited = true;
+                        }
+                    });
+                    if let Some(error) = &form.error {
+                        ui.colored_label(egui::Color32::RED, error);
                     }
-                });
-                if let Some(error) = &form.error {
-                    ui.colored_label(egui::Color32::RED, error);
                 }
-            }
-        }
+            });
         if edit_clicked {
             self.editor_edit_clicked();
         } else if save_clicked {
@@ -1454,28 +1848,32 @@ impl GuiApp {
             return;
         };
 
-        egui::Modal::new(egui::Id::new("validate_before_save_dialog")).show(ui.ctx(), |ui| match state {
-            ValidateBeforeSaveDialogState::Asking { .. } => {
-                ui.label("This project must be validated before it can be saved. Validate now?");
-                ui.horizontal(|ui| {
-                    if ui.button("Validate").clicked() {
-                        self.validate_before_save_confirmed();
+        egui::Modal::new(egui::Id::new("validate_before_save_dialog")).show(ui.ctx(), |ui| {
+            match state {
+                ValidateBeforeSaveDialogState::Asking { .. } => {
+                    ui.label(
+                        "This project must be validated before it can be saved. Validate now?",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Validate").clicked() {
+                            self.validate_before_save_confirmed();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.validate_before_save_dismissed();
+                        }
+                    });
+                }
+                ValidateBeforeSaveDialogState::Validating { .. } => {
+                    ui.label("Validating…");
+                }
+                ValidateBeforeSaveDialogState::Failed { errors } => {
+                    ui.label("Validation failed:");
+                    for error in &errors {
+                        ui.label(format!("\u{2022} {error}"));
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Ok").clicked() {
                         self.validate_before_save_dismissed();
                     }
-                });
-            }
-            ValidateBeforeSaveDialogState::Validating { .. } => {
-                ui.label("Validating…");
-            }
-            ValidateBeforeSaveDialogState::Failed { errors } => {
-                ui.label("Validation failed:");
-                for error in &errors {
-                    ui.label(format!("\u{2022} {error}"));
-                }
-                if ui.button("Ok").clicked() {
-                    self.validate_before_save_dismissed();
                 }
             }
         });
@@ -1629,6 +2027,140 @@ impl GuiApp {
         }
     }
 
+    /// The "Commit all changes" modal — a multiline commit-message box
+    /// (see `resizable_multiline`) plus a scrollable, depth-then-
+    /// alphabetically sorted list of every path `GetChangedFiles` reported
+    /// (already sorted by `apply_changed_files` — this just renders it in
+    /// that order). Same bounded-`ScrollArea` shape as
+    /// `render_path_picker_dialog` so a large changeset never grows the
+    /// modal itself unbounded.
+    pub(crate) fn render_commit_all_dialog(&mut self, ui: &mut egui::Ui) {
+        if self.commit_all_dialog.is_none() {
+            return;
+        }
+
+        let mut close_clicked = false;
+        let mut commit_clicked = false;
+
+        // Keep at least this many pixels between the modal's bottom edge and
+        // the window edge — `egui::Modal` centers on the full screen but
+        // never shrinks its frame to fit, so a long changed-files list near
+        // the old fixed 300px cap could otherwise push the frame straight
+        // past the viewport's bottom.
+        const SCREEN_MARGIN: f32 = 10.0;
+        // Rough, deliberately generous estimate of the popup frame's own
+        // margin/shadow plus the heading/labels/separators/button row
+        // surrounding the file list below — subtracted up front so the
+        // *outer* modal border still clears `SCREEN_MARGIN` once that
+        // chrome is added back around whatever we cap the file list to.
+        const CHROME_BUFFER: f32 = 180.0;
+
+        // Floor kept for the changed-files list once the message box has
+        // taken whatever it wants — small enough to still show a couple of
+        // rows, never fully squeezed out by a tall commit message.
+        const FILE_LIST_MIN_HEIGHT: f32 = 60.0;
+
+        let screen_rect = ui.ctx().content_rect();
+        let resizable_budget =
+            (screen_rect.height() - 2.0 * SCREEN_MARGIN - CHROME_BUFFER).max(200.0);
+        // The message box can grow almost the whole budget — it's capped
+        // only so the file list always keeps its floor — and whatever
+        // height it actually ends up at (grown by content or dragged by
+        // the user) is subtracted below to size the file list, so growing
+        // the message box steals space from the file list instead of the
+        // modal growing past the screen edge.
+        let max_message_height = (resizable_budget - FILE_LIST_MIN_HEIGHT)
+            .max(MULTILINE_ROW_HEIGHT * MULTILINE_MIN_ROWS as f32);
+        let width = screen_rect.width() * 0.66;
+
+        egui::Modal::new(egui::Id::new("commit_all_dialog")).show(ui.ctx(), |ui| {
+            let Some(dialog) = &mut self.commit_all_dialog else {
+                return;
+            };
+            ui.set_width(width);
+            ui.heading("Commit all changes");
+
+            if dialog.loading {
+                ui.label("Loading…");
+            } else {
+                // Reserve exactly `resizable_budget` of vertical space for
+                // the message box and file list together, then size the
+                // file list to whatever's actually left in it once the
+                // message box (and the labels/separator around it) have
+                // really been laid out — measuring the live cursor this way
+                // (instead of subtracting the message box's own reported
+                // height from the budget) absorbs any of `Resize`'s own
+                // chrome that isn't part of that reported height, so the
+                // modal's total height stays constant as the message box is
+                // dragged, rather than drifting by that leftover chrome.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, resizable_budget),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_height(resizable_budget);
+                        ui.label("Commit message:");
+                        resizable_multiline_with_max_height(
+                            ui,
+                            "commit_all_message",
+                            &mut dialog.message,
+                            max_message_height,
+                        );
+
+                        ui.separator();
+                        ui.label(format!("Changed files ({}):", dialog.changed_files.len()));
+                        let max_file_list_height = ui.available_height().max(FILE_LIST_MIN_HEIGHT);
+                        egui::ScrollArea::vertical()
+                            .max_height(max_file_list_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if dialog.changed_files.is_empty() {
+                                    ui.label("No changes.");
+                                } else {
+                                    for path in &dialog.changed_files {
+                                        ui.label(path.display().to_string());
+                                    }
+                                }
+                            });
+                    },
+                );
+            }
+
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                let can_commit = !dialog.loading
+                    && !dialog.committing
+                    && !dialog.changed_files.is_empty()
+                    && !dialog.message.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        can_commit,
+                        egui::Button::new(if dialog.committing {
+                            "Committing…"
+                        } else {
+                            "Commit"
+                        }),
+                    )
+                    .clicked()
+                {
+                    commit_clicked = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close_clicked = true;
+                }
+            });
+        });
+
+        if commit_clicked {
+            self.commit_all_dialog_commit_clicked();
+        } else if close_clicked {
+            self.commit_all_dialog_closed();
+        }
+    }
+
     /// The path-picker modal — see `PathPickerDialogState`'s own doc
     /// comment on why this replaced a per-field `egui::ComboBox`: a
     /// `ComboBox` popup sizes itself to its content with no scrolling, so
@@ -1653,28 +2185,32 @@ impl GuiApp {
             ui.heading(match dialog.kind {
                 EntryKind::Requirement => "Pick a requirement",
                 EntryKind::Test => "Pick a test",
-                EntryKind::Module | EntryKind::Result => unreachable!("no picker ever targets a module or result"),
+                EntryKind::Module | EntryKind::Result => {
+                    unreachable!("no picker ever targets a module or result")
+                }
             });
             ui.text_edit_singleline(&mut dialog.filter);
             let kind_segment = leaf_kind_segment(dialog.kind);
             let filter = dialog.filter.to_lowercase();
 
-            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                let mut any_shown = false;
-                for target in flatten_leaf_paths(tree, dialog.kind) {
-                    let path_str = absolute_reference_path(&target, kind_segment);
-                    if !filter.is_empty() && !path_str.to_lowercase().contains(&filter) {
-                        continue;
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    let mut any_shown = false;
+                    for target in flatten_leaf_paths(tree, dialog.kind) {
+                        let path_str = absolute_reference_path(&target, kind_segment);
+                        if !filter.is_empty() && !path_str.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        any_shown = true;
+                        if ui.selectable_label(false, target.to_string()).clicked() {
+                            picked = Some(target);
+                        }
                     }
-                    any_shown = true;
-                    if ui.selectable_label(false, target.to_string()).clicked() {
-                        picked = Some(target);
+                    if !any_shown {
+                        ui.label("No matches.");
                     }
-                }
-                if !any_shown {
-                    ui.label("No matches.");
-                }
-            });
+                });
 
             ui.separator();
             if ui.button("Cancel").clicked() {
@@ -1734,7 +2270,10 @@ impl GuiApp {
         let busy = dialog.pending_request.is_some();
         egui::Modal::new(egui::Id::new("delete_confirm_dialog")).show(ui.ctx(), |ui| {
             ui.heading("Delete?");
-            ui.label(format!("This will permanently delete \"{}\". This cannot be undone.", dialog.label));
+            ui.label(format!(
+                "This will permanently delete \"{}\". This cannot be undone.",
+                dialog.label
+            ));
             if let Some(error) = &dialog.error {
                 ui.colored_label(egui::Color32::RED, error);
             }
@@ -1811,76 +2350,151 @@ impl GuiApp {
         }
     }
 
+    pub(crate) fn render_recreate_test_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.recreate_test_dialog.clone() else {
+            return;
+        };
+
+        let mut new_name = dialog.new_name;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let busy = dialog.pending_request.is_some();
+        egui::Modal::new(egui::Id::new("recreate_test_dialog")).show(ui.ctx(), |ui| {
+            ui.heading("Recreate Test");
+            ui.label(format!(
+                "This deletes \"{}\" and creates a new test with the same contents under a new stable name.",
+                dialog.target.name
+            ));
+            ui.horizontal(|ui| {
+                ui.label("New name:");
+                ui.text_edit_singleline(&mut new_name);
+            });
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy && !new_name.trim().is_empty(), egui::Button::new("Recreate"))
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+                if ui.add_enabled(!busy && !dialog.deleted, egui::Button::new("Cancel")).clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+        if confirmed {
+            if let Some(dialog) = &mut self.recreate_test_dialog {
+                dialog.new_name = new_name;
+            }
+            self.recreate_test_confirmed();
+        } else if cancelled {
+            self.recreate_test_cancelled();
+        } else if let Some(dialog) = &mut self.recreate_test_dialog {
+            dialog.new_name = new_name;
+        }
+    }
+
     #[cfg(all(feature = "debug-panel", debug_assertions))]
     pub(crate) fn render_debug_panel(&mut self, ui: &mut egui::Ui) {
         if !self.debug.open {
             return;
         }
 
-        egui::Panel::right("debug_panel").default_size(320.0).size_range(240.0..=600.0).show(ui, |ui| {
-            ui.heading("Debug");
+        egui::Panel::right("debug_panel")
+            .default_size(320.0)
+            .size_range(240.0..=600.0)
+            .show(ui, |ui| {
+                ui.heading("Debug");
 
-            ui.separator();
-            ui.label("Local gui-ui state:");
-            ui.label(format!("pending: {}", self.pending.len()));
-            ui.label(format!("dirty: {}", self.dirty));
-            ui.label(format!("selection: {:?}", self.selection));
-            ui.label(format!("selected_module: {:?}", self.selected_module));
-            ui.label(format!("project_path: {:?}", self.project_path));
-            ui.label(format!("nav_history: {} entries, position {}", self.nav_history.len(), self.nav_position));
-            ui.label(format!("exit_dialog: {:?}", self.exit_dialog));
+                ui.separator();
+                ui.label("Local gui-ui state:");
+                ui.label(format!("pending: {}", self.pending.len()));
+                ui.label(format!("dirty: {}", self.dirty));
+                ui.label(format!("selection: {:?}", self.selection));
+                ui.label(format!("selected_module: {:?}", self.selected_module));
+                ui.label(format!("project_path: {:?}", self.project_path));
+                ui.label(format!(
+                    "nav_history: {} entries, position {}",
+                    self.nav_history.len(),
+                    self.nav_position
+                ));
+                ui.label(format!("exit_dialog: {:?}", self.exit_dialog));
 
-            ui.separator();
-            ui.label("Trigger:");
-            ui.horizontal(|ui| {
-                if ui.button("Tx Stall").clicked() {
-                    self.debug.trigger_tx_stall(std::time::Instant::now());
+                ui.separator();
+                ui.label("Trigger:");
+                ui.horizontal(|ui| {
+                    if ui.button("Tx Stall").clicked() {
+                        self.debug.trigger_tx_stall(std::time::Instant::now());
+                    }
+                    if ui.button("Tx Failure").clicked() {
+                        self.debug.trigger_tx_failure();
+                    }
+                    if ui.button("Rx Stall").clicked() {
+                        self.debug.trigger_rx_stall(std::time::Instant::now());
+                    }
+                });
+                if self.debug.is_tx_stalled() {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Tx is currently stalled — commands are queuing.",
+                    );
                 }
-                if ui.button("Tx Failure").clicked() {
-                    self.debug.trigger_tx_failure();
+                if self.debug.is_rx_stalled(std::time::Instant::now()) {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Rx is currently stalled — events are queuing.",
+                    );
                 }
-                if ui.button("Rx Stall").clicked() {
-                    self.debug.trigger_rx_stall(std::time::Instant::now());
-                }
+                // No "Rx Failure" button — a genuine one (an `Event` `gui-core`
+                // computed but never sent) needs real `gui-core` cooperation
+                // to reproduce honestly, which isn't built yet; see README's
+                // "Planned: debug side panel" for the open decision on
+                // whether that's worth adding to `gui-core`'s production
+                // `Command` enum for a purely diagnostic feature.
+                ui.label("(Rx Failure not implemented — see README)");
+
+                ui.separator();
+                ui.label(format!(
+                    "Message log ({} entries, oldest first):",
+                    self.debug.log.len()
+                ));
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for entry in &self.debug.log {
+                            let prefix = match entry.direction {
+                                crate::debug_panel::LogDirection::Tx => "→ Tx",
+                                crate::debug_panel::LogDirection::TxDropped => "✗ Tx dropped",
+                                crate::debug_panel::LogDirection::Rx => "← Rx",
+                            };
+                            // `at.elapsed()` — recomputed fresh every frame from
+                            // when this entry was actually logged, rather than a
+                            // value baked in once, so "how long ago" keeps
+                            // ticking up correctly while the panel stays open.
+                            ui.label(format!(
+                                "[{:>6.1}s] {prefix}: {}",
+                                entry.at.elapsed().as_secs_f32(),
+                                entry.detail
+                            ));
+                        }
+                    });
             });
-            if self.debug.is_tx_stalled() {
-                ui.colored_label(egui::Color32::YELLOW, "Tx is currently stalled — commands are queuing.");
-            }
-            if self.debug.is_rx_stalled(std::time::Instant::now()) {
-                ui.colored_label(egui::Color32::YELLOW, "Rx is currently stalled — events are queuing.");
-            }
-            // No "Rx Failure" button — a genuine one (an `Event` `gui-core`
-            // computed but never sent) needs real `gui-core` cooperation
-            // to reproduce honestly, which isn't built yet; see README's
-            // "Planned: debug side panel" for the open decision on
-            // whether that's worth adding to `gui-core`'s production
-            // `Command` enum for a purely diagnostic feature.
-            ui.label("(Rx Failure not implemented — see README)");
-
-            ui.separator();
-            ui.label(format!("Message log ({} entries, oldest first):", self.debug.log.len()));
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for entry in &self.debug.log {
-                    let prefix = match entry.direction {
-                        crate::debug_panel::LogDirection::Tx => "→ Tx",
-                        crate::debug_panel::LogDirection::TxDropped => "✗ Tx dropped",
-                        crate::debug_panel::LogDirection::Rx => "← Rx",
-                    };
-                    // `at.elapsed()` — recomputed fresh every frame from
-                    // when this entry was actually logged, rather than a
-                    // value baked in once, so "how long ago" keeps
-                    // ticking up correctly while the panel stays open.
-                    ui.label(format!("[{:>6.1}s] {prefix}: {}", entry.at.elapsed().as_secs_f32(), entry.detail));
-                }
-            });
-        });
     }
 }
 
 /// Only ever called for a `Module` node — `render_module_children` filters
 /// to `EntryKind::Module` before recursing here, since the top tree pane
 /// no longer renders leaves at all.
-fn render_tree_node(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName], force_open: Option<bool>) {
+fn render_tree_node(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    node: &TreeNode,
+    module_path: &[EntryName],
+    force_open: Option<bool>,
+) {
     // A module with no matching descendant module (filter active) is
     // skipped entirely, not just collapsed — see `module_matches_filter`'s
     // own doc comment.
@@ -1897,14 +2511,24 @@ fn render_tree_node(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module
         // doc comment) — this button is the only way to make it the
         // "current module" new entries and the Attachments dialog target;
         // the CollapsingHeader label itself only toggles expand/collapse.
-        let glyph = if is_current { icons::MODULE_CURRENT } else { icons::MODULE_NOT_CURRENT };
+        let glyph = if is_current {
+            icons::MODULE_CURRENT
+        } else {
+            icons::MODULE_NOT_CURRENT
+        };
         let mut text = egui::RichText::new(glyph);
         if is_current {
             text = text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
         }
-        if ui.add(egui::Button::new(text).small()).on_hover_text("Set as current module").clicked() {
+        if ui
+            .add(egui::Button::new(text).small())
+            .on_hover_text("Set as current module")
+            .clicked()
+        {
             if app.editor_has_unsaved_edits() {
-                app.unsaved_form_dialog_opened(PendingNavigation::SelectModule(this_module_path.clone()));
+                app.unsaved_form_dialog_opened(PendingNavigation::SelectModule(
+                    this_module_path.clone(),
+                ));
             } else {
                 app.select_module(this_module_path.clone());
             }
@@ -1959,7 +2583,9 @@ fn render_leaf_group(
 ) {
     let matching: Vec<&TreeNode> = children
         .iter()
-        .filter(|child| child.kind == kind && node_matches_filter(child, module_path, &app.tree_filter))
+        .filter(|child| {
+            child.kind == kind && node_matches_filter(child, module_path, &app.tree_filter)
+        })
         .collect();
     if matching.is_empty() {
         return;
@@ -1981,10 +2607,10 @@ fn render_leaf_group(
         .default_open(false)
         .open(display.force_open)
         .show(ui, |ui| {
-        for leaf in matching {
-            render_leaf(app, ui, leaf, module_path);
-        }
-    });
+            for leaf in matching {
+                render_leaf(app, ui, leaf, module_path);
+            }
+        });
 }
 
 /// The two per-frame, per-group settings `render_leaf_group` needs beyond
@@ -2071,7 +2697,12 @@ fn resolve_tree_module<'a>(root: &'a TreeNode, path: &[EntryName]) -> Option<&'a
 /// project's. Mirrors `render_module_children`'s old (pre-split)
 /// requirement/test/result grouping, but against exactly one module's own
 /// `children` instead of recursing into every module in the tree.
-fn render_selected_module_pane(app: &mut GuiApp, ui: &mut egui::Ui, tree: &TreeSnapshot, force_open: Option<bool>) {
+fn render_selected_module_pane(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    tree: &TreeSnapshot,
+    force_open: Option<bool>,
+) {
     let module_path = app.selected_module.clone();
     let Some(node) = resolve_tree_module(&tree.root, &module_path) else {
         // Can happen if the selected module was just deleted out from
@@ -2079,8 +2710,12 @@ fn render_selected_module_pane(app: &mut GuiApp, ui: &mut egui::Ui, tree: &TreeS
         ui.label("Selected module no longer exists.");
         return;
     };
-    let has_submodules = node.children.iter().any(|child| child.kind == EntryKind::Module);
-    let requirement_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Requirement));
+    let has_submodules = node
+        .children
+        .iter()
+        .any(|child| child.kind == EntryKind::Module);
+    let requirement_total =
+        has_submodules.then(|| count_kind_recursive(node, EntryKind::Requirement));
     let test_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Test));
     let result_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Result));
     let children = node.children.clone();
@@ -2092,7 +2727,10 @@ fn render_selected_module_pane(app: &mut GuiApp, ui: &mut egui::Ui, tree: &TreeS
         EntryKind::Requirement,
         &children,
         &module_path,
-        LeafGroupDisplay { force_open, recursive_total: requirement_total },
+        LeafGroupDisplay {
+            force_open,
+            recursive_total: requirement_total,
+        },
     );
     render_leaf_group(
         app,
@@ -2101,7 +2739,10 @@ fn render_selected_module_pane(app: &mut GuiApp, ui: &mut egui::Ui, tree: &TreeS
         EntryKind::Test,
         &children,
         &module_path,
-        LeafGroupDisplay { force_open, recursive_total: test_total },
+        LeafGroupDisplay {
+            force_open,
+            recursive_total: test_total,
+        },
     );
     render_leaf_group(
         app,
@@ -2110,7 +2751,10 @@ fn render_selected_module_pane(app: &mut GuiApp, ui: &mut egui::Ui, tree: &TreeS
         EntryKind::Result,
         &children,
         &module_path,
-        LeafGroupDisplay { force_open, recursive_total: result_total },
+        LeafGroupDisplay {
+            force_open,
+            recursive_total: result_total,
+        },
     );
 
     if let Some(pools) = app.sidebar_pools.clone() {
@@ -2128,11 +2772,13 @@ fn render_pool_group(ui: &mut egui::Ui, title: &str, paths: &[PathBuf]) {
     if paths.is_empty() {
         return;
     }
-    egui::CollapsingHeader::new(title).default_open(false).show(ui, |ui| {
-        for path in paths {
-            ui.label(path.display().to_string());
-        }
-    });
+    egui::CollapsingHeader::new(title)
+        .default_open(false)
+        .show(ui, |ui| {
+            for path in paths {
+                ui.label(path.display().to_string());
+            }
+        });
 }
 
 /// Three radio buttons switching `dep`'s variant — resets its fields to
@@ -2146,14 +2792,23 @@ fn render_pool_group(ui: &mut egui::Ui, title: &str, paths: &[PathBuf]) {
 /// real has changed until it's actually added — see both call sites in
 /// `render_requirement_form`).
 fn render_dependency_kind_picker(ui: &mut egui::Ui, dep: &mut DependencyDraft) -> bool {
-    if ui.radio(matches!(dep, DependencyDraft::LocalRequirement { .. }), "Local").clicked() {
+    if ui
+        .radio(
+            matches!(dep, DependencyDraft::LocalRequirement { .. }),
+            "Local",
+        )
+        .clicked()
+    {
         *dep = DependencyDraft::LocalRequirement {
             path: String::new(),
             commit: String::new(),
         };
         return true;
     }
-    if ui.radio(matches!(dep, DependencyDraft::Remote { .. }), "Remote").clicked() {
+    if ui
+        .radio(matches!(dep, DependencyDraft::Remote { .. }), "Remote")
+        .clicked()
+    {
         *dep = DependencyDraft::Remote {
             url: String::new(),
             path: String::new(),
@@ -2161,7 +2816,10 @@ fn render_dependency_kind_picker(ui: &mut egui::Ui, dep: &mut DependencyDraft) -
         };
         return true;
     }
-    if ui.radio(matches!(dep, DependencyDraft::Submodules), "Submodules").clicked() {
+    if ui
+        .radio(matches!(dep, DependencyDraft::Submodules), "Submodules")
+        .clicked()
+    {
         *dep = DependencyDraft::Submodules;
         return true;
     }
@@ -2241,7 +2899,11 @@ fn render_dependency_fields(
                 if ui.button("Auto").clicked() && !url.trim().is_empty() {
                     auto = Some(AutoCommitKind::Remote {
                         url: url.clone(),
-                        path: if path.trim().is_empty() { None } else { Some(ReferencePath(path.clone())) },
+                        path: if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(ReferencePath(path.clone()))
+                        },
                     });
                 }
             });
@@ -2249,6 +2911,48 @@ fn render_dependency_fields(
         }
         DependencyDraft::Submodules => (false, None, false),
     }
+}
+
+/// `test_ref`'s own editable fields — a `TestRefDraft` only ever has one
+/// shape (`path`/`commit`, like `DependencyDraft::LocalRequirement`), so
+/// unlike dependencies there's no kind picker. Same return-value and
+/// "capture during rendering, act after the borrow of `self.editor` ends"
+/// conventions as `render_dependency_fields`: `changed` for a plain text
+/// edit, `auto` for an "Auto" commit-fetch click (turned into a
+/// `GuiApp::test_ref_commit_auto_clicked` call by the caller), `pick_clicked`
+/// for a "Pick…" click (turned into `GuiApp::path_picker_dialog_opened`).
+fn render_test_ref_fields(
+    ui: &mut egui::Ui,
+    test_ref: &mut TestRefDraft,
+    tree: Option<&TreeSnapshot>,
+) -> (bool, Option<LogicalPath>, bool) {
+    let mut changed = false;
+    let mut auto = None;
+    let mut pick_clicked = false;
+    ui.horizontal(|ui| {
+        ui.label("Path:");
+        changed |= ui.text_edit_singleline(&mut test_ref.path).changed();
+        if tree.is_some() && ui.button("Pick…").clicked() {
+            pick_clicked = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Commit:");
+        changed |= ui.text_edit_singleline(&mut test_ref.commit).changed();
+        if ui.button("Auto").clicked()
+            && let Some(tree) = tree
+            && let Some(target) =
+                flatten_leaf_paths(tree, EntryKind::Test)
+                    .into_iter()
+                    .find(|target| {
+                        absolute_reference_path(target, leaf_kind_segment(EntryKind::Test))
+                            == test_ref.path
+                    })
+        {
+            auto = Some(target);
+        }
+    });
+    (changed, auto, pick_clicked)
 }
 
 /// Whether `node` (a leaf or a module) should be visible under the left
@@ -2284,7 +2988,12 @@ fn module_matches_filter(node: &TreeNode, module_path: &[EntryName], filter: &st
     let filter = filter.to_lowercase();
     let mut this_module_path = module_path.to_vec();
     this_module_path.push(node.name.clone());
-    let full_path = this_module_path.iter().map(EntryName::as_str).collect::<Vec<_>>().join("/").to_lowercase();
+    let full_path = this_module_path
+        .iter()
+        .map(EntryName::as_str)
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase();
     if full_path.contains(&filter) {
         return true;
     }
@@ -2320,14 +3029,18 @@ fn node_matches_filter(node: &TreeNode, module_path: &[EntryName], filter: &str)
         EntryKind::Module => {
             let mut this_module_path = module_path.to_vec();
             this_module_path.push(node.name.clone());
-            node.children.iter().any(|child| node_matches_filter(child, &this_module_path, &filter))
+            node.children
+                .iter()
+                .any(|child| node_matches_filter(child, &this_module_path, &filter))
         }
         leaf_kind => {
             let target = LogicalPath {
                 modules: module_path.to_vec(),
                 name: node.name.clone(),
             };
-            absolute_reference_path(&target, leaf_kind_segment(leaf_kind)).to_lowercase().contains(&filter)
+            absolute_reference_path(&target, leaf_kind_segment(leaf_kind))
+                .to_lowercase()
+                .contains(&filter)
         }
     }
 }
@@ -2363,7 +3076,10 @@ mod test {
     #[test]
     fn absolute_reference_path_for_a_root_level_entry_has_no_module_segments() {
         let target = LogicalPath::root(name("definition"));
-        assert_eq!(absolute_reference_path(&target, "requirements"), "/requirements/definition");
+        assert_eq!(
+            absolute_reference_path(&target, "requirements"),
+            "/requirements/definition"
+        );
     }
 
     #[test]
@@ -2385,7 +3101,10 @@ mod test {
             // a child's path — see this function's own doc comment.
             root: module(
                 "Capstone",
-                vec![leaf(EntryKind::Requirement, "definition"), leaf(EntryKind::Test, "generic_test")],
+                vec![
+                    leaf(EntryKind::Requirement, "definition"),
+                    leaf(EntryKind::Test, "generic_test"),
+                ],
             ),
             can_undo: false,
             can_redo: false,
@@ -2401,7 +3120,10 @@ mod test {
         let tree = TreeSnapshot {
             root: module(
                 "Capstone",
-                vec![module("setup", vec![leaf(EntryKind::Requirement, "nested_requirement")])],
+                vec![module(
+                    "setup",
+                    vec![leaf(EntryKind::Requirement, "nested_requirement")],
+                )],
             ),
             can_undo: false,
             can_redo: false,
@@ -2423,13 +3145,54 @@ mod test {
         let tree = TreeSnapshot {
             root: module(
                 "Capstone",
-                vec![leaf(EntryKind::Requirement, "definition"), leaf(EntryKind::Result, "definition")],
+                vec![
+                    leaf(EntryKind::Requirement, "definition"),
+                    leaf(EntryKind::Result, "definition"),
+                ],
             ),
             can_undo: false,
             can_redo: false,
         };
 
         assert_eq!(flatten_leaf_paths(&tree, EntryKind::Test), Vec::new());
+    }
+
+    #[test]
+    fn flatten_leaf_paths_orders_shallower_modules_before_deeper_ones() {
+        // "zzz_root_level" sorts after "nested" alphabetically, so this
+        // only passes if depth — not tree-walk/name order — decides the
+        // result: the picker should list the project root's own entries,
+        // then a module's, before a submodule's, regardless of naming.
+        let tree = TreeSnapshot {
+            root: module(
+                "Capstone",
+                vec![
+                    module(
+                        "nested",
+                        vec![module(
+                            "deeper",
+                            vec![leaf(EntryKind::Requirement, "deepest")],
+                        )],
+                    ),
+                    leaf(EntryKind::Requirement, "zzz_root_level"),
+                ],
+            ),
+            can_undo: false,
+            can_redo: false,
+        };
+
+        let requirements = flatten_leaf_paths(&tree, EntryKind::Requirement);
+
+        assert_eq!(
+            requirements,
+            vec![
+                LogicalPath::root(name("zzz_root_level")),
+                LogicalPath {
+                    modules: vec![name("nested"), name("deeper")],
+                    name: name("deepest"),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2452,7 +3215,13 @@ mod test {
 
     #[test]
     fn a_module_matches_when_a_descendant_at_any_depth_matches() {
-        let tree = module("setup", vec![module("nested", vec![leaf(EntryKind::Test, "generic_test")])]);
+        let tree = module(
+            "setup",
+            vec![module(
+                "nested",
+                vec![leaf(EntryKind::Test, "generic_test")],
+            )],
+        );
         assert!(node_matches_filter(&tree, &[], "generic_test"));
     }
 

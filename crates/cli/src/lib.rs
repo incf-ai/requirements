@@ -444,7 +444,7 @@ fn mutate(
 #[cfg(test)]
 mod test {
     use super::*;
-    use syscalls::{CommitForPathError, CommitForRemoteError, StdFilesystem, SystemGit};
+    use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, StdFilesystem, SystemGit};
 
     struct FixedGit;
     impl Git for FixedGit {
@@ -454,6 +454,14 @@ mod test {
             _excludes: &[&std::path::Path],
         ) -> Result<String, CommitForPathError> {
             Ok("deadbeef".to_string())
+        }
+
+        fn changed_paths(&self, _dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, ChangedPathsError> {
+            Ok(Vec::new())
+        }
+
+        fn commit_all(&self, _dir: &std::path::Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
         }
     }
 

@@ -9,7 +9,9 @@ mod test_support;
 pub mod validate;
 mod validated;
 
-pub use path::LogicalPath;
+pub use path::{LogicalPath, resolve_reference_path};
 pub use pool::AddPoolFileError;
 pub use sanitize::{InvalidNameError, InvalidPathError};
-pub use validated::{TestUnmetReason, UnmetReason, UnsatisfiedTest, ValidatedProject};
+pub use validated::{
+    RequirementResult, TestUnmetReason, UnmetReason, UnsatisfiedTest, ValidatedProject, results_for_requirement,
+};

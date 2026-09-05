@@ -101,6 +101,14 @@ mod test {
         fn is_repository(&self, _dir: &std::path::Path) -> bool {
             false
         }
+
+        fn changed_paths(&self, _dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, syscalls::ChangedPathsError> {
+            unreachable!("load_project should bail out before looking up any commits")
+        }
+
+        fn commit_all(&self, _dir: &std::path::Path, _message: &str) -> Result<(), syscalls::CommitAllError> {
+            unreachable!("load_project should bail out before looking up any commits")
+        }
     }
 
     #[test]

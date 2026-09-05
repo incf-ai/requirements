@@ -15,12 +15,30 @@ use gui_core::EntryStatus;
 /// settled.
 pub fn status_colors(dark_mode: bool, status: EntryStatus) -> (Color32, Color32) {
     match (dark_mode, status) {
-        (false, EntryStatus::Met) => (Color32::from_rgb(0x1a, 0x7f, 0x37), Color32::from_rgb(0xda, 0xfb, 0xe1)),
-        (false, EntryStatus::Unmet) => (Color32::from_rgb(0xcf, 0x22, 0x2e), Color32::from_rgb(0xff, 0xeb, 0xe9)),
-        (false, EntryStatus::Unvalidated) => (Color32::from_rgb(0x59, 0x63, 0x6e), Color32::from_rgb(0xf0, 0xf1, 0xf3)),
-        (true, EntryStatus::Met) => (Color32::from_rgb(0x7e, 0xe7, 0x87), Color32::from_rgb(0x0f, 0x2a, 0x1a)),
-        (true, EntryStatus::Unmet) => (Color32::from_rgb(0xff, 0x9a, 0x92), Color32::from_rgb(0x3a, 0x11, 0x14)),
-        (true, EntryStatus::Unvalidated) => (Color32::from_rgb(0x9a, 0xa4, 0xaf), Color32::from_rgb(0x2a, 0x2d, 0x31)),
+        (false, EntryStatus::Met) => (
+            Color32::from_rgb(0x1a, 0x7f, 0x37),
+            Color32::from_rgb(0xda, 0xfb, 0xe1),
+        ),
+        (false, EntryStatus::Unmet) => (
+            Color32::from_rgb(0xcf, 0x22, 0x2e),
+            Color32::from_rgb(0xff, 0xeb, 0xe9),
+        ),
+        (false, EntryStatus::Unvalidated) => (
+            Color32::from_rgb(0x59, 0x63, 0x6e),
+            Color32::from_rgb(0xf0, 0xf1, 0xf3),
+        ),
+        (true, EntryStatus::Met) => (
+            Color32::from_rgb(0x7e, 0xe7, 0x87),
+            Color32::from_rgb(0x0f, 0x2a, 0x1a),
+        ),
+        (true, EntryStatus::Unmet) => (
+            Color32::from_rgb(0xff, 0x9a, 0x92),
+            Color32::from_rgb(0x3a, 0x11, 0x14),
+        ),
+        (true, EntryStatus::Unvalidated) => (
+            Color32::from_rgb(0x9a, 0xa4, 0xaf),
+            Color32::from_rgb(0x2a, 0x2d, 0x31),
+        ),
     }
 }
 

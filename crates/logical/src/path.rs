@@ -107,6 +107,21 @@ pub(crate) fn parse_reference_path(
     })
 }
 
+/// Public counterpart to `parse_reference_path`, for callers outside this
+/// crate — the read-only requirement viewer's clickable reference links —
+/// that need to resolve a raw on-disk reference string into a `LogicalPath`
+/// without going through `ValidatedProject`. Swallows the parse error rather
+/// than exposing `ParseReferencePathError` (itself crate-private): an
+/// unresolvable reference just isn't rendered as a link, no need for the
+/// caller to distinguish why.
+pub fn resolve_reference_path(
+    raw: &ReferencePath,
+    current_module: &[EntryName],
+    expected_kind: &'static str,
+) -> Option<LogicalPath> {
+    parse_reference_path(raw, current_module, expected_kind).ok()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

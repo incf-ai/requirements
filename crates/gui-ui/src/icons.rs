@@ -30,6 +30,7 @@ pub const NEW_TEST: &str = egui_phosphor::regular::TEST_TUBE;
 pub const NEW_RESULT: &str = egui_phosphor::regular::CHART_BAR;
 pub const NEW_MODULE: &str = egui_phosphor::regular::FOLDER_PLUS;
 pub const ATTACHMENTS: &str = egui_phosphor::regular::PAPERCLIP;
+pub const COMMIT_ALL: &str = egui_phosphor::regular::GIT_COMMIT;
 
 // Menu bar (`render_menu_bar`'s File menu).
 pub const NEW_PROJECT: &str = egui_phosphor::regular::FILE_PLUS;

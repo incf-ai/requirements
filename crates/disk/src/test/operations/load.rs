@@ -65,12 +65,16 @@ fn load_test_inner(
     if !definition.include_template_in_commit {
         excludes.push(template_dir.as_path());
     }
-    let commit = git
-        .commit_for_path_excluding(dir, &excludes)
-        .map_err(|source| ErrorKind::Commit {
-            path: dir.to_path_buf(),
-            source,
-        })?;
+    let commit = match git.commit_for_path_excluding(dir, &excludes) {
+        Ok(commit) => Some(commit),
+        Err(CommitForPathError::NotTracked { .. }) => None,
+        Err(source) => {
+            return Err(ErrorKind::Commit {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
 
     Ok(TestOnDisk {
         name: EntryName::of(dir),
@@ -178,6 +182,29 @@ mod test {
 
         let err = load_test(&StdFilesystem, &git, &dir).unwrap_err();
         assert!(matches!(err.0, ErrorKind::Commit { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_test_folder_with_no_commits_loads_with_commit_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-test-load-no-commits-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        init_scratch_git_repo(&dir);
+        std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(dir.join("template")).unwrap();
+        std::fs::write(
+            dir.join("test.ron"),
+            "TestV1(title: \"Title\", result_kind: FreeForm)",
+        )
+        .unwrap();
+        std::fs::write(dir.join("test.typ"), "").unwrap();
+
+        let test = load_test(&StdFilesystem, &SystemGit, &dir).unwrap();
+        assert_eq!(test.commit, None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -402,7 +429,7 @@ mod test {
         git_commit_all(&dir, "touch attachments only");
 
         let test = load_test(&StdFilesystem, &SystemGit, &dir).unwrap();
-        assert_eq!(test.commit, base_commit);
+        assert_eq!(test.commit, Some(base_commit));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -419,7 +446,7 @@ mod test {
         git_commit_all(&dir, "touch template only");
 
         let test = load_test(&StdFilesystem, &SystemGit, &dir).unwrap();
-        assert_eq!(test.commit, base_commit);
+        assert_eq!(test.commit, Some(base_commit));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -436,8 +463,8 @@ mod test {
         let latest_commit = git_commit_all(&dir, "touch template only");
 
         let test = load_test(&StdFilesystem, &SystemGit, &dir).unwrap();
-        assert_ne!(test.commit, base_commit);
-        assert_eq!(test.commit, latest_commit);
+        assert_ne!(test.commit, Some(base_commit));
+        assert_eq!(test.commit, Some(latest_commit));
 
         std::fs::remove_dir_all(&dir).ok();
     }

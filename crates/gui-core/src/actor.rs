@@ -14,9 +14,9 @@ use crate::tree::{
     get_requirement_met_status, resolve_module_mut,
 };
 use crate::{
-    AddChildError, AddLocalPoolError, AddPoolChildError, AddPoolFileError, Command, EntryKind, Event, LogicalPath,
-    Outcome, ProjectState, RedoError, ReferencePath, RefreshStaleTestReferencesError, RenameModuleError,
-    RenameProjectError, RequestId, ResolveLocalCommitError, SaveError, UndoError, UpdateChildError,
+    AddChildError, AddLocalPoolError, AddPoolChildError, AddPoolFileError, Command, CommitAllError, EntryKind, Event,
+    GetChangedFilesError, LogicalPath, Outcome, ProjectState, RedoError, ReferencePath, RefreshStaleTestReferencesError,
+    RenameModuleError, RenameProjectError, RequestId, ResolveLocalCommitError, SaveError, UndoError, UpdateChildError,
 };
 
 /// The boundary `gui-ui` talks across. Plain `Send + Sync`, non-blocking
@@ -299,6 +299,8 @@ where
             }
             Command::ResolveLocalCommit { target, kind, request } => self.spawn_resolve_local_commit(target, kind, request),
             Command::ResolveRemoteCommit { url, path, request } => self.spawn_resolve_remote_commit(url, path, request),
+            Command::GetChangedFiles { request } => self.spawn_get_changed_files(request),
+            Command::CommitAll { message, request } => self.spawn_commit_all(message, request),
             Command::Shutdown => unreachable!("handled in run_actor's select! before dispatch is called"),
         }
     }
@@ -1093,6 +1095,36 @@ where
         });
     }
 
+    /// See `Command::GetChangedFiles`'s own doc comment — same "no project
+    /// state touched, still shells out to `git`, so it's spawned" shape as
+    /// `spawn_resolve_local_commit`.
+    fn spawn_get_changed_files(&self, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(request, Outcome::GetChangedFiles(Err(GetChangedFilesError::NoProjectPath)));
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = Outcome::GetChangedFiles(git.changed_paths(&project_path).map_err(GetChangedFilesError::from));
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
+    /// See `Command::CommitAll`'s own doc comment.
+    fn spawn_commit_all(&self, message: String, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(request, Outcome::CommitAll(Err(CommitAllError::NoProjectPath)));
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = Outcome::CommitAll(git.commit_all(&project_path, &message).map_err(CommitAllError::from));
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
     fn spawn_load_project(&mut self, path: PathBuf, request: RequestId) {
         let previous_state = self.state.take();
         self.mutation_in_flight = true;
@@ -1308,13 +1340,13 @@ mod test {
     use disk::{EntryName, LocalGitReference, ReferencePath, TestReferenceKind};
     use logical::LogicalPath;
     use logical::draft::RequirementDraft;
-    use syscalls::{CommitForPathError, CommitForRemoteError, StdFilesystem};
+    use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, StdFilesystem};
 
     use logical::draft::AddNamedChildError;
 
     use crate::{
-        AddPoolFileError, EntryDetail, EntryKind, RefreshStaleTestReferencesError, RequirementMetStatus, TestUnmetReason,
-        TreeSnapshot, UnmetReason,
+        AddPoolFileError, EntryDetail, EntryKind, GetChangedFilesError, RefreshStaleTestReferencesError,
+        RequirementMetStatus, TestUnmetReason, TreeSnapshot, UnmetReason,
     };
 
     use super::*;
@@ -1328,6 +1360,14 @@ mod test {
     impl syscalls::Git for FixedGit {
         fn commit_for_path_excluding(&self, _path: &Path, _excludes: &[&Path]) -> Result<String, CommitForPathError> {
             Ok("deadbeef".to_string())
+        }
+
+        fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+            Ok(vec![PathBuf::from("root.txt"), PathBuf::from("sub/file.txt")])
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
         }
     }
 
@@ -1391,6 +1431,14 @@ mod test {
     impl syscalls::Git for PathEchoingGit {
         fn commit_for_path_excluding(&self, path: &Path, _excludes: &[&Path]) -> Result<String, CommitForPathError> {
             Ok(path.display().to_string())
+        }
+
+        fn changed_paths(&self, dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+            Ok(vec![dir.to_path_buf()])
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
         }
     }
 
@@ -3382,6 +3430,75 @@ mod test {
             panic!("expected ResolveRemoteCommit");
         };
         assert_eq!(result.unwrap(), "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn get_changed_files_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands.send(Command::GetChangedFiles { request: 1 }).unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::GetChangedFiles(Err(GetChangedFilesError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_changed_files_returns_gits_reply() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands.send(Command::GetChangedFiles { request: 2 }).unwrap();
+        let Outcome::GetChangedFiles(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetChangedFiles");
+        };
+        // `FixedGit`'s own fixed reply — see its doc comment.
+        assert_eq!(
+            result.unwrap(),
+            vec![PathBuf::from("root.txt"), PathBuf::from("sub/file.txt")]
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_all_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands
+            .send(Command::CommitAll {
+                message: "hello".to_string(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::CommitAll(Err(crate::CommitAllError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_all_succeeds_against_a_loaded_project() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::CommitAll {
+                message: "commit everything".to_string(),
+                request: 2,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::CommitAll(Ok(()))));
     }
 
     #[tokio::test]

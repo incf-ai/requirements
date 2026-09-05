@@ -34,8 +34,8 @@ pub use config::{GuiConfig, LoadError as ConfigLoadError, ThemeChoice};
 pub use exit::ExitDialogState;
 pub use fonts::install_icon_font;
 pub use forms::{
-    AutoCommitKind, DependencyDraft, DependencySlot, ModuleDetailFormState, ModuleFormState, RequirementFormState,
-    ResultFormState, TestFormState,
+    AutoCommitKind, DependencyDraft, DependencySlot, ModuleDetailFormState, ModuleFormState,
+    RequirementFormState, ResultFormState, TestFormState, TestRefDraft, TestRefSlot,
 };
 pub use recent::{LoadError as RecentLoadError, RecentProjects};
 
@@ -44,8 +44,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gui_core::{
-    Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools, Outcome, RequestId,
-    RequirementDraft, SaveError, TreeNode, TreeSnapshot,
+    Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools,
+    Outcome, RequestId, RequirementDraft, SaveError, TestDraft, TreeNode, TreeSnapshot,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -168,6 +168,17 @@ pub struct GuiApp {
     /// The path-picker modal — `Some` while it's open. See
     /// `PathPickerDialogState`'s own doc comment.
     path_picker_dialog: Option<PathPickerDialogState>,
+    /// The "Commit all changes" modal — `Some` while it's open. See
+    /// `CommitAllDialogState`'s own doc comment.
+    commit_all_dialog: Option<CommitAllDialogState>,
+    /// Which `GetChangedFiles` request `commit_all_dialog` is waiting on —
+    /// same stale-reply guard as `pools_request`.
+    changed_files_request: Option<RequestId>,
+    /// Which `CommitAll` request `commit_all_dialog` is waiting on — same
+    /// stale-reply guard as `changed_files_request`, kept separate since
+    /// the two are never in flight for the same dialog at once but are
+    /// still logically distinct fetches.
+    commit_all_request: Option<RequestId>,
     config: GuiConfig,
     /// Where `config` was loaded from — kept so a zoom click can write
     /// the changed config straight back to the same file (`GuiConfig::
@@ -203,6 +214,9 @@ pub struct GuiApp {
     /// The requirement "Recreate" prompt — `Some` while it's open. See
     /// `RecreateRequirementState`'s own doc comment.
     recreate_requirement_dialog: Option<RecreateRequirementState>,
+    /// The test "Recreate" prompt — `Some` while it's open. See
+    /// `RecreateTestState`'s own doc comment.
+    recreate_test_dialog: Option<RecreateTestState>,
     /// A failed `LoadProject`'s error message — `Some` while the "couldn't
     /// open project" dialog is open. Set from `Outcome::LoadProject`'s
     /// `Err` case (e.g. the target directory isn't a git repository) so
@@ -326,9 +340,16 @@ pub enum PendingSaveAction {
 /// behave differently).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidateBeforeSaveDialogState {
-    Asking { action: PendingSaveAction },
-    Validating { request: RequestId, action: PendingSaveAction },
-    Failed { errors: Vec<String> },
+    Asking {
+        action: PendingSaveAction,
+    },
+    Validating {
+        request: RequestId,
+        action: PendingSaveAction,
+    },
+    Failed {
+        errors: Vec<String>,
+    },
 }
 
 /// What the Delete-confirmation dialog is about to delete — built by
@@ -367,8 +388,9 @@ pub struct DeleteConfirmState {
 /// requirement's form (never a create-mode one, which has no stable name
 /// yet to replace). Confirming with a nonempty name deletes the requirement
 /// at `target` and adds it back under `new_name` with the same content
-/// (`requirement`, a snapshot of the form's `original` taken when the
-/// dialog opened) — two separate `Command`s chained by
+/// (`requirement`, the form's live contents — `current_contents`, not the
+/// possibly-stale `original` — snapshotted when the dialog opened) — two
+/// separate `Command`s chained by
 /// `GuiApp::apply_recreate_delete_result`/`apply_recreate_create_result`,
 /// since there's no single "rename this entry's `EntryName`" command for a
 /// requirement (unlike `Command::RenameModule`). `deleted` tracks which of
@@ -386,9 +408,26 @@ pub struct RecreateRequirementState {
     error: Option<String>,
 }
 
+/// The test "Recreate" prompt's own state — same shape and reasoning as
+/// `RecreateRequirementState`, just for `Command::AddTest`/`RemoveTest`
+/// instead of the requirement equivalents (there's no `RenameTest`
+/// command either).
+#[derive(Debug, Clone)]
+pub struct RecreateTestState {
+    target: LogicalPath,
+    test: Box<TestDraft>,
+    new_name: String,
+    deleted: bool,
+    pending_request: Option<RequestId>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingNavigation {
-    Select { target: LogicalPath, kind: EntryKind },
+    Select {
+        target: LogicalPath,
+        kind: EntryKind,
+    },
     SelectModule(Vec<EntryName>),
     Back,
     Forward,
@@ -474,6 +513,9 @@ pub enum PathPickerTarget {
     /// A requirement's dependency row — `slot` picks which one, same as
     /// `RequirementFormState::pending_commit_fetches`' own keying.
     Dependency(DependencySlot),
+    /// A requirement's test-reference row — `slot` picks which one, same
+    /// as `RequirementFormState::pending_test_commit_fetches`' own keying.
+    TestReference(TestRefSlot),
 }
 
 impl PathPickerTarget {
@@ -482,10 +524,29 @@ impl PathPickerTarget {
     /// derives from it instead of being passed alongside redundantly.
     fn kind(self) -> EntryKind {
         match self {
-            PathPickerTarget::ResultRequirementPath | PathPickerTarget::Dependency(_) => EntryKind::Requirement,
-            PathPickerTarget::ResultTestPath => EntryKind::Test,
+            PathPickerTarget::ResultRequirementPath | PathPickerTarget::Dependency(_) => {
+                EntryKind::Requirement
+            }
+            PathPickerTarget::ResultTestPath | PathPickerTarget::TestReference(_) => {
+                EntryKind::Test
+            }
         }
     }
+}
+
+/// The "Commit all changes" modal's state — the commit message buffer, the
+/// sorted list of paths `GetChangedFiles` reported, and the usual
+/// loading/error bookkeeping. `committing` is distinct from `loading`
+/// (fetching the file list) so the dialog can show "Committing…" on the
+/// message/list it already has instead of blanking back to a loading
+/// state.
+#[derive(Debug, Default)]
+pub struct CommitAllDialogState {
+    pub message: String,
+    pub changed_files: Vec<PathBuf>,
+    pub loading: bool,
+    pub committing: bool,
+    pub error: Option<String>,
 }
 
 /// The path-picker modal's state — open (`Some`) for exactly as long as
@@ -554,6 +615,9 @@ impl GuiApp {
             local_pool_ops: HashMap::new(),
             module_summary_request: None,
             path_picker_dialog: None,
+            commit_all_dialog: None,
+            changed_files_request: None,
+            commit_all_request: None,
             zoom_input: config.zoom_percent.to_string(),
             tree_filter: String::new(),
             tree_force_open: None,
@@ -568,6 +632,7 @@ impl GuiApp {
             validate_before_save_dialog: None,
             delete_confirm_dialog: None,
             recreate_requirement_dialog: None,
+            recreate_test_dialog: None,
             load_error_dialog: None,
             next_request: 0,
         }
@@ -627,8 +692,9 @@ impl GuiApp {
             // "must validate first" prompt with this `Save` as what to
             // retry once validation succeeds.
             Outcome::Save(Err(SaveError::NotValidated)) => {
-                self.validate_before_save_dialog =
-                    Some(ValidateBeforeSaveDialogState::Asking { action: PendingSaveAction::Save });
+                self.validate_before_save_dialog = Some(ValidateBeforeSaveDialogState::Asking {
+                    action: PendingSaveAction::Save,
+                });
             }
             Outcome::SaveAs(result) => {
                 if result.is_ok() {
@@ -637,9 +703,10 @@ impl GuiApp {
                     && let Some((pending_request, path)) = &self.pending_project_path
                     && *pending_request == request
                 {
-                    self.validate_before_save_dialog = Some(ValidateBeforeSaveDialogState::Asking {
-                        action: PendingSaveAction::SaveAs(path.clone()),
-                    });
+                    self.validate_before_save_dialog =
+                        Some(ValidateBeforeSaveDialogState::Asking {
+                            action: PendingSaveAction::SaveAs(path.clone()),
+                        });
                 }
                 self.apply_project_path_result(request, result.is_ok());
             }
@@ -694,8 +761,10 @@ impl GuiApp {
                 // click, which never populates this dialog), resolve it:
                 // success retries the save it was blocking, failure shows
                 // the errors in place of the "Validate now?" prompt.
-                if let Some(ValidateBeforeSaveDialogState::Validating { request: pending_request, action }) =
-                    self.validate_before_save_dialog.clone()
+                if let Some(ValidateBeforeSaveDialogState::Validating {
+                    request: pending_request,
+                    action,
+                }) = self.validate_before_save_dialog.clone()
                     && pending_request == request
                 {
                     match result {
@@ -707,9 +776,10 @@ impl GuiApp {
                             }
                         }
                         Err(errors) => {
-                            self.validate_before_save_dialog = Some(ValidateBeforeSaveDialogState::Failed {
-                                errors: errors.iter().map(ToString::to_string).collect(),
-                            });
+                            self.validate_before_save_dialog =
+                                Some(ValidateBeforeSaveDialogState::Failed {
+                                    errors: errors.iter().map(ToString::to_string).collect(),
+                                });
                         }
                     }
                 }
@@ -729,8 +799,7 @@ impl GuiApp {
                 }
             }
             Outcome::AddRequirement(result) => {
-                let is_recreate_pending =
-                    matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
+                let is_recreate_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
                 if is_recreate_pending {
                     self.apply_recreate_create_result(request, result);
                 } else {
@@ -741,21 +810,35 @@ impl GuiApp {
             Outcome::RefreshStaleTestReferences(result) => {
                 self.apply_refresh_stale_test_references_result(request, result)
             }
-            Outcome::AddTest(result) => self.apply_create_result(request, result),
+            Outcome::AddTest(result) => {
+                let is_recreate_pending = matches!(&self.recreate_test_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
+                if is_recreate_pending {
+                    self.apply_recreate_test_create_result(request, result);
+                } else {
+                    self.apply_create_result(request, result);
+                }
+            }
             Outcome::UpdateTest(result) => self.apply_update_result(request, result),
             Outcome::AddResult(result) => self.apply_create_result(request, result),
             Outcome::UpdateResult(result) => self.apply_update_result(request, result),
             Outcome::AddModule(result) => self.apply_create_result(request, result),
             Outcome::RemoveRequirement(removed) => {
-                let is_recreate_pending =
-                    matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
+                let is_recreate_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
                 if is_recreate_pending {
                     self.apply_recreate_delete_result(request, removed);
                 } else {
                     self.apply_delete_result(request, removed);
                 }
             }
-            Outcome::RemoveTest(removed) | Outcome::RemoveResult(removed) | Outcome::RemoveModule(removed) => {
+            Outcome::RemoveTest(removed) => {
+                let is_recreate_pending = matches!(&self.recreate_test_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
+                if is_recreate_pending {
+                    self.apply_recreate_test_delete_result(request, removed);
+                } else {
+                    self.apply_delete_result(request, removed);
+                }
+            }
+            Outcome::RemoveResult(removed) | Outcome::RemoveModule(removed) => {
                 self.apply_delete_result(request, removed)
             }
             Outcome::RenameModule(result) => {
@@ -764,38 +847,61 @@ impl GuiApp {
             Outcome::RenameProject(result) => {
                 self.apply_module_rename_result(request, result.map_err(|e| e.to_string()))
             }
-            Outcome::AddAttachment(result) => self.apply_pool_change_result(result.map_err(|e| e.to_string())),
-            Outcome::AddTemplate(result) => self.apply_pool_change_result(result.map_err(|e| e.to_string())),
-            Outcome::RemoveAttachment(removed) | Outcome::RemoveTemplate(removed) => {
-                self.apply_pool_change_result(if removed { Ok(()) } else { Err("nothing there to remove".to_string()) })
+            Outcome::AddAttachment(result) => {
+                self.apply_pool_change_result(result.map_err(|e| e.to_string()))
             }
+            Outcome::AddTemplate(result) => {
+                self.apply_pool_change_result(result.map_err(|e| e.to_string()))
+            }
+            Outcome::RemoveAttachment(removed) | Outcome::RemoveTemplate(removed) => self
+                .apply_pool_change_result(if removed {
+                    Ok(())
+                } else {
+                    Err("nothing there to remove".to_string())
+                }),
             Outcome::AddRequirementAttachment(result) => {
                 self.apply_local_pool_outcome(request, result.map_err(|e| e.to_string()))
             }
             Outcome::RemoveRequirementAttachment(removed) => self.apply_local_pool_outcome(
                 request,
-                if removed { Ok(()) } else { Err("nothing there to remove".to_string()) },
+                if removed {
+                    Ok(())
+                } else {
+                    Err("nothing there to remove".to_string())
+                },
             ),
             Outcome::AddTestAttachment(result) => {
                 self.apply_local_pool_outcome(request, result.map_err(|e| e.to_string()))
             }
             Outcome::RemoveTestAttachment(removed) => self.apply_local_pool_outcome(
                 request,
-                if removed { Ok(()) } else { Err("nothing there to remove".to_string()) },
+                if removed {
+                    Ok(())
+                } else {
+                    Err("nothing there to remove".to_string())
+                },
             ),
             Outcome::AddTestTemplateFile(result) => {
                 self.apply_local_pool_outcome(request, result.map_err(|e| e.to_string()))
             }
             Outcome::RemoveTestTemplateFile(removed) => self.apply_local_pool_outcome(
                 request,
-                if removed { Ok(()) } else { Err("nothing there to remove".to_string()) },
+                if removed {
+                    Ok(())
+                } else {
+                    Err("nothing there to remove".to_string())
+                },
             ),
             Outcome::AddResultAttachment(result) => {
                 self.apply_local_pool_outcome(request, result.map_err(|e| e.to_string()))
             }
             Outcome::RemoveResultAttachment(removed) => self.apply_local_pool_outcome(
                 request,
-                if removed { Ok(()) } else { Err("nothing there to remove".to_string()) },
+                if removed {
+                    Ok(())
+                } else {
+                    Err("nothing there to remove".to_string())
+                },
             ),
             // A stale reply for an already-abandoned selection/dialog is
             // ignored, not applied — see `detail_request`'s/`pools_request`'s
@@ -827,8 +933,16 @@ impl GuiApp {
                     form.summary = summary;
                 }
             }
+            Outcome::GetChangedFiles(result) if self.changed_files_request == Some(request) => {
+                self.apply_changed_files(result.map_err(|e| e.to_string()));
+            }
+            Outcome::CommitAll(result) if self.commit_all_request == Some(request) => {
+                self.apply_commit_all_result(result.map_err(|e| e.to_string()));
+            }
             Outcome::ResolveLocalCommit(result) => {
-                self.apply_commit_fetch_result(request, result.map_err(|e| e.to_string()))
+                let result = result.map_err(|e| e.to_string());
+                self.apply_commit_fetch_result(request, result.clone());
+                self.apply_test_commit_fetch_result(request, result);
             }
             Outcome::ResolveRemoteCommit(result) => {
                 self.apply_commit_fetch_result(request, result.map_err(|e| e.to_string()))
@@ -858,8 +972,15 @@ impl GuiApp {
     /// "ignore stale replies by request id" shape as `apply_entry_detail`
     /// via `detail_request`) and only if it actually succeeded.
     fn apply_project_path_result(&mut self, request: RequestId, succeeded: bool) {
-        if self.pending_project_path.as_ref().is_some_and(|(pending_request, _)| *pending_request == request) {
-            let (_, path) = self.pending_project_path.take().expect("just checked Some above");
+        if self
+            .pending_project_path
+            .as_ref()
+            .is_some_and(|(pending_request, _)| *pending_request == request)
+        {
+            let (_, path) = self
+                .pending_project_path
+                .take()
+                .expect("just checked Some above");
             if succeeded {
                 self.project_path = Some(path.clone());
                 self.record_recent_project(path);
@@ -1109,12 +1230,15 @@ impl GuiApp {
     /// to resume) so `apply_outcome`'s `Outcome::Validate` arm knows this
     /// completion is the dialog's own, not an unrelated toolbar click.
     fn validate_before_save_confirmed(&mut self) {
-        let Some(ValidateBeforeSaveDialogState::Asking { action }) = self.validate_before_save_dialog.clone() else {
+        let Some(ValidateBeforeSaveDialogState::Asking { action }) =
+            self.validate_before_save_dialog.clone()
+        else {
             return;
         };
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
-        self.validate_before_save_dialog = Some(ValidateBeforeSaveDialogState::Validating { request, action });
+        self.validate_before_save_dialog =
+            Some(ValidateBeforeSaveDialogState::Validating { request, action });
         self.send_command(Command::Validate { request });
     }
 
@@ -1330,7 +1454,11 @@ impl GuiApp {
         let request = self.next_request_id();
         self.detail_request = Some(request);
         self.pending.insert(request, PendingKind::Generic);
-        self.send_command(Command::GetEntryDetail { target, kind, request });
+        self.send_command(Command::GetEntryDetail {
+            target,
+            kind,
+            request,
+        });
     }
 
     /// The `NavMode` of the entry `nav_position` currently points at —
@@ -1488,6 +1616,23 @@ impl GuiApp {
                     }
                 }
             }
+            PathPickerTarget::TestReference(slot) => {
+                if let EditorState::NewRequirement(form) = &mut self.editor {
+                    let test_ref = match slot {
+                        TestRefSlot::Existing(i) => form.tests.get_mut(i),
+                        TestRefSlot::New => Some(&mut form.new_test_ref),
+                    };
+                    if let Some(test_ref) = test_ref {
+                        test_ref.path = path_str;
+                    }
+                    // Same "only an already-added row is part of the
+                    // form's real content" distinction
+                    // `apply_test_commit_fetch_result` already draws.
+                    if let TestRefSlot::Existing(_) = slot {
+                        form.edited = true;
+                    }
+                }
+            }
         }
     }
 
@@ -1555,28 +1700,45 @@ impl GuiApp {
                 dependencies,
                 attachments,
                 met_status,
+                results,
                 original,
-            }) => EditorState::NewRequirement(RequirementFormState {
-                name: target.name.as_str().to_string(),
-                title,
-                requirement_text,
-                requirement_guidance: requirement_guidance.unwrap_or_default(),
-                test_guidance: test_guidance.unwrap_or_default(),
-                original,
-                met_status,
-                editing_target: Some(target),
-                read_only,
-                edited: false,
-                pending_request: None,
-                error: None,
-                dependencies: dependencies.into_iter().map(DependencyDraft::from_core).collect(),
-                new_dependency: DependencyDraft::default(),
-                attachments,
-                new_attachment_path: String::new(),
-                local_pool_error: None,
-                pending_commit_fetches: HashMap::new(),
-                commit_fetch_error: None,
-            }),
+            }) => {
+                let tests = original
+                    .tests
+                    .iter()
+                    .cloned()
+                    .map(TestRefDraft::from_core)
+                    .collect();
+                EditorState::NewRequirement(RequirementFormState {
+                    name: target.name.as_str().to_string(),
+                    title,
+                    requirement_text,
+                    requirement_guidance: requirement_guidance.unwrap_or_default(),
+                    test_guidance: test_guidance.unwrap_or_default(),
+                    original,
+                    met_status,
+                    results,
+                    editing_target: Some(target),
+                    read_only,
+                    edited: false,
+                    pending_request: None,
+                    error: None,
+                    dependencies: dependencies
+                        .into_iter()
+                        .map(DependencyDraft::from_core)
+                        .collect(),
+                    new_dependency: DependencyDraft::default(),
+                    tests,
+                    new_test_ref: TestRefDraft::default(),
+                    attachments,
+                    new_attachment_path: String::new(),
+                    local_pool_error: None,
+                    pending_commit_fetches: HashMap::new(),
+                    commit_fetch_error: None,
+                    pending_test_commit_fetches: HashMap::new(),
+                    test_commit_fetch_error: None,
+                })
+            }
             Some(EntryDetail::Test {
                 title,
                 result_kind,
@@ -1675,6 +1837,71 @@ impl GuiApp {
         self.attachments_dialog = None;
     }
 
+    /// Opens the "Commit all changes" modal and fetches the file list.
+    fn commit_all_button_clicked(&mut self) {
+        self.commit_all_dialog = Some(CommitAllDialogState {
+            loading: true,
+            ..CommitAllDialogState::default()
+        });
+        let request = self.next_request_id();
+        self.changed_files_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetChangedFiles { request });
+    }
+
+    fn commit_all_dialog_closed(&mut self) {
+        self.commit_all_dialog = None;
+    }
+
+    /// Sorted "short paths (e.g. root-level files) first, alphabetically
+    /// within the same depth" — same `.components().count()` shape as
+    /// `flatten_leaf_paths`' own depth sort.
+    fn apply_changed_files(&mut self, result: Result<Vec<PathBuf>, String>) {
+        let Some(dialog) = &mut self.commit_all_dialog else {
+            return;
+        };
+        dialog.loading = false;
+        match result {
+            Ok(mut files) => {
+                files.sort_by_key(|path| (path.components().count(), path.clone()));
+                dialog.changed_files = files;
+            }
+            Err(message) => dialog.error = Some(message),
+        }
+    }
+
+    fn commit_all_dialog_commit_clicked(&mut self) {
+        let Some(dialog) = &mut self.commit_all_dialog else {
+            return;
+        };
+        if dialog.message.trim().is_empty() {
+            return;
+        }
+        dialog.committing = true;
+        dialog.error = None;
+        let message = dialog.message.clone();
+        let request = self.next_request_id();
+        self.commit_all_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::CommitAll { message, request });
+    }
+
+    /// Success closes the dialog outright — nothing left to show once the
+    /// commit exists. Failure leaves it open with the message/file list
+    /// intact so the user doesn't have to retype anything to retry.
+    fn apply_commit_all_result(&mut self, result: Result<(), String>) {
+        let Some(dialog) = &mut self.commit_all_dialog else {
+            return;
+        };
+        match result {
+            Ok(()) => self.commit_all_dialog = None,
+            Err(message) => {
+                dialog.committing = false;
+                dialog.error = Some(message);
+            }
+        }
+    }
+
     /// `None` (module not found — can happen if it was removed while the
     /// dialog was open) closes the dialog rather than showing a stale/
     /// broken one.
@@ -1753,7 +1980,11 @@ impl GuiApp {
         let path = PathBuf::from(std::mem::take(&mut dialog.new_attachment_path));
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
-        self.send_command(Command::AddAttachment { module, path, request });
+        self.send_command(Command::AddAttachment {
+            module,
+            path,
+            request,
+        });
     }
 
     fn attachments_dialog_remove_attachment_clicked(&mut self, path: PathBuf) {
@@ -1763,7 +1994,11 @@ impl GuiApp {
         let module = dialog.module.clone();
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
-        self.send_command(Command::RemoveAttachment { module, path, request });
+        self.send_command(Command::RemoveAttachment {
+            module,
+            path,
+            request,
+        });
     }
 
     fn attachments_dialog_add_template_clicked(&mut self) {
@@ -1777,7 +2012,11 @@ impl GuiApp {
         let path = PathBuf::from(std::mem::take(&mut dialog.new_template_path));
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
-        self.send_command(Command::AddTemplate { module, path, request });
+        self.send_command(Command::AddTemplate {
+            module,
+            path,
+            request,
+        });
     }
 
     fn attachments_dialog_remove_template_clicked(&mut self, path: PathBuf) {
@@ -1787,7 +2026,11 @@ impl GuiApp {
         let module = dialog.module.clone();
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
-        self.send_command(Command::RemoveTemplate { module, path, request });
+        self.send_command(Command::RemoveTemplate {
+            module,
+            path,
+            request,
+        });
     }
 
     /// Sends the `Add*` command for `kind` and remembers it in
@@ -1805,10 +2048,26 @@ impl GuiApp {
             },
         );
         let command = match kind {
-            LocalPoolKind::RequirementAttachment => Command::AddRequirementAttachment { target, path, request },
-            LocalPoolKind::TestAttachment => Command::AddTestAttachment { target, path, request },
-            LocalPoolKind::TestTemplate => Command::AddTestTemplateFile { target, path, request },
-            LocalPoolKind::ResultAttachment => Command::AddResultAttachment { target, path, request },
+            LocalPoolKind::RequirementAttachment => Command::AddRequirementAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolKind::TestAttachment => Command::AddTestAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolKind::TestTemplate => Command::AddTestTemplateFile {
+                target,
+                path,
+                request,
+            },
+            LocalPoolKind::ResultAttachment => Command::AddResultAttachment {
+                target,
+                path,
+                request,
+            },
         };
         self.send_command(command);
     }
@@ -1826,10 +2085,26 @@ impl GuiApp {
             },
         );
         let command = match kind {
-            LocalPoolKind::RequirementAttachment => Command::RemoveRequirementAttachment { target, path, request },
-            LocalPoolKind::TestAttachment => Command::RemoveTestAttachment { target, path, request },
-            LocalPoolKind::TestTemplate => Command::RemoveTestTemplateFile { target, path, request },
-            LocalPoolKind::ResultAttachment => Command::RemoveResultAttachment { target, path, request },
+            LocalPoolKind::RequirementAttachment => Command::RemoveRequirementAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolKind::TestAttachment => Command::RemoveTestAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolKind::TestTemplate => Command::RemoveTestTemplateFile {
+                target,
+                path,
+                request,
+            },
+            LocalPoolKind::ResultAttachment => Command::RemoveResultAttachment {
+                target,
+                path,
+                request,
+            },
         };
         self.send_command(command);
     }
@@ -1871,11 +2146,16 @@ impl GuiApp {
 
     fn local_attachment_remove_clicked(&mut self, kind: LocalPoolKind, path: PathBuf) {
         let target = match (&self.editor, kind) {
-            (EditorState::NewRequirement(form), LocalPoolKind::RequirementAttachment) => form.editing_target.clone(),
-            (EditorState::NewTest(form), LocalPoolKind::TestAttachment | LocalPoolKind::TestTemplate) => {
+            (EditorState::NewRequirement(form), LocalPoolKind::RequirementAttachment) => {
                 form.editing_target.clone()
             }
-            (EditorState::NewResult(form), LocalPoolKind::ResultAttachment) => form.editing_target.clone(),
+            (
+                EditorState::NewTest(form),
+                LocalPoolKind::TestAttachment | LocalPoolKind::TestTemplate,
+            ) => form.editing_target.clone(),
+            (EditorState::NewResult(form), LocalPoolKind::ResultAttachment) => {
+                form.editing_target.clone()
+            }
             _ => None,
         };
         let Some(target) = target else {
@@ -1904,7 +2184,9 @@ impl GuiApp {
                 kind: EntryKind::Requirement,
                 request,
             },
-            AutoCommitKind::Remote { url, path } => Command::ResolveRemoteCommit { url, path, request },
+            AutoCommitKind::Remote { url, path } => {
+                Command::ResolveRemoteCommit { url, path, request }
+            }
         };
         self.send_command(command);
     }
@@ -1945,6 +2227,60 @@ impl GuiApp {
                 }
             }
             Err(message) => form.commit_fetch_error = Some(message),
+        }
+    }
+
+    /// A test reference row's "Auto" button. Test references only ever
+    /// resolve locally (there's no remote test-reference variant), so unlike
+    /// `dependency_commit_auto_clicked` this always sends
+    /// `Command::ResolveLocalCommit`.
+    fn test_ref_commit_auto_clicked(&mut self, target: TestRefSlot, logical: LogicalPath) {
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        if let EditorState::NewRequirement(form) = &mut self.editor {
+            form.pending_test_commit_fetches.insert(request, target);
+            form.test_commit_fetch_error = None;
+        } else {
+            return;
+        }
+        self.send_command(Command::ResolveLocalCommit {
+            target: logical,
+            kind: EntryKind::Test,
+            request,
+        });
+    }
+
+    /// Applies a `ResolveLocalCommit` reply to whichever test reference slot
+    /// requested it. A no-op if the Requirement form has since closed,
+    /// switched to a different entry, or the row itself was removed while
+    /// the fetch was in flight — same "a stale reply is simply dropped"
+    /// precedent as `apply_commit_fetch_result`.
+    fn apply_test_commit_fetch_result(
+        &mut self,
+        request: RequestId,
+        result: Result<String, String>,
+    ) {
+        let EditorState::NewRequirement(form) = &mut self.editor else {
+            return;
+        };
+        let Some(target) = form.pending_test_commit_fetches.remove(&request) else {
+            return;
+        };
+        match result {
+            Ok(commit) => {
+                let test_ref = match target {
+                    TestRefSlot::Existing(i) => form.tests.get_mut(i),
+                    TestRefSlot::New => Some(&mut form.new_test_ref),
+                };
+                let Some(test_ref) = test_ref else {
+                    return;
+                };
+                test_ref.commit = commit;
+                if let TestRefSlot::Existing(_) = target {
+                    form.edited = true;
+                }
+            }
+            Err(message) => form.test_commit_fetch_error = Some(message),
         }
     }
 
@@ -2003,9 +2339,10 @@ impl GuiApp {
             {
                 form.local_pool_error = Some(message);
             }
-            (EditorState::NewTest(form), LocalPoolKind::TestAttachment | LocalPoolKind::TestTemplate)
-                if form.editing_target.as_ref() == Some(target) =>
-            {
+            (
+                EditorState::NewTest(form),
+                LocalPoolKind::TestAttachment | LocalPoolKind::TestTemplate,
+            ) if form.editing_target.as_ref() == Some(target) => {
                 form.local_pool_error = Some(message);
             }
             (EditorState::NewResult(form), LocalPoolKind::ResultAttachment)
@@ -2025,7 +2362,10 @@ impl GuiApp {
     /// `(LogicalPath, EntryKind)` to hand to `navigate`.
     fn editing_target_and_kind(&self) -> Option<(LogicalPath, EntryKind)> {
         match &self.editor {
-            EditorState::NewRequirement(f) => f.editing_target.clone().map(|t| (t, EntryKind::Requirement)),
+            EditorState::NewRequirement(f) => f
+                .editing_target
+                .clone()
+                .map(|t| (t, EntryKind::Requirement)),
             EditorState::NewTest(f) => f.editing_target.clone().map(|t| (t, EntryKind::Test)),
             EditorState::NewResult(f) => f.editing_target.clone().map(|t| (t, EntryKind::Result)),
             EditorState::NewModule(_) | EditorState::ExistingModule(_) | EditorState::None => None,
@@ -2146,10 +2486,13 @@ impl GuiApp {
                 Some(target) => (DeleteTarget::Result(target), form.name.clone()),
                 None => return,
             },
-            EditorState::ExistingModule(form) if !form.path.is_empty() => {
-                (DeleteTarget::Module(form.path.clone()), form.display_name.clone())
+            EditorState::ExistingModule(form) if !form.path.is_empty() => (
+                DeleteTarget::Module(form.path.clone()),
+                form.display_name.clone(),
+            ),
+            EditorState::ExistingModule(_) | EditorState::NewModule(_) | EditorState::None => {
+                return;
             }
-            EditorState::ExistingModule(_) | EditorState::NewModule(_) | EditorState::None => return,
         };
         self.delete_confirm_dialog = Some(DeleteConfirmState {
             target,
@@ -2215,17 +2558,22 @@ impl GuiApp {
     /// dialog open with an error instead of silently closing on a delete
     /// that didn't actually happen.
     fn apply_delete_result(&mut self, request: RequestId, removed: bool) {
-        let is_pending = matches!(&self.delete_confirm_dialog, Some(d) if d.pending_request == Some(request));
+        let is_pending =
+            matches!(&self.delete_confirm_dialog, Some(d) if d.pending_request == Some(request));
         if !is_pending {
             return;
         }
         if removed {
             self.dirty = true;
-            let target = self.delete_confirm_dialog.take().expect("just matched Some above").target;
+            let target = self
+                .delete_confirm_dialog
+                .take()
+                .expect("just matched Some above")
+                .target;
             let parent = match target {
-                DeleteTarget::Requirement(target) | DeleteTarget::Test(target) | DeleteTarget::Result(target) => {
-                    target.modules
-                }
+                DeleteTarget::Requirement(target)
+                | DeleteTarget::Test(target)
+                | DeleteTarget::Result(target) => target.modules,
                 DeleteTarget::Module(target) => {
                     let len = target.len().saturating_sub(1);
                     target[..len].to_vec()
@@ -2255,7 +2603,7 @@ impl GuiApp {
         };
         self.recreate_requirement_dialog = Some(RecreateRequirementState {
             target,
-            requirement: form.original.clone(),
+            requirement: Box::new(form.current_contents()),
             new_name: String::new(),
             deleted: false,
             pending_request: None,
@@ -2319,15 +2667,17 @@ impl GuiApp {
     /// `deleted` unset, so a retry resends the delete (nothing succeeded
     /// yet to make that unsafe).
     fn apply_recreate_delete_result(&mut self, request: RequestId, removed: bool) -> bool {
-        let is_pending =
-            matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
+        let is_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
         if !is_pending {
             return false;
         }
         if !removed {
             if let Some(dialog) = &mut self.recreate_requirement_dialog {
                 dialog.pending_request = None;
-                dialog.error = Some("Could not delete the existing requirement — it may have already been removed.".to_string());
+                dialog.error = Some(
+                    "Could not delete the existing requirement — it may have already been removed."
+                        .to_string(),
+                );
             }
             return true;
         }
@@ -2363,16 +2713,22 @@ impl GuiApp {
     /// reports that plainly rather than pretending Cancel is still a safe
     /// no-op, and lets the user retry the create (e.g. under a different
     /// name) via `recreate_requirement_confirmed`'s `deleted: true` branch.
-    fn apply_recreate_create_result(&mut self, request: RequestId, result: Result<(), gui_core::AddChildError>) -> bool {
-        let is_pending =
-            matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
+    fn apply_recreate_create_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::AddChildError>,
+    ) -> bool {
+        let is_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
         if !is_pending {
             return false;
         }
         match result {
             Ok(()) => {
                 self.dirty = true;
-                let dialog = self.recreate_requirement_dialog.take().expect("just matched Some above");
+                let dialog = self
+                    .recreate_requirement_dialog
+                    .take()
+                    .expect("just matched Some above");
                 let new_target = LogicalPath {
                     modules: dialog.target.modules,
                     name: EntryName(dialog.new_name.trim().to_string()),
@@ -2392,6 +2748,141 @@ impl GuiApp {
         true
     }
 
+    /// Opens the "Recreate" prompt for the test currently open in the
+    /// editor — see `recreate_requirement_clicked`'s doc comment; identical
+    /// reasoning, just for `Command::AddTest`/`RemoveTest` instead.
+    fn recreate_test_clicked(&mut self) {
+        let EditorState::NewTest(form) = &self.editor else {
+            return;
+        };
+        let Some(target) = form.editing_target.clone() else {
+            return;
+        };
+        self.recreate_test_dialog = Some(RecreateTestState {
+            target,
+            test: Box::new(form.current_contents()),
+            new_name: String::new(),
+            deleted: false,
+            pending_request: None,
+            error: None,
+        });
+    }
+
+    /// "Cancel" clicked in the test Recreate prompt — see
+    /// `recreate_requirement_cancelled`'s doc comment.
+    fn recreate_test_cancelled(&mut self) {
+        self.recreate_test_dialog = None;
+    }
+
+    /// "Recreate" clicked inside the test prompt — see
+    /// `recreate_requirement_confirmed`'s doc comment; identical reasoning.
+    fn recreate_test_confirmed(&mut self) {
+        let Some(dialog) = self.recreate_test_dialog.clone() else {
+            return;
+        };
+        let new_name = dialog.new_name.trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        let request = self.next_request_id();
+        let command = if dialog.deleted {
+            Command::AddTest {
+                module: dialog.target.modules.clone(),
+                name: EntryName(new_name),
+                test: dialog.test.clone(),
+                request,
+            }
+        } else {
+            Command::RemoveTest {
+                target: dialog.target.clone(),
+                request,
+            }
+        };
+        self.pending.insert(request, PendingKind::Generic);
+        if let Some(dialog) = &mut self.recreate_test_dialog {
+            dialog.pending_request = Some(request);
+            dialog.error = None;
+        }
+        self.send_command(command);
+    }
+
+    /// Routes a `RemoveTest` outcome back to the test Recreate dialog's
+    /// delete leg — see `apply_recreate_delete_result`'s doc comment;
+    /// identical reasoning.
+    fn apply_recreate_test_delete_result(&mut self, request: RequestId, removed: bool) -> bool {
+        let is_pending = matches!(&self.recreate_test_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
+        if !is_pending {
+            return false;
+        }
+        if !removed {
+            if let Some(dialog) = &mut self.recreate_test_dialog {
+                dialog.pending_request = None;
+                dialog.error = Some(
+                    "Could not delete the existing test — it may have already been removed."
+                        .to_string(),
+                );
+            }
+            return true;
+        }
+        self.dirty = true;
+        let add_request = self.next_request_id();
+        self.pending.insert(add_request, PendingKind::Generic);
+        let dialog = self
+            .recreate_test_dialog
+            .as_mut()
+            .expect("just matched Some above");
+        dialog.deleted = true;
+        let module = dialog.target.modules.clone();
+        let name = EntryName(dialog.new_name.trim().to_string());
+        let test = dialog.test.clone();
+        dialog.pending_request = Some(add_request);
+        self.send_command(Command::AddTest {
+            module,
+            name,
+            test,
+            request: add_request,
+        });
+        true
+    }
+
+    /// Routes an `AddTest` outcome back to the test Recreate dialog's
+    /// create leg — see `apply_recreate_create_result`'s doc comment;
+    /// identical reasoning.
+    fn apply_recreate_test_create_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::AddChildError>,
+    ) -> bool {
+        let is_pending = matches!(&self.recreate_test_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
+        if !is_pending {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                self.dirty = true;
+                let dialog = self
+                    .recreate_test_dialog
+                    .take()
+                    .expect("just matched Some above");
+                let new_target = LogicalPath {
+                    modules: dialog.target.modules,
+                    name: EntryName(dialog.new_name.trim().to_string()),
+                };
+                self.select(new_target, EntryKind::Test);
+            }
+            Err(err) => {
+                if let Some(dialog) = &mut self.recreate_test_dialog {
+                    dialog.pending_request = None;
+                    dialog.error = Some(format!(
+                        "The old test was already deleted, but creating \"{}\" failed: {err}. Enter a different name and try again.",
+                        dialog.new_name
+                    ));
+                }
+            }
+        }
+        true
+    }
+
     /// Routes an `AddRequirement`/`AddTest`/`AddResult`/`AddModule`
     /// outcome back into whichever form is still open and waiting on it —
     /// a reply for a form the user already cancelled/closed is ignored,
@@ -2402,7 +2893,11 @@ impl GuiApp {
     /// create-mode form (`editing_target: None`) — that's the only way an
     /// `Add*` `Command` gets sent in the first place, see
     /// `RequirementFormState::build_command`.
-    fn apply_create_result(&mut self, request: RequestId, result: Result<(), gui_core::AddChildError>) {
+    fn apply_create_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::AddChildError>,
+    ) {
         let is_pending = match &self.editor {
             EditorState::NewRequirement(f) => f.pending_request == Some(request),
             EditorState::NewTest(f) => f.pending_request == Some(request),
@@ -2445,50 +2940,69 @@ impl GuiApp {
     }
 
     /// The `Update*` counterpart to `apply_create_result` — same stale-
-    /// reply guard, but success keeps the form open (just clears
-    /// `pending_request`) instead of closing it: unlike a create, there's
-    /// no "done, blank slate" moment for an edit — the form still shows
-    /// the (now-saved) entry, which is the reasonable thing to keep
-    /// looking at. Only ever reached for an edit-mode form
+    /// reply guard, but success navigates back to the entry's read-only
+    /// viewer (`NavMode::View`, same as `editor_cancel_clicked`) instead of
+    /// leaving the edit form open: Save is done, so there's nothing left to
+    /// edit, and re-fetching gives a viewer that reflects the just-saved
+    /// state rather than a stale local copy. A failure leaves the form
+    /// open with the error shown inline, so the user doesn't lose what
+    /// they typed. Only ever reached for an edit-mode form
     /// (`editing_target: Some(_)`), the mirror image of
     /// `apply_create_result`'s note.
-    fn apply_update_result(&mut self, request: RequestId, result: Result<(), gui_core::UpdateChildError>) {
-        let is_pending = match &self.editor {
-            EditorState::NewRequirement(f) => f.pending_request == Some(request),
-            EditorState::NewTest(f) => f.pending_request == Some(request),
-            EditorState::NewResult(f) => f.pending_request == Some(request),
-            EditorState::NewModule(_) | EditorState::ExistingModule(_) | EditorState::None => false,
+    fn apply_update_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::UpdateChildError>,
+    ) {
+        let target_and_kind = match &self.editor {
+            EditorState::NewRequirement(f) if f.pending_request == Some(request) => f
+                .editing_target
+                .clone()
+                .map(|t| (t, EntryKind::Requirement)),
+            EditorState::NewTest(f) if f.pending_request == Some(request) => {
+                f.editing_target.clone().map(|t| (t, EntryKind::Test))
+            }
+            EditorState::NewResult(f) if f.pending_request == Some(request) => {
+                f.editing_target.clone().map(|t| (t, EntryKind::Result))
+            }
+            _ => return,
         };
-        if !is_pending {
-            return;
-        }
 
-        let succeeded = result.is_ok();
-        if succeeded {
-            self.dirty = true;
-        }
-        let message = result.err().map(|err| err.to_string());
-        // `edited` only clears on success — a failed save leaves the
-        // form's content still genuinely unsaved, so the "you have
-        // unsaved changes" prompt (`editor_has_unsaved_edits`) must keep
-        // applying to it.
-        match &mut self.editor {
-            EditorState::NewRequirement(f) => {
-                f.error = message;
-                f.pending_request = None;
-                f.edited = !succeeded;
+        match result {
+            Ok(()) => {
+                self.dirty = true;
+                match target_and_kind {
+                    Some((target, kind)) => self.navigate(target, kind, NavMode::View),
+                    None => self.editor = EditorState::None,
+                }
             }
-            EditorState::NewTest(f) => {
-                f.error = message;
-                f.pending_request = None;
-                f.edited = !succeeded;
+            Err(err) => {
+                let message = err.to_string();
+                // `edited` stays true — a failed save leaves the form's
+                // content still genuinely unsaved, so the "you have
+                // unsaved changes" prompt (`editor_has_unsaved_edits`) must
+                // keep applying to it.
+                match &mut self.editor {
+                    EditorState::NewRequirement(f) => {
+                        f.error = Some(message);
+                        f.pending_request = None;
+                        f.edited = true;
+                    }
+                    EditorState::NewTest(f) => {
+                        f.error = Some(message);
+                        f.pending_request = None;
+                        f.edited = true;
+                    }
+                    EditorState::NewResult(f) => {
+                        f.error = Some(message);
+                        f.pending_request = None;
+                        f.edited = true;
+                    }
+                    EditorState::NewModule(_)
+                    | EditorState::ExistingModule(_)
+                    | EditorState::None => {}
+                }
             }
-            EditorState::NewResult(f) => {
-                f.error = message;
-                f.pending_request = None;
-                f.edited = !succeeded;
-            }
-            EditorState::NewModule(_) | EditorState::ExistingModule(_) | EditorState::None => {}
         }
     }
 
@@ -2633,7 +3147,8 @@ impl eframe::App for GuiApp {
         // changed (checked internally), so it's cheap enough to just
         // call unconditionally every frame rather than tracking "did the
         // zoom change this frame" separately.
-        ui.ctx().set_zoom_factor(self.config.zoom_percent as f32 / 100.0);
+        ui.ctx()
+            .set_zoom_factor(self.config.zoom_percent as f32 / 100.0);
         // Same "cheap enough to set unconditionally" reasoning as
         // `set_zoom_factor` above — `set_theme` just writes
         // `Options::theme_preference`, no per-call cost worth tracking
@@ -2671,7 +3186,8 @@ impl eframe::App for GuiApp {
                 // still true this same pass and lets it complete on its
                 // own rather than roundtripping through another manufactured
                 // `ViewportCommand::Close`.
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
 
@@ -2715,8 +3231,10 @@ impl eframe::App for GuiApp {
         self.render_validate_before_save_dialog(ui);
         self.render_delete_confirm_dialog(ui);
         self.render_recreate_requirement_dialog(ui);
+        self.render_recreate_test_dialog(ui);
         self.render_load_error_dialog(ui);
         self.render_attachments_dialog(ui);
+        self.render_commit_all_dialog(ui);
         self.render_path_picker_dialog(ui);
         self.render_exit_dialog(ui);
         #[cfg(all(feature = "debug-panel", debug_assertions))]
@@ -2738,10 +3256,23 @@ impl eframe::App for GuiApp {
 pub(crate) fn flatten_leaf_paths(tree: &TreeSnapshot, kind: EntryKind) -> Vec<LogicalPath> {
     let mut out = Vec::new();
     collect_leaf_paths(&tree.root.children, kind, &[], &mut out);
+    // Root-level entries (and, more generally, entries from a
+    // shallower module) before ones nested deeper — the picker's
+    // list otherwise reads in a plain pre-order tree walk, which
+    // buries the project root's own entries under whichever module
+    // happens to sort first. `sort_by_key` is stable, so entries at
+    // the same depth keep the tree-walk order `collect_leaf_paths`
+    // already produced.
+    out.sort_by_key(|target| target.modules.len());
     out
 }
 
-fn collect_leaf_paths(children: &[TreeNode], kind: EntryKind, module_path: &[EntryName], out: &mut Vec<LogicalPath>) {
+fn collect_leaf_paths(
+    children: &[TreeNode],
+    kind: EntryKind,
+    module_path: &[EntryName],
+    out: &mut Vec<LogicalPath>,
+) {
     for child in children {
         if child.kind == EntryKind::Module {
             let mut child_path = module_path.to_vec();
@@ -2775,11 +3306,18 @@ fn collect_leaf_paths(children: &[TreeNode], kind: EntryKind, module_path: &[Ent
 /// separately borrowed mutably — see that arm's own comment.
 fn module_display_name(tree: Option<&TreeSnapshot>, path: &[EntryName]) -> String {
     let Some(tree) = tree else {
-        return path.last().map(|name| name.as_str().to_string()).unwrap_or_default();
+        return path
+            .last()
+            .map(|name| name.as_str().to_string())
+            .unwrap_or_default();
     };
     let mut node = &tree.root;
     for segment in path {
-        match node.children.iter().find(|child| child.kind == EntryKind::Module && &child.name == segment) {
+        match node
+            .children
+            .iter()
+            .find(|child| child.kind == EntryKind::Module && &child.name == segment)
+        {
             Some(child) => node = child,
             None => return segment.as_str().to_string(),
         }
@@ -2947,7 +3485,10 @@ mod test {
             outcome: Outcome::AddRequirement(Ok(())),
         });
 
-        assert!(matches!(app.exit_dialog, Some(ExitDialogState::Saving { .. })));
+        assert!(matches!(
+            app.exit_dialog,
+            Some(ExitDialogState::Saving { .. })
+        ));
     }
 
     #[test]
@@ -2964,7 +3505,10 @@ mod test {
 
         // A `now` before the deadline: no transition yet.
         app.tick_exit_dialog(Instant::now());
-        assert!(matches!(app.exit_dialog, Some(ExitDialogState::Saving { .. })));
+        assert!(matches!(
+            app.exit_dialog,
+            Some(ExitDialogState::Saving { .. })
+        ));
 
         // A `now` past the deadline: transitions deterministically, no
         // real sleep needed.
@@ -2980,14 +3524,23 @@ mod test {
         app.on_exit_clicked();
         app.on_exit_dialog_save_clicked();
         app.tick_exit_dialog(Instant::now() + Duration::from_secs(2));
-        assert!(matches!(app.exit_dialog, Some(ExitDialogState::TimedOut { .. })));
+        assert!(matches!(
+            app.exit_dialog,
+            Some(ExitDialogState::TimedOut { .. })
+        ));
 
         app.on_exit_dialog_keep_waiting_clicked();
 
-        assert!(matches!(app.exit_dialog, Some(ExitDialogState::Saving { .. })));
+        assert!(matches!(
+            app.exit_dialog,
+            Some(ExitDialogState::Saving { .. })
+        ));
         // Fresh deadline: an immediate tick doesn't re-time-out.
         app.tick_exit_dialog(Instant::now());
-        assert!(matches!(app.exit_dialog, Some(ExitDialogState::Saving { .. })));
+        assert!(matches!(
+            app.exit_dialog,
+            Some(ExitDialogState::Saving { .. })
+        ));
     }
 
     #[test]
@@ -2998,7 +3551,10 @@ mod test {
         app.on_exit_clicked();
         app.on_exit_dialog_save_clicked();
         app.tick_exit_dialog(Instant::now() + Duration::from_secs(2));
-        assert!(matches!(app.exit_dialog, Some(ExitDialogState::TimedOut { .. })));
+        assert!(matches!(
+            app.exit_dialog,
+            Some(ExitDialogState::TimedOut { .. })
+        ));
 
         app.on_exit_dialog_exit_anyway_clicked();
 
@@ -3035,9 +3591,15 @@ mod test {
         app.new_module_clicked();
         assert!(matches!(app.editor, EditorState::NewModule(_)));
 
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
 
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("definition"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
         assert!(matches!(app.editor, EditorState::None));
         assert!(app.detail_request.is_some());
         assert_eq!(app.pending.len(), 1);
@@ -3053,7 +3615,10 @@ mod test {
     #[test]
     fn a_single_selection_still_cannot_go_back_or_forward() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
         assert!(!app.can_go_back());
         assert!(!app.can_go_forward());
     }
@@ -3061,19 +3626,34 @@ mod test {
     #[test]
     fn back_then_forward_round_trips_two_selections() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
-        app.select(LogicalPath::root(disk_entry_name("second")), EntryKind::Requirement);
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("second"))));
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
+        app.select(
+            LogicalPath::root(disk_entry_name("second")),
+            EntryKind::Requirement,
+        );
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("second")))
+        );
         assert!(app.can_go_back());
         assert!(!app.can_go_forward());
 
         app.back_clicked();
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("first"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("first")))
+        );
         assert!(!app.can_go_back());
         assert!(app.can_go_forward());
 
         app.forward_clicked();
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("second"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("second")))
+        );
         assert!(app.can_go_back());
         assert!(!app.can_go_forward());
     }
@@ -3081,32 +3661,50 @@ mod test {
     #[test]
     fn back_clicked_with_nothing_to_go_back_to_does_nothing() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
         let pending_before = app.pending.len();
 
         app.back_clicked();
 
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("first"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("first")))
+        );
         assert_eq!(app.pending.len(), pending_before);
     }
 
     #[test]
     fn forward_clicked_with_nothing_to_go_forward_to_does_nothing() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
         let pending_before = app.pending.len();
 
         app.forward_clicked();
 
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("first"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("first")))
+        );
         assert_eq!(app.pending.len(), pending_before);
     }
 
     #[test]
     fn a_new_selection_after_going_back_discards_forward_history() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
-        app.select(LogicalPath::root(disk_entry_name("second")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
+        app.select(
+            LogicalPath::root(disk_entry_name("second")),
+            EntryKind::Requirement,
+        );
         app.back_clicked();
         assert!(app.can_go_forward());
 
@@ -3114,11 +3712,17 @@ mod test {
         // should truncate the "second" entry out of history entirely,
         // same as a browser dropping forward history on a fresh
         // navigation.
-        app.select(LogicalPath::root(disk_entry_name("third")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("third")),
+            EntryKind::Requirement,
+        );
 
         assert!(!app.can_go_forward());
         app.back_clicked();
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("first"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("first")))
+        );
     }
 
     /// The bug this session's whole nav_history/`NavTarget` change fixes:
@@ -3128,22 +3732,37 @@ mod test {
     #[test]
     fn back_after_selecting_a_module_between_two_leaves_lands_on_the_middle_leaf() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
-        app.select(LogicalPath::root(disk_entry_name("second")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
+        app.select(
+            LogicalPath::root(disk_entry_name("second")),
+            EntryKind::Requirement,
+        );
         app.select_module(vec![disk_entry_name("m")]);
         assert!(matches!(app.editor, EditorState::ExistingModule(_)));
 
         app.back_clicked();
 
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("second"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("second")))
+        );
         assert!(matches!(app.editor, EditorState::None));
     }
 
     #[test]
     fn selecting_a_module_after_going_back_discards_forward_history() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
-        app.select(LogicalPath::root(disk_entry_name("second")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
+        app.select(
+            LogicalPath::root(disk_entry_name("second")),
+            EntryKind::Requirement,
+        );
         app.back_clicked();
         assert!(app.can_go_forward());
 
@@ -3151,15 +3770,24 @@ mod test {
 
         assert!(!app.can_go_forward());
         app.back_clicked();
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("first"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("first")))
+        );
     }
 
     #[test]
     fn back_and_forward_walk_through_a_mixed_leaf_and_module_history() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("a")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("a")),
+            EntryKind::Requirement,
+        );
         app.select_module(vec![disk_entry_name("m1")]);
-        app.select(LogicalPath::root(disk_entry_name("b")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("b")),
+            EntryKind::Requirement,
+        );
         app.select_module(Vec::new()); // the project root
 
         // history: [a, m1, b, root], position 3 (root)
@@ -3203,7 +3831,10 @@ mod test {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Stop {
-        Leaf { name: &'static str, mode: NavMode },
+        Leaf {
+            name: &'static str,
+            mode: NavMode,
+        },
         /// Index into `FAKE_MODULES`; `0` is the project root.
         Module(usize),
     }
@@ -3259,7 +3890,10 @@ mod test {
     const FAKE_MODULES: [&[&str]; 3] = [&[], &["m1"], &["m2"]];
 
     fn fake_module_path(index: usize) -> Vec<gui_core::EntryName> {
-        FAKE_MODULES[index].iter().map(|s| disk_entry_name(s)).collect()
+        FAKE_MODULES[index]
+            .iter()
+            .map(|s| disk_entry_name(s))
+            .collect()
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -3299,6 +3933,7 @@ mod test {
                         dependencies: Vec::new(),
                         attachments: Vec::new(),
                         met_status: gui_core::RequirementMetStatus::Unvalidated,
+                        results: Vec::new(),
                         original: Box::new(gui_core::RequirementDraft::new("Fake")),
                     })),
                 });
@@ -3318,7 +3953,9 @@ mod test {
             {
                 app.apply_event(Event::Completed {
                     request,
-                    outcome: Outcome::RequirementMetStatus(gui_core::RequirementMetStatus::Unvalidated),
+                    outcome: Outcome::RequirementMetStatus(
+                        gui_core::RequirementMetStatus::Unvalidated,
+                    ),
                 });
                 continue;
             }
@@ -3336,11 +3973,17 @@ mod test {
 
         match model.current() {
             Stop::Leaf { name, mode } => {
-                assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name(name))));
+                assert_eq!(
+                    app.selection,
+                    Some(LogicalPath::root(disk_entry_name(name)))
+                );
                 let EditorState::NewRequirement(form) = &app.editor else {
                     panic!("expected NewRequirement, got {:?}", app.editor);
                 };
-                assert_eq!(form.editing_target, Some(LogicalPath::root(disk_entry_name(name))));
+                assert_eq!(
+                    form.editing_target,
+                    Some(LogicalPath::root(disk_entry_name(name)))
+                );
                 assert_eq!(form.read_only, mode == NavMode::View);
             }
             Stop::Module(index) => {
@@ -3359,7 +4002,10 @@ mod test {
 
         let mut rng = StdRng::seed_from_u64(seed);
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name(FAKE_LEAVES[0])), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name(FAKE_LEAVES[0])),
+            EntryKind::Requirement,
+        );
         settle(&mut app);
         let mut model = Model::new(Stop::Leaf {
             name: FAKE_LEAVES[0],
@@ -3380,8 +4026,14 @@ mod test {
             match action {
                 Action::SelectLeaf(i) => {
                     let name = FAKE_LEAVES[i];
-                    app.select(LogicalPath::root(disk_entry_name(name)), EntryKind::Requirement);
-                    model.navigate(Stop::Leaf { name, mode: NavMode::View });
+                    app.select(
+                        LogicalPath::root(disk_entry_name(name)),
+                        EntryKind::Requirement,
+                    );
+                    model.navigate(Stop::Leaf {
+                        name,
+                        mode: NavMode::View,
+                    });
                 }
                 Action::SelectModule(i) => {
                     app.select_module(fake_module_path(i));
@@ -3394,9 +4046,16 @@ mod test {
                     // form) are already covered by
                     // `editor_edit_clicked_does_nothing_for_a_create_mode_form`
                     // and aren't what this test is about.
-                    if let Stop::Leaf { name, mode: NavMode::View } = model.current() {
+                    if let Stop::Leaf {
+                        name,
+                        mode: NavMode::View,
+                    } = model.current()
+                    {
                         app.editor_edit_clicked();
-                        model.navigate(Stop::Leaf { name, mode: NavMode::Edit });
+                        model.navigate(Stop::Leaf {
+                            name,
+                            mode: NavMode::Edit,
+                        });
                     }
                 }
                 Action::TriggerValidate => {
@@ -3437,7 +4096,10 @@ mod test {
     #[test]
     fn a_matching_requirement_detail_reply_opens_it_pre_filled_and_read_only() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
         let request = app.detail_request.unwrap();
 
         app.apply_event(Event::Completed {
@@ -3450,6 +4112,7 @@ mod test {
                 dependencies: Vec::new(),
                 attachments: Vec::new(),
                 met_status: gui_core::RequirementMetStatus::Unvalidated,
+                results: Vec::new(),
                 original: Box::new(gui_core::RequirementDraft::new("Definition")),
             })),
         });
@@ -3460,7 +4123,10 @@ mod test {
         assert_eq!(form.title, "Definition");
         assert_eq!(form.requirement_text, "The system shall...");
         assert_eq!(form.name, "definition");
-        assert_eq!(form.editing_target, Some(LogicalPath::root(disk_entry_name("definition"))));
+        assert_eq!(
+            form.editing_target,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
         assert!(form.pending_request.is_none());
         // A plain tree click (`select`, `NavMode::View`) lands on the
         // read-only viewer, not straight into the editable form — see
@@ -3471,7 +4137,10 @@ mod test {
     #[test]
     fn a_requirement_detail_replys_dependencies_populate_the_form() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
         let request = app.detail_request.unwrap();
 
         app.apply_event(Event::Completed {
@@ -3482,14 +4151,17 @@ mod test {
                 requirement_guidance: None,
                 test_guidance: None,
                 dependencies: vec![
-                    gui_core::DependencyReferenceKind::RequirementReferenceV1(gui_core::LocalGitReference {
-                        path: gui_core::ReferencePath("/requirements/discovery".to_string()),
-                        commit: "abc123".to_string(),
-                    }),
+                    gui_core::DependencyReferenceKind::RequirementReferenceV1(
+                        gui_core::LocalGitReference {
+                            path: gui_core::ReferencePath("/requirements/discovery".to_string()),
+                            commit: "abc123".to_string(),
+                        },
+                    ),
                     gui_core::DependencyReferenceKind::Submodules,
                 ],
                 attachments: Vec::new(),
                 met_status: gui_core::RequirementMetStatus::Unvalidated,
+                results: Vec::new(),
                 original: Box::new(gui_core::RequirementDraft::new("Definition")),
             })),
         });
@@ -3511,7 +4183,10 @@ mod test {
     #[test]
     fn editor_edit_clicked_switches_the_viewer_to_the_editable_form() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
         complete_definition_requirement_detail(&mut app);
         let EditorState::NewRequirement(form) = &app.editor else {
             unreachable!()
@@ -3525,13 +4200,19 @@ mod test {
             unreachable!()
         };
         assert!(!form.read_only);
-        assert_eq!(form.editing_target, Some(LogicalPath::root(disk_entry_name("definition"))));
+        assert_eq!(
+            form.editing_target,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
     }
 
     #[test]
     fn editor_edit_clicked_registers_as_a_navigation_back_returns_to_the_viewer() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
         complete_definition_requirement_detail(&mut app);
         assert!(!app.can_go_back());
 
@@ -3550,7 +4231,10 @@ mod test {
             unreachable!()
         };
         assert!(form.read_only);
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("definition"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
     }
 
     #[test]
@@ -3606,7 +4290,10 @@ mod test {
     #[test]
     fn editor_has_unsaved_edits_is_false_for_the_read_only_viewer() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
         complete_definition_requirement_detail(&mut app);
         // A plain tree click lands read-only — nothing editable to have
         // set `edited` in the first place.
@@ -3630,6 +4317,11 @@ mod test {
             request,
             outcome: Outcome::UpdateRequirement(Ok(())),
         });
+        // Save navigates back to the viewer (see
+        // `a_successful_update_closes_the_form_and_returns_to_the_viewer`),
+        // which lands on a freshly-fetched form — `edited` is moot until
+        // that reply arrives and rebuilds the form from scratch.
+        complete_definition_requirement_detail(&mut app);
 
         let EditorState::NewRequirement(form) = &app.editor else {
             unreachable!()
@@ -3681,7 +4373,10 @@ mod test {
 
         assert!(app.unsaved_form_dialog.is_none());
         // Still on "definition" — nothing navigated.
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("definition"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
     }
 
     #[test]
@@ -3703,7 +4398,10 @@ mod test {
         app.unsaved_form_dialog_confirmed();
 
         assert!(app.unsaved_form_dialog.is_none());
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("discovery"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("discovery")))
+        );
     }
 
     #[test]
@@ -3724,9 +4422,15 @@ mod test {
     #[test]
     fn a_stale_entry_detail_reply_is_ignored_after_a_new_selection() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("first")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("first")),
+            EntryKind::Requirement,
+        );
         let first_request = app.detail_request.unwrap();
-        app.select(LogicalPath::root(disk_entry_name("second")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("second")),
+            EntryKind::Requirement,
+        );
 
         // The first selection's reply arrives late, after the user already
         // moved on to a second selection.
@@ -3740,12 +4444,16 @@ mod test {
                 dependencies: Vec::new(),
                 attachments: Vec::new(),
                 met_status: gui_core::RequirementMetStatus::Unvalidated,
+                results: Vec::new(),
                 original: Box::new(gui_core::RequirementDraft::new("First")),
             })),
         });
 
         assert!(matches!(app.editor, EditorState::None));
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("second"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("second")))
+        );
     }
 
     #[test]
@@ -3845,7 +4553,9 @@ mod test {
 
         assert_eq!(
             app.validate_before_save_dialog,
-            Some(ValidateBeforeSaveDialogState::Asking { action: PendingSaveAction::Save })
+            Some(ValidateBeforeSaveDialogState::Asking {
+                action: PendingSaveAction::Save
+            })
         );
     }
 
@@ -3863,7 +4573,9 @@ mod test {
 
         assert_eq!(
             app.validate_before_save_dialog,
-            Some(ValidateBeforeSaveDialogState::Asking { action: PendingSaveAction::SaveAs(path) })
+            Some(ValidateBeforeSaveDialogState::Asking {
+                action: PendingSaveAction::SaveAs(path)
+            })
         );
         // A failed SaveAs must not adopt the path — same guarantee
         // `a_failed_save_as_does_not_change_the_known_project_path`
@@ -3948,9 +4660,11 @@ mod test {
 
         app.apply_event(Event::Completed {
             request: validate_request,
-            outcome: Outcome::Validate(Err(vec![logical::validate::ValidationError::DependencyCycle {
-                cycle: vec![LogicalPath::root(disk_entry_name("a"))],
-            }])),
+            outcome: Outcome::Validate(Err(vec![
+                logical::validate::ValidationError::DependencyCycle {
+                    cycle: vec![LogicalPath::root(disk_entry_name("a"))],
+                },
+            ])),
         });
 
         match &app.validate_before_save_dialog {
@@ -4314,7 +5028,10 @@ mod test {
     #[test]
     fn select_module_sets_selected_module_and_clears_the_leaf_selection() {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
         assert!(app.selection.is_some());
 
         app.select_module(vec![disk_entry_name("setup")]);
@@ -4357,6 +5074,7 @@ mod test {
                 dependencies: Vec::new(),
                 attachments: Vec::new(),
                 met_status: gui_core::RequirementMetStatus::Unvalidated,
+                results: Vec::new(),
                 original: Box::new(gui_core::RequirementDraft::new("Definition")),
             })),
         });
@@ -4372,10 +5090,42 @@ mod test {
     /// `read_only: false`.
     fn app_editing_a_requirement() -> GuiApp {
         let mut app = test_app();
-        app.select(LogicalPath::root(disk_entry_name("definition")), EntryKind::Requirement);
+        app.select(
+            LogicalPath::root(disk_entry_name("definition")),
+            EntryKind::Requirement,
+        );
         complete_definition_requirement_detail(&mut app);
         app.editor_edit_clicked();
         complete_definition_requirement_detail(&mut app);
+        app
+    }
+
+    fn complete_smoke_test_detail(app: &mut GuiApp) {
+        let request = app.detail_request.unwrap();
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::EntryDetail(Some(gui_core::EntryDetail::Test {
+                title: "Smoke".to_string(),
+                result_kind: gui_core::ResultKindV1::FreeForm,
+                attachments: Vec::new(),
+                template_files: Vec::new(),
+                original: Box::new(gui_core::TestDraft::new(
+                    "Smoke",
+                    gui_core::ResultKindV1::FreeForm,
+                )),
+            })),
+        });
+    }
+
+    /// Test-form analogue of `app_editing_a_requirement` — same two-step
+    /// round trip, landing on `EditorState::NewTest` with
+    /// `editing_target: Some(_)`, `read_only: false`.
+    fn app_editing_a_test() -> GuiApp {
+        let mut app = test_app();
+        app.select(LogicalPath::root(disk_entry_name("smoke")), EntryKind::Test);
+        complete_smoke_test_detail(&mut app);
+        app.editor_edit_clicked();
+        complete_smoke_test_detail(&mut app);
         app
     }
 
@@ -4391,11 +5141,14 @@ mod test {
         assert!(form.pending_request.is_some());
         // Still in edit mode, still pointed at the same entry — Save
         // doesn't lose track of what's being edited.
-        assert_eq!(form.editing_target, Some(LogicalPath::root(disk_entry_name("definition"))));
+        assert_eq!(
+            form.editing_target,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
     }
 
     #[test]
-    fn a_successful_update_keeps_the_form_open_and_marks_dirty() {
+    fn a_successful_update_closes_the_form_and_returns_to_the_viewer() {
         let mut app = app_editing_a_requirement();
         app.editor_create_clicked();
         let EditorState::NewRequirement(form) = &app.editor else {
@@ -4408,16 +5161,25 @@ mod test {
             outcome: Outcome::UpdateRequirement(Ok(())),
         });
 
-        let EditorState::NewRequirement(form) = &app.editor else {
-            panic!("form should stay open after a successful update");
-        };
-        assert!(form.pending_request.is_none());
-        assert!(form.error.is_none());
+        // Save navigates back to the viewer, same as Cancel — this fires
+        // a fresh `GetEntryDetail` rather than leaving the edit form open,
+        // so `self.editor` is `None` until that reply lands.
+        assert!(matches!(app.editor, EditorState::None));
         assert!(app.dirty);
+
+        complete_definition_requirement_detail(&mut app);
+        let EditorState::NewRequirement(form) = &app.editor else {
+            panic!("expected the read-only viewer to reopen after Save");
+        };
+        assert!(form.read_only);
+        assert_eq!(
+            form.editing_target,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
     }
 
     #[test]
-    fn a_failed_update_reports_the_error_and_keeps_the_form_open() {
+    fn a_failed_update_reports_the_error_and_keeps_the_edit_form_open() {
         let mut app = app_editing_a_requirement();
         app.editor_create_clicked();
         let EditorState::NewRequirement(form) = &app.editor else {
@@ -4523,7 +5285,13 @@ mod test {
 
         app.attachments_dialog_add_attachment_clicked();
 
-        assert!(app.attachments_dialog.as_ref().unwrap().new_attachment_path.is_empty());
+        assert!(
+            app.attachments_dialog
+                .as_ref()
+                .unwrap()
+                .new_attachment_path
+                .is_empty()
+        );
         // One pending from opening (GetModulePools) plus one for the add.
         assert_eq!(app.pending.len(), 2);
     }
@@ -4562,11 +5330,143 @@ mod test {
     }
 
     #[test]
+    fn commit_all_button_clicked_opens_the_dialog_loading() {
+        let mut app = test_app();
+
+        app.commit_all_button_clicked();
+
+        let dialog = app.commit_all_dialog.as_ref().unwrap();
+        assert!(dialog.loading);
+        assert!(dialog.changed_files.is_empty());
+        assert!(app.changed_files_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_matching_get_changed_files_reply_populates_and_sorts_the_dialog() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+        let request = app.changed_files_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::GetChangedFiles(Ok(vec![
+                PathBuf::from("sub/deep/file.txt"),
+                PathBuf::from("root.txt"),
+                PathBuf::from("aaa.txt"),
+                PathBuf::from("sub/nested.txt"),
+            ])),
+        });
+
+        let dialog = app.commit_all_dialog.as_ref().unwrap();
+        assert!(!dialog.loading);
+        // Shallowest first, alphabetical within the same depth.
+        assert_eq!(
+            dialog.changed_files,
+            vec![
+                PathBuf::from("aaa.txt"),
+                PathBuf::from("root.txt"),
+                PathBuf::from("sub/nested.txt"),
+                PathBuf::from("sub/deep/file.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_get_changed_files_reports_the_error_inline() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+        let request = app.changed_files_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::GetChangedFiles(Err(gui_core::GetChangedFilesError::NoProjectPath)),
+        });
+
+        let dialog = app.commit_all_dialog.as_ref().unwrap();
+        assert!(!dialog.loading);
+        assert!(dialog.error.is_some());
+    }
+
+    #[test]
+    fn commit_all_dialog_closed_clears_the_dialog() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+
+        app.commit_all_dialog_closed();
+
+        assert!(app.commit_all_dialog.is_none());
+    }
+
+    #[test]
+    fn commit_clicked_with_an_empty_message_does_nothing() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+
+        app.commit_all_dialog_commit_clicked();
+
+        // Only the original GetChangedFiles request from opening.
+        assert_eq!(app.pending.len(), 1);
+        assert!(app.commit_all_request.is_none());
+    }
+
+    #[test]
+    fn commit_clicked_with_a_message_sends_commit_all() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+        app.commit_all_dialog.as_mut().unwrap().message = "commit everything".to_string();
+
+        app.commit_all_dialog_commit_clicked();
+
+        assert!(app.commit_all_dialog.as_ref().unwrap().committing);
+        assert!(app.commit_all_request.is_some());
+        // One pending from opening (GetChangedFiles) plus one for the commit.
+        assert_eq!(app.pending.len(), 2);
+    }
+
+    #[test]
+    fn a_successful_commit_all_closes_the_dialog() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+        app.commit_all_dialog.as_mut().unwrap().message = "commit everything".to_string();
+        app.commit_all_dialog_commit_clicked();
+        let request = app.commit_all_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::CommitAll(Ok(())),
+        });
+
+        assert!(app.commit_all_dialog.is_none());
+    }
+
+    #[test]
+    fn a_failed_commit_all_reports_the_error_and_keeps_the_dialog_open() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+        app.commit_all_dialog.as_mut().unwrap().message = "commit everything".to_string();
+        app.commit_all_dialog_commit_clicked();
+        let request = app.commit_all_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::CommitAll(Err(gui_core::CommitAllError::NoProjectPath)),
+        });
+
+        let dialog = app.commit_all_dialog.as_ref().unwrap();
+        assert!(!dialog.committing);
+        assert!(dialog.error.is_some());
+    }
+
+    #[test]
     fn a_failed_pool_change_reports_the_error_inline() {
         let mut app = test_app();
         app.attachments_dialog_opened();
 
-        app.apply_outcome(999, Outcome::AddAttachment(Err(gui_core::AddPoolChildError::ModuleNotFound)));
+        app.apply_outcome(
+            999,
+            Outcome::AddAttachment(Err(gui_core::AddPoolChildError::ModuleNotFound)),
+        );
 
         let dialog = app.attachments_dialog.as_ref().unwrap();
         assert!(dialog.error.is_some());
@@ -4641,7 +5541,10 @@ mod test {
         };
         form.attachments = vec![PathBuf::from("notes.md")];
 
-        app.local_attachment_remove_clicked(LocalPoolKind::RequirementAttachment, PathBuf::from("notes.md"));
+        app.local_attachment_remove_clicked(
+            LocalPoolKind::RequirementAttachment,
+            PathBuf::from("notes.md"),
+        );
         let request = *app.local_pool_ops.keys().next().unwrap();
         app.apply_event(Event::Completed {
             request,
@@ -4666,7 +5569,9 @@ mod test {
 
         app.apply_event(Event::Completed {
             request,
-            outcome: Outcome::AddRequirementAttachment(Err(gui_core::AddLocalPoolError::EntryNotFound)),
+            outcome: Outcome::AddRequirementAttachment(Err(
+                gui_core::AddLocalPoolError::EntryNotFound,
+            )),
         });
 
         let EditorState::NewRequirement(form) = &app.editor else {
@@ -4683,13 +5588,18 @@ mod test {
         let EditorState::NewRequirement(form) = &app.editor else {
             unreachable!()
         };
-        assert!(matches!(form.met_status, gui_core::RequirementMetStatus::Unvalidated));
+        assert!(matches!(
+            form.met_status,
+            gui_core::RequirementMetStatus::Unvalidated
+        ));
 
         app.apply_event(Event::Completed {
             request: 999,
             outcome: Outcome::Validate(Ok(())),
         });
-        let request = app.met_status_request.expect("Validate should have requested a met_status refresh");
+        let request = app
+            .met_status_request
+            .expect("Validate should have requested a met_status refresh");
 
         app.apply_event(Event::Completed {
             request,
@@ -4699,7 +5609,10 @@ mod test {
         let EditorState::NewRequirement(form) = &app.editor else {
             unreachable!()
         };
-        assert!(matches!(form.met_status, gui_core::RequirementMetStatus::Met));
+        assert!(matches!(
+            form.met_status,
+            gui_core::RequirementMetStatus::Met
+        ));
         assert!(app.met_status_request.is_none());
     }
 
@@ -4731,7 +5644,9 @@ mod test {
             outcome: Outcome::Validate(Ok(())),
         });
 
-        let request = app.module_summary_request.expect("Validate should have requested a summary refresh");
+        let request = app
+            .module_summary_request
+            .expect("Validate should have requested a summary refresh");
 
         app.apply_event(Event::Completed {
             request,
@@ -4830,7 +5745,9 @@ mod test {
 
         app.apply_event(Event::Completed {
             request,
-            outcome: Outcome::RefreshStaleTestReferences(Err(gui_core::RefreshStaleTestReferencesError::NotValidated)),
+            outcome: Outcome::RefreshStaleTestReferences(Err(
+                gui_core::RefreshStaleTestReferencesError::NotValidated,
+            )),
         });
 
         assert!(!app.dirty);
@@ -4871,7 +5788,9 @@ mod test {
             request: 999,
             outcome: Outcome::Validate(Ok(())),
         });
-        let request = app.met_status_request.expect("Validate should have requested a met_status refresh");
+        let request = app
+            .met_status_request
+            .expect("Validate should have requested a met_status refresh");
         app.editor_cancel_clicked();
 
         app.apply_event(Event::Completed {
@@ -5197,8 +6116,14 @@ mod test {
 
         app.editor_delete_clicked();
 
-        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should be open");
-        assert_eq!(dialog.target, DeleteTarget::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        let dialog = app
+            .delete_confirm_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(
+            dialog.target,
+            DeleteTarget::Requirement(LogicalPath::root(disk_entry_name("definition")))
+        );
         assert_eq!(dialog.label, "definition");
         assert!(dialog.pending_request.is_none());
     }
@@ -5232,8 +6157,14 @@ mod test {
 
         app.editor_delete_clicked();
 
-        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should be open");
-        assert_eq!(dialog.target, DeleteTarget::Module(vec![disk_entry_name("setup")]));
+        let dialog = app
+            .delete_confirm_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(
+            dialog.target,
+            DeleteTarget::Module(vec![disk_entry_name("setup")])
+        );
     }
 
     #[test]
@@ -5255,7 +6186,10 @@ mod test {
 
         app.delete_confirmed();
 
-        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should still be open while pending");
+        let dialog = app
+            .delete_confirm_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
         assert!(dialog.pending_request.is_some());
         assert_eq!(app.pending.len(), 1);
     }
@@ -5265,7 +6199,12 @@ mod test {
         let mut app = app_editing_a_requirement();
         app.editor_delete_clicked();
         app.delete_confirmed();
-        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+        let request = app
+            .delete_confirm_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request,
@@ -5285,14 +6224,22 @@ mod test {
         let mut app = app_editing_a_requirement();
         app.editor_delete_clicked();
         app.delete_confirmed();
-        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+        let request = app
+            .delete_confirm_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request,
             outcome: Outcome::RemoveRequirement(false),
         });
 
-        let dialog = app.delete_confirm_dialog.as_ref().expect("dialog should stay open on failure");
+        let dialog = app
+            .delete_confirm_dialog
+            .as_ref()
+            .expect("dialog should stay open on failure");
         assert!(dialog.error.is_some());
         assert!(dialog.pending_request.is_none());
         assert!(!app.dirty);
@@ -5303,7 +6250,12 @@ mod test {
         let mut app = app_editing_a_requirement();
         app.editor_delete_clicked();
         app.delete_confirmed();
-        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+        let request = app
+            .delete_confirm_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
         app.delete_cancelled();
 
         // The reply for the now-abandoned dialog arrives late.
@@ -5324,11 +6276,39 @@ mod test {
 
         app.recreate_requirement_clicked();
 
-        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog should be open");
-        assert_eq!(dialog.target, LogicalPath::root(disk_entry_name("definition")));
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(
+            dialog.target,
+            LogicalPath::root(disk_entry_name("definition"))
+        );
         assert!(dialog.new_name.is_empty());
         assert!(!dialog.deleted);
         assert!(dialog.pending_request.is_none());
+    }
+
+    #[test]
+    fn recreate_requirement_clicked_captures_unsaved_edits_not_just_original() {
+        let mut app = app_editing_a_requirement();
+        let EditorState::NewRequirement(form) = &mut app.editor else {
+            panic!("expected NewRequirement editor state");
+        };
+        form.tests.push(TestRefDraft {
+            path: "tests/new.ron".to_string(),
+            commit: "deadbeef".to_string(),
+        });
+        form.title = "Edited title".to_string();
+
+        app.recreate_requirement_clicked();
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(dialog.requirement.title, "Edited title");
+        assert_eq!(dialog.requirement.tests.len(), 1);
     }
 
     #[test]
@@ -5348,7 +6328,10 @@ mod test {
 
         app.recreate_requirement_confirmed();
 
-        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog stays open");
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert!(dialog.pending_request.is_none());
         assert!(app.pending.is_empty());
     }
@@ -5363,7 +6346,10 @@ mod test {
 
         app.recreate_requirement_confirmed();
 
-        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog should still be open while pending");
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
         assert!(dialog.pending_request.is_some());
         assert!(!dialog.deleted);
         assert_eq!(app.pending.len(), 1);
@@ -5377,16 +6363,26 @@ mod test {
             dialog.new_name = "renamed".to_string();
         }
         app.recreate_requirement_confirmed();
-        let delete_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let delete_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request: delete_request,
             outcome: Outcome::RemoveRequirement(true),
         });
 
-        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog stays open for the create leg");
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open for the create leg");
         assert!(dialog.deleted);
-        let create_request = dialog.pending_request.expect("create leg should now be pending");
+        let create_request = dialog
+            .pending_request
+            .expect("create leg should now be pending");
         assert_ne!(create_request, delete_request);
         assert!(app.dirty);
     }
@@ -5399,14 +6395,22 @@ mod test {
             dialog.new_name = "renamed".to_string();
         }
         app.recreate_requirement_confirmed();
-        let request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request,
             outcome: Outcome::RemoveRequirement(false),
         });
 
-        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog should stay open on failure");
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should stay open on failure");
         assert!(!dialog.deleted);
         assert!(dialog.error.is_some());
         assert!(dialog.pending_request.is_none());
@@ -5421,12 +6425,22 @@ mod test {
             dialog.new_name = "renamed".to_string();
         }
         app.recreate_requirement_confirmed();
-        let delete_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let delete_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
         app.apply_event(Event::Completed {
             request: delete_request,
             outcome: Outcome::RemoveRequirement(true),
         });
-        let create_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let create_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request: create_request,
@@ -5435,7 +6449,10 @@ mod test {
 
         assert!(app.recreate_requirement_dialog.is_none());
         assert!(app.dirty);
-        assert_eq!(app.selection, Some(LogicalPath::root(disk_entry_name("renamed"))));
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("renamed")))
+        );
     }
 
     #[test]
@@ -5446,19 +6463,32 @@ mod test {
             dialog.new_name = "renamed".to_string();
         }
         app.recreate_requirement_confirmed();
-        let delete_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let delete_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
         app.apply_event(Event::Completed {
             request: delete_request,
             outcome: Outcome::RemoveRequirement(true),
         });
-        let create_request = app.recreate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let create_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request: create_request,
             outcome: Outcome::AddRequirement(Err(gui_core::AddChildError::ModuleNotFound)),
         });
 
-        let dialog = app.recreate_requirement_dialog.as_ref().expect("dialog stays open so the user can retry");
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open so the user can retry");
         assert!(dialog.deleted);
         assert!(dialog.error.is_some());
         assert!(dialog.pending_request.is_none());
@@ -5483,13 +6513,252 @@ mod test {
     }
 
     #[test]
+    fn recreate_test_clicked_on_an_editing_test_opens_the_dialog() {
+        let mut app = app_editing_a_test();
+
+        app.recreate_test_clicked();
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(dialog.target, LogicalPath::root(disk_entry_name("smoke")));
+        assert!(dialog.new_name.is_empty());
+        assert!(!dialog.deleted);
+        assert!(dialog.pending_request.is_none());
+    }
+
+    #[test]
+    fn recreate_test_clicked_captures_unsaved_edits_not_just_original() {
+        let mut app = app_editing_a_test();
+        let EditorState::NewTest(form) = &mut app.editor else {
+            panic!("expected NewTest editor state");
+        };
+        form.title = "Edited title".to_string();
+
+        app.recreate_test_clicked();
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(dialog.test.title, "Edited title");
+    }
+
+    #[test]
+    fn recreate_test_clicked_is_a_no_op_for_a_create_mode_form() {
+        let mut app = test_app();
+        app.new_test_clicked();
+
+        app.recreate_test_clicked();
+
+        assert!(app.recreate_test_dialog.is_none());
+    }
+
+    #[test]
+    fn recreate_test_confirmed_with_an_empty_name_sends_nothing() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+
+        app.recreate_test_confirmed();
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert!(dialog.pending_request.is_none());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn recreate_test_confirmed_sends_a_remove_command_first() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+
+        app.recreate_test_confirmed();
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert!(dialog.pending_request.is_some());
+        assert!(!dialog.deleted);
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_successful_test_delete_leg_immediately_chains_into_the_create_leg() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_test_confirmed();
+        let delete_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveTest(true),
+        });
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog stays open for the create leg");
+        assert!(dialog.deleted);
+        let create_request = dialog
+            .pending_request
+            .expect("create leg should now be pending");
+        assert_ne!(create_request, delete_request);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn a_failed_test_delete_leg_leaves_the_dialog_open_without_marking_it_deleted() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_test_confirmed();
+        let request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RemoveTest(false),
+        });
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog should stay open on failure");
+        assert!(!dialog.deleted);
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn a_successful_full_test_recreate_closes_the_dialog_and_navigates_to_the_new_entry() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_test_confirmed();
+        let delete_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveTest(true),
+        });
+        let create_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddTest(Ok(())),
+        });
+
+        assert!(app.recreate_test_dialog.is_none());
+        assert!(app.dirty);
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("renamed")))
+        );
+    }
+
+    #[test]
+    fn a_failed_test_create_leg_leaves_the_dialog_open_for_a_retry() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        app.recreate_test_confirmed();
+        let delete_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveTest(true),
+        });
+        let create_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddTest(Err(gui_core::AddChildError::ModuleNotFound)),
+        });
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog stays open so the user can retry");
+        assert!(dialog.deleted);
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+
+        // Retrying only resends the create — the delete already happened.
+        app.recreate_test_confirmed();
+        let dialog = app.recreate_test_dialog.as_ref().unwrap();
+        assert!(dialog.pending_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn recreate_test_cancelled_closes_the_dialog_without_sending_anything() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        let pending_before = app.pending.len();
+
+        app.recreate_test_cancelled();
+
+        assert!(app.recreate_test_dialog.is_none());
+        assert_eq!(app.pending.len(), pending_before);
+    }
+
+    #[test]
     fn a_successful_module_delete_selects_the_parent_module() {
         let mut app = test_app();
         app.select_module(vec![disk_entry_name("setup")]);
         app.editor_edit_clicked();
         app.editor_delete_clicked();
         app.delete_confirmed();
-        let request = app.delete_confirm_dialog.as_ref().unwrap().pending_request.unwrap();
+        let request = app
+            .delete_confirm_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request,

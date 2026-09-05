@@ -99,7 +99,7 @@ fn export_requirement(name: &EntryName, requirement: &RequirementDraft) -> Requi
         requirement_guidance: requirement.requirement_guidance.clone(),
         test_guidance: requirement.test_guidance.clone(),
         attachments: export_pool(&requirement.attachments),
-        commit: requirement.commit.clone().unwrap_or_default(),
+        commit: requirement.commit.clone(),
     }
 }
 
@@ -122,7 +122,7 @@ fn export_test(name: &EntryName, test: &TestDraft) -> TestOnDisk {
         test_text: String::new(),
         attachments: export_pool(&test.attachments),
         template: export_pool(&test.template),
-        commit: test.commit.clone().unwrap_or_default(),
+        commit: test.commit.clone(),
     }
 }
 

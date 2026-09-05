@@ -24,7 +24,7 @@ pub use disk::{
 pub use logical::LogicalPath;
 pub use logical::AddPoolFileError;
 pub use logical::draft::{RequirementDraft, ResultDraft, TestDraft};
-pub use logical::{TestUnmetReason, UnmetReason, UnsatisfiedTest};
+pub use logical::{RequirementResult, TestUnmetReason, UnmetReason, UnsatisfiedTest, resolve_reference_path};
 
 use std::path::PathBuf;
 
@@ -338,6 +338,21 @@ pub enum Command {
         path: Option<ReferencePath>,
         request: RequestId,
     },
+    /// Every path the project's working directory currently has pending
+    /// (staged, unstaged, or untracked) — what a `CommitAll` would sweep
+    /// up. The read behind the "Commit all changes" dialog's file list.
+    GetChangedFiles {
+        request: RequestId,
+    },
+    /// Stages and commits every pending change in the project's working
+    /// directory with `message` — the "Commit all changes" button. Touches
+    /// no in-memory project state (the draft/validated project is
+    /// unaffected either way), so unlike `Save` it isn't gated by
+    /// `mutation_in_flight`.
+    CommitAll {
+        message: String,
+        request: RequestId,
+    },
 
     Shutdown,
 }
@@ -400,6 +415,8 @@ pub enum Outcome {
     /// — carried directly, same as `Outcome::LoadProject` carries `disk`'s
     /// own error type unwrapped.
     ResolveRemoteCommit(Result<String, syscalls::CommitForRemoteError>),
+    GetChangedFiles(Result<Vec<PathBuf>, GetChangedFilesError>),
+    CommitAll(Result<(), CommitAllError>),
     /// A command that needs a loaded project arrived when `state` is
     /// `None` (no `LoadProject` has ever succeeded, or the current
     /// project failed to load).
@@ -417,6 +434,28 @@ pub enum ResolveLocalCommitError {
     NoProjectPath,
     #[error(transparent)]
     Commit(#[from] syscalls::CommitForPathError),
+}
+
+/// `GetChangedFiles`'s own error type — same "no project on disk yet"
+/// failure mode as `ResolveLocalCommitError`, plus `syscalls`'s own
+/// `git status` failure.
+#[derive(Debug, thiserror::Error)]
+pub enum GetChangedFilesError {
+    #[error("no project is loaded on disk to check for changes")]
+    NoProjectPath,
+    #[error(transparent)]
+    Status(#[from] syscalls::ChangedPathsError),
+}
+
+/// `CommitAll`'s own error type — same "no project on disk yet" failure
+/// mode as `GetChangedFilesError`, plus `syscalls`'s own add/commit
+/// failure (including "nothing to commit").
+#[derive(Debug, thiserror::Error)]
+pub enum CommitAllError {
+    #[error("no project is loaded on disk to commit")]
+    NoProjectPath,
+    #[error(transparent)]
+    Commit(#[from] syscalls::CommitAllError),
 }
 
 /// `add_requirement`/`add_test`/`add_result`/`add_module` all need
@@ -596,6 +635,13 @@ pub enum EntryDetail {
         /// every `GetEntryDetail`, same "always recompute, never cache"
         /// spirit as `logical::ValidatedProject`'s own queries.
         met_status: RequirementMetStatus,
+        /// Every result anywhere in the project that references this
+        /// requirement — the read-only viewer's own "Results" list,
+        /// below Dependencies and Test references. See
+        /// `logical::results_for_requirement`'s own doc comment for why
+        /// this isn't filtered by currency or `status` the way
+        /// `met_status` is.
+        results: Vec<RequirementResult>,
         /// The full `RequirementDraft` this was read from, unmodified —
         /// `gui-ui`'s `RequirementFormState::build_command` clones this
         /// and overlays only the fields above, so `UpdateRequirement`

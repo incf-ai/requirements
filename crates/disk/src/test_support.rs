@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use syscalls::{CommitForPathError, Git};
+use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, Git};
 
 /// A `Git` stub that reports a fixed commit for any path, used by tests that
 /// exercise load/save plumbing in a scratch tempdir which isn't (and
@@ -14,6 +14,14 @@ impl Git for FixedGit {
         _excludes: &[&Path],
     ) -> Result<String, CommitForPathError> {
         Ok("deadbeef".to_string())
+    }
+
+    fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+        Ok(Vec::new())
+    }
+
+    fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+        Ok(())
     }
 }
 

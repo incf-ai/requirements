@@ -3,6 +3,6 @@ GuiConfig(
         secs: 15,
         nanos: 0,
     ),
-    zoom_percent: 130,
+    zoom_percent: 120,
     theme: Dark,
 )
