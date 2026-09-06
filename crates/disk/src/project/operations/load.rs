@@ -109,6 +109,10 @@ mod test {
         fn commit_all(&self, _dir: &std::path::Path, _message: &str) -> Result<(), syscalls::CommitAllError> {
             unreachable!("load_project should bail out before looking up any commits")
         }
+
+        fn diff(&self, _dir: &std::path::Path, _path: &std::path::Path) -> Result<String, syscalls::DiffError> {
+            unreachable!("load_project should bail out before looking up any commits")
+        }
     }
 
     #[test]

@@ -456,7 +456,9 @@ fn mutate(
 #[cfg(test)]
 mod test {
     use super::*;
-    use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, StdFilesystem, SystemGit};
+    use syscalls::{
+        ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, DiffError, StdFilesystem, SystemGit,
+    };
 
     struct FixedGit;
     impl Git for FixedGit {
@@ -474,6 +476,10 @@ mod test {
 
         fn commit_all(&self, _dir: &std::path::Path, _message: &str) -> Result<(), CommitAllError> {
             Ok(())
+        }
+
+        fn diff(&self, _dir: &std::path::Path, _path: &std::path::Path) -> Result<String, DiffError> {
+            Ok(String::new())
         }
     }
 

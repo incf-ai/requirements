@@ -321,6 +321,10 @@ mod test {
         fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), syscalls::CommitAllError> {
             unreachable!("save_project never looks up commits")
         }
+
+        fn diff(&self, _dir: &Path, _path: &Path) -> Result<String, syscalls::DiffError> {
+            unreachable!("save_project never looks up commits")
+        }
     }
 
     #[test]

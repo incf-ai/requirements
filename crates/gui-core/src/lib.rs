@@ -23,7 +23,7 @@ pub use disk::{
 };
 pub use logical::LogicalPath;
 pub use logical::AddPoolFileError;
-pub use logical::draft::{RequirementDraft, ResultDraft, TestDraft};
+pub use logical::draft::{RequirementDraft, ResultDraft, TestDraft, title_case_from_name};
 pub use logical::{RequirementResult, TestUnmetReason, UnmetReason, UnsatisfiedTest, resolve_reference_path};
 pub use logical::{
     ReferenceAction, ReferenceRepairError, ReferenceSite, ReferenceSiteKind, ReferenceTarget,
@@ -356,6 +356,14 @@ pub enum Command {
     GetChangedFiles {
         request: RequestId,
     },
+    /// A unified diff for one path from `GetChangedFiles`'s own list —
+    /// what clicking a file in the "Commit all changes" dialog fetches to
+    /// show in the diff-preview modal. Read-only, same shape as
+    /// `GetChangedFiles` itself.
+    GetDiff {
+        path: PathBuf,
+        request: RequestId,
+    },
     /// Stages and commits every pending change in the project's working
     /// directory with `message` — the "Commit all changes" button. Touches
     /// no in-memory project state (the draft/validated project is
@@ -456,6 +464,7 @@ pub enum Outcome {
     /// own error type unwrapped.
     ResolveRemoteCommit(Result<String, syscalls::CommitForRemoteError>),
     GetChangedFiles(Result<Vec<PathBuf>, GetChangedFilesError>),
+    GetDiff(Result<String, GetDiffError>),
     CommitAll(Result<(), CommitAllError>),
     FindReferences(Vec<ReferenceSite>),
     RepairReferences(Result<(), ReferenceRepairError>),
@@ -495,6 +504,17 @@ pub enum GetChangedFilesError {
     NoProjectPath,
     #[error(transparent)]
     Status(#[from] syscalls::ChangedPathsError),
+}
+
+/// `GetDiff`'s own error type — same "no project on disk yet" failure
+/// mode as `GetChangedFilesError`, plus `syscalls`'s own `git diff`
+/// failure.
+#[derive(Debug, thiserror::Error)]
+pub enum GetDiffError {
+    #[error("no project is loaded on disk to diff")]
+    NoProjectPath,
+    #[error(transparent)]
+    Diff(#[from] syscalls::DiffError),
 }
 
 /// `CommitAll`'s own error type — same "no project on disk yet" failure

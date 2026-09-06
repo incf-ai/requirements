@@ -21,6 +21,9 @@ debug-panel = []
 
 [dependencies]
 gui-core = { path = "../gui-core" }
+# Only used for `today_iso_date`'s calendar-date formatting (the Create
+# Result dialog's identifier prefill).
+chrono = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 # Only used for its glyph-name constants and `Variant::font_bytes()` — its

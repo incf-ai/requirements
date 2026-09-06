@@ -53,8 +53,10 @@ pub enum UpdateNamedChildError {
 
 /// Turns a sanitized entry name like `foo_bar_baz` into a human display
 /// title, `Foo Bar Baz` — underscores become spaces, each word capitalized.
-/// Used to autopopulate an empty title when adding a requirement/test.
-fn title_case_from_name(name: &str) -> String {
+/// Used to autopopulate an empty title when adding a requirement/test, and
+/// (via `logical::draft::title_case_from_name`) to regenerate a title after
+/// a rename/recreate.
+pub fn title_case_from_name(name: &str) -> String {
     name.split('_')
         .filter(|segment| !segment.is_empty())
         .map(|segment| {

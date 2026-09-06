@@ -244,6 +244,14 @@ pub trait Git {
     /// letting `git commit` itself error, so callers can distinguish "the
     /// repo really has nothing pending" from a genuine git failure.
     fn commit_all(&self, dir: &Path, message: &str) -> Result<(), CommitAllError>;
+
+    /// A unified diff for `path` (relative to `dir`, as `changed_paths`
+    /// itself returns them) against what a `commit_all` would compare it
+    /// to — `HEAD` for a tracked file, or an empty tree for one that's
+    /// untracked/has no `HEAD` yet to diff against. Read-only: never stages
+    /// anything, so calling this doesn't change what a subsequent
+    /// `commit_all` would sweep up.
+    fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError>;
 }
 
 #[derive(Debug, Error)]
@@ -302,6 +310,17 @@ pub enum CommitAllError {
     CommandFailed { status: ExitStatus, stderr: String },
     #[error("nothing to commit")]
     NothingToCommit,
+}
+
+#[derive(Debug, Error)]
+pub enum DiffError {
+    #[error("failed to run git: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("git exited with {status}: {stderr}")]
+    CommandFailed { status: ExitStatus, stderr: String },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -459,6 +478,70 @@ impl Git for SystemGit {
 
         Ok(())
     }
+
+    fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError> {
+        // `git diff HEAD -- <path>` only knows about paths already in the
+        // index or `HEAD` — a genuinely untracked file (or any file at all
+        // in a brand-new repo with no commits yet) shows up there as no
+        // difference rather than as the new-file diff a user expects, so
+        // that case is detected via `git status` first and routed through
+        // `--no-index` against `/dev/null` instead, the same "treat it as
+        // an addition" trick `git diff --no-index` is designed for.
+        let status_output = Command::new("git")
+            .current_dir(dir)
+            .args(["status", "--porcelain=v1", "--untracked-files=all", "--"])
+            .arg(path)
+            .output()
+            .map_err(|source| DiffError::Spawn { source })?;
+        if !status_output.status.success() {
+            return Err(DiffError::CommandFailed {
+                status: status_output.status,
+                stderr: String::from_utf8_lossy(&status_output.stderr).into_owned(),
+            });
+        }
+        let untracked = String::from_utf8_lossy(&status_output.stdout)
+            .lines()
+            .any(|line| line.starts_with("??"));
+
+        let head_exists = !untracked
+            && self.is_repository(dir)
+            && Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "--verify", "-q", "HEAD"])
+                .output()
+                .map_err(|source| DiffError::Spawn { source })?
+                .status
+                .success();
+
+        let output = if untracked || !head_exists {
+            Command::new("git")
+                .current_dir(dir)
+                .args(["diff", "--no-index", "--", "/dev/null"])
+                .arg(path)
+                .output()
+                .map_err(|source| DiffError::Spawn { source })?
+        } else {
+            Command::new("git")
+                .current_dir(dir)
+                .args(["diff", "HEAD", "--"])
+                .arg(path)
+                .output()
+                .map_err(|source| DiffError::Spawn { source })?
+        };
+
+        // `git diff --no-index` uses exit-code semantics (0 = identical,
+        // 1 = differences found, 2+ = real error) unlike ordinary `git
+        // diff`, which always exits 0 regardless of what it finds — treat
+        // exit code 1 as success here too rather than a command failure.
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(DiffError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
 
 /// Wraps another `Git`, letting tests force `commit_for_path` on specific
@@ -507,6 +590,10 @@ impl<G: Git> Git for FaultInjectingGit<G> {
 
     fn commit_all(&self, dir: &Path, message: &str) -> Result<(), CommitAllError> {
         self.inner.commit_all(dir, message)
+    }
+
+    fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError> {
+        self.inner.diff(dir, path)
     }
 }
 
@@ -987,6 +1074,60 @@ mod tests {
                 PathBuf::from("untracked.txt"),
             ]
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_reports_a_modified_tracked_file_against_head() {
+        let dir = scratch_git_repo("diff-modified");
+        std::fs::write(dir.join("tracked.txt"), "goodbye").unwrap();
+
+        let diff = SystemGit.diff(&dir, Path::new("tracked.txt")).unwrap();
+        assert!(diff.contains("-hello"), "diff was: {diff}");
+        assert!(diff.contains("+goodbye"), "diff was: {diff}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_reports_an_untracked_file_as_wholly_added() {
+        let dir = scratch_git_repo("diff-untracked");
+        std::fs::write(dir.join("untracked.txt"), "new content").unwrap();
+
+        let diff = SystemGit.diff(&dir, Path::new("untracked.txt")).unwrap();
+        assert!(diff.contains("+new content"), "diff was: {diff}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_reports_a_staged_new_file_in_a_repo_with_no_commits_yet() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-git-diff-unborn-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet"]);
+        std::fs::write(dir.join("file.txt"), "brand new").unwrap();
+        run(&["add", "file.txt"]);
+
+        let diff = SystemGit.diff(&dir, Path::new("file.txt")).unwrap();
+        assert!(diff.contains("+brand new"), "diff was: {diff}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_is_empty_for_an_unmodified_tracked_file() {
+        let dir = scratch_git_repo("diff-unmodified");
+
+        assert_eq!(SystemGit.diff(&dir, Path::new("tracked.txt")).unwrap(), "");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

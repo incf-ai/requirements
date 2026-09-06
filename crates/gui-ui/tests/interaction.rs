@@ -50,7 +50,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use accesskit::Role;
+use accesskit::{Role, Toggled};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{By, NodeT as _, Queryable as _};
 use gui_ui::{GuiApp, GuiConfig, RecentProjects};
@@ -247,6 +247,13 @@ impl syscalls::Git for FixedGit {
 
     fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), syscalls::CommitAllError> {
         Ok(())
+    }
+
+    fn diff(&self, _dir: &Path, path: &Path) -> Result<String, syscalls::DiffError> {
+        let p = path.display();
+        Ok(format!(
+            "diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1,1 +1,2 @@\n-old line\n+new line\n+another line\n"
+        ))
     }
 }
 
@@ -1168,7 +1175,7 @@ fn new_module_button_opens_a_blank_creation_form() {
             .query_by_role_and_label(Role::Label, "New Module")
             .is_some()
     );
-    assert!(harness.query_by_label("Name:").is_some());
+    assert!(harness.query_by_label("Identifier:").is_some());
     assert!(
         harness
             .query_by_role_and_label(Role::Button, "Create")
@@ -1184,18 +1191,18 @@ fn cancel_closes_the_module_form_and_restores_the_empty_state() {
         .get_by_role_and_label(Role::Button, "New Module")
         .click();
     harness.step();
-    assert!(harness.query_by_label("Name:").is_some());
+    assert!(harness.query_by_label("Identifier:").is_some());
 
     harness
         .get_by_role_and_label(Role::Button, "Cancel")
         .click();
     // Two steps: one to process the click (Cancel lives inside the same
-    // render function that already drew "Name:" earlier this frame — see
-    // this file's module doc comment), one more to see the effect.
+    // render function that already drew "Identifier:" earlier this frame
+    // — see this file's module doc comment), one more to see the effect.
     harness.step();
     harness.step();
 
-    assert!(harness.query_by_label("Name:").is_none());
+    assert!(harness.query_by_label("Identifier:").is_none());
     assert!(
         harness
             .query_by_label(
@@ -1404,6 +1411,79 @@ fn committing_with_a_message_closes_the_dialog() {
 }
 
 #[test]
+fn clicking_a_changed_file_opens_its_diff() {
+    let dir = scratch_copy_of_test_project("commit-all-diff-open");
+    let mut harness = commit_all_harness(&dir);
+
+    harness
+        .get_by_role_and_label(Role::Button, "Commit all changes…")
+        .click();
+    harness.step();
+    harness.step();
+    wait_until(&mut harness, |h| h.query_by_label("root.txt").is_some());
+
+    // `.click_accesskit()` — same "dialog can sit past the simulated
+    // viewport" reasoning as the Cancel/Commit buttons above.
+    harness.get_by_label("root.txt").click_accesskit();
+    harness.step();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Diff: root.txt").is_some()
+    });
+    // `FixedGit::diff`'s own fixed reply (see its doc comment) — a real
+    // unified diff round-tripped through `Command::GetDiff`, proving the
+    // click sent the request for *this* path and the reply rendered.
+    assert!(harness.query_by_label_contains("+new line").is_some());
+    assert!(harness.query_by_label_contains("-old line").is_some());
+
+    drop(harness);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn closing_the_diff_dialog_leaves_the_commit_all_dialog_open() {
+    let dir = scratch_copy_of_test_project("commit-all-diff-close");
+    let mut harness = commit_all_harness(&dir);
+
+    harness
+        .get_by_role_and_label(Role::Button, "Commit all changes…")
+        .click();
+    harness.step();
+    harness.step();
+    wait_until(&mut harness, |h| h.query_by_label("root.txt").is_some());
+
+    harness.get_by_label("root.txt").click_accesskit();
+    harness.step();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Diff: root.txt").is_some()
+    });
+
+    harness
+        .get_by_role_and_label(Role::Button, "Close")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Diff: root.txt")
+            .is_none()
+    );
+    // The diff modal closed back to the still-open commit-all dialog, not
+    // out entirely — see `GuiApp::diff_dialog_closed`'s own doc comment.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Commit all changes")
+            .is_some()
+    );
+
+    drop(harness);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn opening_a_real_project_populates_the_tree() {
     let mut harness = harness();
     harness.step();
@@ -1416,6 +1496,572 @@ fn opening_a_real_project_populates_the_tree() {
     // real data came back from a real `LoadProject`, not just that the
     // placeholder message went away.
     assert!(harness.query_by_label("Test Project").is_some());
+}
+
+/// Creates a real requirement named "scratchreq" at the project root with
+/// non-empty text, via the actual New Requirement form (same field-index
+/// convention `a_successful_requirement_create...`'s own new-project test
+/// uses) — the Copy/Paste tests below need a source requirement with real
+/// text, since a real `AddRequirement` refuses an empty one (see
+/// `logical::draft::module::add_requirement`) and `test_project`'s own
+/// fixture requirements all happen to have empty `requirement.typ` files
+/// (this project's fixture is deliberately structural, not textual).
+/// Leaves the tree filtered to nothing and the "New Requirement" form
+/// closed (back to the read-only viewer) once done.
+fn create_scratch_requirement(harness: &mut Harness<GuiApp>) {
+    harness
+        .get_by_role_and_label(Role::Button, "New Requirement")
+        .click();
+    harness.step();
+    // Field order among `Role::TextInput` nodes in create mode: the status
+    // bar's own zoom field(0) and the left pane's own filter field(1) —
+    // both always first, rendered before the center pane — then name(2),
+    // title(3). Same convention `a_successful_requirement_create...`'s own
+    // new-project test relies on.
+    let fields: Vec<_> = harness.get_all_by_role(Role::TextInput).collect();
+    fields[2].focus();
+    fields[2].type_text("scratchreq");
+    fields[3].focus();
+    fields[3].type_text("Scratch Requirement");
+    let multiline_fields: Vec<_> = harness.get_all_by_role(Role::MultilineTextInput).collect();
+    multiline_fields[0].focus();
+    multiline_fields[0].type_text("Scratch requirement text.");
+    harness.step();
+    harness.get_by_role_and_label(Role::Button, "Create").click();
+    harness.step();
+    wait_until(harness, |h| {
+        h.query_by_label("\u{e18a} unsaved changes").is_some()
+    });
+}
+
+#[test]
+fn right_click_copy_then_paste_duplicates_a_requirement_into_another_module() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    // Right-click the freshly created "scratchreq" requirement leaf and
+    // Copy it. `"\u{e32c} scratchreq"`, not bare `"scratchreq"` — a
+    // requirement leaf's own accessible label prepends its status icon
+    // (see `render_leaf`'s `Atoms` construction) — matches this file's
+    // existing convention for querying requirement leaves elsewhere.
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Copy")
+        .click_accesskit();
+    harness.step();
+
+    // `test_project`'s "beta" module has no requirements and no
+    // submodules of its own (see its on-disk fixture) — the tree's
+    // right-click "Paste" targets its plain-`Label` row (the no-
+    // submodules branch of `render_tree_node`), not a `CollapsingHeader`.
+    harness.get_by_label("beta").click_secondary();
+    harness.step();
+    harness.step();
+    // "Copy" fetches the requirement's full content via a real, genuinely
+    // async `GetEntryDetail` round trip (see `copy_requirement_clicked`)
+    // rather than completing inline — `Paste` starts out disabled
+    // (`attach_paste_requirement_menu`) and only becomes clickable once
+    // that reply actually lands, so wait for it instead of assuming a
+    // fixed `step()` count was enough.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "Paste")
+            .is_some_and(|node| !node.accesskit_node().is_disabled())
+    });
+    harness
+        .get_by_role_and_label(Role::Button, "Paste")
+        .click_accesskit();
+    harness.step();
+
+    // Switch to "beta" as the current module (its own "not current" glyph
+    // button — same lookup `module_page_shows_summary_then_renames_a_real_module`
+    // uses) and wait for the real, async `AddRequirement` reply to land:
+    // an empty module shows no "requirements" leaf-group header at all
+    // (see `render_leaf_group`), so its mere appearance proves the paste
+    // actually landed in *this* module, not just somewhere.
+    harness
+        .get_all_by_role_and_label(Role::Button, "\u{E24A}")
+        .last()
+        .expect("no module buttons found")
+        .click();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "requirements (1)")
+            .is_some()
+    });
+    // "Expand All" only reached the groups that existed *when it was
+    // clicked* (back in `open_test_project`, before this paste) — beta's
+    // own "requirements" group is brand new and starts collapsed like any
+    // other (`render_leaf_group`'s `default_open(false)`), so its leaf
+    // isn't actually rendered/queryable until it's opened.
+    harness
+        .get_by_role_and_label(Role::Button, "requirements (1)")
+        .click();
+    harness.step();
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_some()
+    );
+}
+
+#[test]
+fn right_click_recreate_renames_a_requirement_and_regenerates_its_title() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    // Right-click the freshly created "scratchreq" requirement leaf and
+    // choose "Recreate…" — same lookup convention as the Copy/Paste test
+    // above.
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Recreate…")
+        .click_accesskit();
+    harness.step();
+
+    // Unlike the form's own "Recreate…" button, the tree's context-menu
+    // version has no open form to read from — it fetches the requirement's
+    // full content via a real `GetEntryDetail` round trip
+    // (`recreate_requirement_from_tree_clicked`) rather than completing
+    // inline, so wait for the modal instead of assuming a fixed `step()`
+    // count was enough.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Recreate Requirement").is_some()
+    });
+
+    // "Regenerate title from new name" is checked by default — leave it
+    // alone and just change the name, then confirm the regenerated title
+    // shows up once the recreate actually lands.
+    let name_field = harness
+        .get_all(By::new().role(Role::TextInput).value("scratchreq"))
+        .next()
+        .expect("name field not found");
+    name_field.focus();
+    name_field.type_text("_renamed");
+    harness.step();
+
+    harness.get_by_role_and_label(Role::Button, "Recreate").click();
+    harness.step();
+
+    // The recreate flow chains a real `FindReferences`, then
+    // `RemoveRequirement`, then `AddRequirement` over the background
+    // actor — wait for the tree to actually show the new name rather than
+    // assuming a fixed `step()` count covers every leg.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "\u{e32c} scratchreq_renamed")
+            .is_some()
+    });
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_none(),
+        "the old name should be gone, not just a second copy added"
+    );
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq_renamed")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| h.query_by_label("Scratchreq Renamed").is_some());
+}
+
+#[test]
+fn pressing_enter_in_the_recreate_name_field_submits_like_clicking_recreate() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Recreate…")
+        .click_accesskit();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Recreate Requirement").is_some()
+    });
+
+    let name_field = harness
+        .get_all(By::new().role(Role::TextInput).value("scratchreq"))
+        .next()
+        .expect("name field not found");
+    name_field.focus();
+    name_field.type_text("_renamed");
+    harness.step();
+
+    // Enter in the name field, not a click on "Recreate", drives the rest
+    // of this test — same real `FindReferences`/`RemoveRequirement`/
+    // `AddRequirement` chain as the click-driven version above, just
+    // triggered by `render_recreate_requirement_dialog`'s own
+    // `enter_pressed_in_name_field` handling instead.
+    harness.key_press(egui::Key::Enter);
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "\u{e32c} scratchreq_renamed")
+            .is_some()
+    });
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_none(),
+        "the old name should be gone, not just a second copy added"
+    );
+}
+
+#[test]
+fn pressing_enter_in_the_recreate_name_field_does_nothing_when_recreate_would_be_disabled() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Recreate…")
+        .click_accesskit();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Recreate Requirement").is_some()
+    });
+
+    // The name field starts out prefilled with the unchanged current name
+    // ("scratchreq") — Recreate is disabled until it actually differs, so
+    // Enter here must not submit either.
+    let name_field = harness
+        .get_all(By::new().role(Role::TextInput).value("scratchreq"))
+        .next()
+        .expect("name field not found");
+    name_field.focus();
+    harness.step();
+
+    harness.key_press(egui::Key::Enter);
+    harness.step();
+    harness.step();
+
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Recreate Requirement")
+            .is_some(),
+        "the dialog should still be open — Enter must not bypass the unchanged-name guard"
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_some()
+    );
+}
+
+#[test]
+fn right_click_duplicate_prompts_for_a_name_then_creates_the_copy() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Duplicate")
+        .click_accesskit();
+    harness.step();
+
+    // "Duplicate" fetches the requirement's full content via a real
+    // `GetEntryDetail` round trip (`duplicate_requirement_clicked`) before
+    // it can even open the prompt (`open_duplicate_requirement_dialog`) —
+    // wait for the modal itself rather than assuming a fixed `step()`
+    // count was enough.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Duplicate Requirement")
+            .is_some()
+    });
+    // Pre-filled with `unique_copy_name`'s own suggestion — left as-is,
+    // proving the field really is editable/confirmable rather than
+    // asserting a hardcoded value here.
+    assert!(
+        harness
+            .query_all(By::new().role(Role::TextInput).value("scratchreq copy"))
+            .next()
+            .is_some()
+    );
+    // "Regenerate title from new name" is checked by default, same as the
+    // Recreate dialogs' own checkbox.
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::CheckBox, "Regenerate title from new name")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
+    // Same "a freshly opened `egui::Modal` needs one extra `step()` before
+    // its own content is reliably clickable" gotcha as the Delete
+    // confirmation test above.
+    harness.step();
+
+    harness.get_by_role_and_label(Role::Button, "Duplicate").click();
+    harness.step();
+
+    // The confirm click sends a real `AddRequirement` for the deduped
+    // copy — wait for the tree to pick up the new leaf.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "\u{e32c} scratchreq copy")
+            .is_some()
+    });
+    // The original is untouched — Duplicate adds a new leaf alongside it,
+    // unlike Recreate which replaces the old one.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_some()
+    );
+
+    // The default-checked "Regenerate title from new name" should have
+    // overwritten the copy's title (originally "Scratch Requirement",
+    // carried over unchanged from the source) with one derived from the
+    // new name instead.
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq copy")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| h.query_by_label("Scratchreq copy").is_some());
+}
+
+#[test]
+fn duplicate_dialog_rejects_a_name_that_already_exists() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Duplicate")
+        .click_accesskit();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Duplicate Requirement")
+            .is_some()
+    });
+    harness.step();
+
+    let name_field = harness
+        .get_all(By::new().role(Role::TextInput).value("scratchreq copy"))
+        .next()
+        .expect("name field not found");
+    name_field.focus();
+    // Ctrl+A then typing over the selection replaces the pre-filled
+    // suggestion outright rather than appending to it, so the field ends
+    // up exactly "scratchreq" — the sibling that already exists.
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    name_field.type_text("scratchreq");
+    harness.step();
+
+    let duplicate_button = harness.get_by_role_and_label(Role::Button, "Duplicate");
+    assert!(
+        duplicate_button.accesskit_node().is_disabled(),
+        "Duplicate should be disabled while the name collides with an existing sibling"
+    );
+    assert!(
+        harness
+            .query_by_label("\"scratchreq\" already exists in this module.")
+            .is_some()
+    );
+}
+
+#[test]
+fn right_click_delete_removes_a_requirement_after_confirmation() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Delete…")
+        .click_accesskit();
+    harness.step();
+
+    // Same "no open form needed" reasoning as Recreate/Duplicate above —
+    // unlike the edit form's own Delete button, this reaches the
+    // confirmation straight from the tree, so wait for the modal itself
+    // rather than assuming a fixed `step()` count.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Delete?").is_some()
+    });
+    // Same "a freshly opened `egui::Modal` needs one extra `step()` before
+    // its own content is reliably clickable" gotcha noted at the top of
+    // this file — the modal opened on the very same step "Delete…" was
+    // clicked (no async round trip involved, unlike Recreate/Duplicate
+    // above), so it hasn't had the chance to "settle" the way `wait_until`
+    // normally provides for free by polling across several steps.
+    harness.step();
+
+    harness.get_by_role_and_label(Role::Button, "Delete").click();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_none()
+    });
+}
+
+#[test]
+fn pasting_the_same_requirement_twice_dedupes_the_seconds_name() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    // Copy root's "scratchreq" and paste it into "beta" twice in a row —
+    // deliberately never switching the current module away from root in
+    // between, so root's own "scratchreq" button (the thing being
+    // re-copied each time) stays reachable throughout: the top tree pane
+    // never shows leaves at all, and the bottom pane only shows whichever
+    // module is *current*, which pasting itself never changes.
+    for _ in 0..2 {
+        harness
+            .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .click_secondary();
+        harness.step();
+        harness.step();
+        harness
+            .get_by_role_and_label(Role::Button, "Copy")
+            .click_accesskit();
+        harness.step();
+
+        harness.get_by_label("beta").click_secondary();
+        harness.step();
+        harness.step();
+        // See the sibling test's comment on why `Paste` needs a real
+        // wait, not a fixed `step()` count — `Copy`'s `GetEntryDetail`
+        // fetch is genuinely async.
+        wait_until(&mut harness, |h| {
+            h.query_by_role_and_label(Role::Button, "Paste")
+                .is_some_and(|node| !node.accesskit_node().is_disabled())
+        });
+        harness
+            .get_by_role_and_label(Role::Button, "Paste")
+            .click_accesskit();
+        harness.step();
+        harness.step();
+    }
+
+    // Switch to "beta" and confirm it ended up with both: the first
+    // paste's "scratchreq" and a second one `unique_copy_name` deduped to
+    // "scratchreq copy" once "scratchreq" was already taken there.
+    harness
+        .get_all_by_role_and_label(Role::Button, "\u{E24A}")
+        .last()
+        .expect("no module buttons found")
+        .click();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "requirements (2)")
+            .is_some()
+    });
+    // See the sibling test's comment on why this group needs its own,
+    // separate expand click — it's brand new, so `open_test_project`'s
+    // one-time "Expand All" never reached it.
+    harness
+        .get_by_role_and_label(Role::Button, "requirements (2)")
+        .click();
+    harness.step();
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq copy")
+            .is_some()
+    );
+}
+
+#[test]
+fn pasting_via_the_requirements_leaf_group_header_targets_the_current_module() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Copy")
+        .click_accesskit();
+    harness.step();
+
+    // Switch to "beta" as the current module *first*, then paste via the
+    // bottom pane's own "requirements" leaf-group header instead of going
+    // back to the top tree pane's per-module row — the point of this
+    // second paste entry point (`render_leaf_group`'s own
+    // `attach_paste_requirement_menu` call).
+    harness
+        .get_all_by_role_and_label(Role::Button, "\u{E24A}")
+        .last()
+        .expect("no module buttons found")
+        .click();
+    harness.step();
+
+    // "beta" has zero requirements, so ordinarily its "requirements"
+    // group wouldn't render at all (`render_leaf_group` returns early) —
+    // it shows up here as "requirements (0)" specifically because
+    // something is on the clipboard to paste (see that function's own
+    // comment on `can_paste_here`).
+    harness
+        .get_by_role_and_label(Role::Button, "requirements (0)")
+        .click_secondary();
+    harness.step();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "Paste")
+            .is_some_and(|node| !node.accesskit_node().is_disabled())
+    });
+    harness
+        .get_by_role_and_label(Role::Button, "Paste")
+        .click_accesskit();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "requirements (1)")
+            .is_some()
+    });
+    harness
+        .get_by_role_and_label(Role::Button, "requirements (1)")
+        .click();
+    harness.step();
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+            .is_some()
+    );
 }
 
 #[test]
@@ -1432,13 +2078,15 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
     harness.step();
     wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
 
-    // Every module (e.g. "beta") and every leaf group folder
-    // ("requirements"/"tests"/"results") starts collapsed — see
-    // `render_tree_node`/`render_leaf_group`'s own `default_open(false)`
-    // — so none of their children are reachable yet.
+    // The tree loaded at all — "beta" (a childless module, so a plain
+    // `Label` rather than a collapsible `CollapsingHeader`, see
+    // `render_tree_node`'s two branches) is a convenient proof of that.
+    // Every leaf group folder ("requirements"/"tests"/"results") starts
+    // collapsed — see `render_leaf_group`'s own `default_open(false)` —
+    // so none of their children are reachable yet.
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "beta")
+            .query_by_role_and_label(Role::Label, "beta")
             .is_some()
     );
     assert!(leaf_group_button_present(&harness, "requirements"));
@@ -1507,14 +2155,17 @@ fn an_empty_module_shows_no_leaf_group_folders() {
     // `tests`/`results`) should disappear too.
     //
     // `ModuleDraft::modules` is a `BTreeMap`, so the tree renders modules
-    // in sorted order: alpha, beta, interaction_test_module — the third
-    // "set as current module" glyph button is this new module's own (see
+    // in sorted order, and "interaction_test_module" sorts after every
+    // other root-level module — it's reliably the *last* "set as current
+    // module" glyph button in tree order regardless of how many other
+    // not-current modules (or their own submodules, like alpha's own
+    // "alpha_child") come before it (see
     // `module_page_shows_summary_then_renames_a_real_module`'s own
     // comment on this exact glyph/pattern, `\u{E24A}` / Phosphor's
     // `FOLDER_NOTCH`, shared by every not-current module's row).
     harness
         .get_all_by_role_and_label(Role::Button, "\u{E24A}")
-        .nth(2)
+        .last()
         .expect("interaction_test_module's module button not found")
         .click();
     harness.step();
@@ -1543,7 +2194,7 @@ fn an_empty_module_shows_no_leaf_group_folders() {
     );
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "interaction_test_module")
+            .query_by_role_and_label(Role::Label, "interaction_test_module")
             .is_some()
     );
 }
@@ -1569,7 +2220,7 @@ fn typing_into_the_filter_bar_hides_non_matching_leaves_and_modules() {
     );
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "beta")
+            .query_by_role_and_label(Role::Label, "beta")
             .is_some()
     );
 
@@ -1600,7 +2251,7 @@ fn typing_into_the_filter_bar_hides_non_matching_leaves_and_modules() {
     );
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "beta")
+            .query_by_role_and_label(Role::Label, "beta")
             .is_none()
     );
 
@@ -1616,7 +2267,7 @@ fn typing_into_the_filter_bar_hides_non_matching_leaves_and_modules() {
     );
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "beta")
+            .query_by_role_and_label(Role::Label, "beta")
             .is_some()
     );
 }
@@ -1630,7 +2281,7 @@ fn filtering_by_module_name_hides_non_matching_modules_in_top_tree() {
 
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "beta")
+            .query_by_role_and_label(Role::Label, "beta")
             .is_some()
     );
     assert!(
@@ -1657,7 +2308,7 @@ fn filtering_by_module_name_hides_non_matching_modules_in_top_tree() {
     // contain "beta" anywhere in its own module path, so it's gone.
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "beta")
+            .query_by_role_and_label(Role::Label, "beta")
             .is_some()
     );
     assert!(
@@ -1694,10 +2345,12 @@ fn the_top_tree_shows_empty_modules_and_no_leaves() {
 
     // "beta" is a real root-level module in `test_project` with no
     // requirements/tests/results/submodules of its own — it still shows
-    // up in the module-only top tree.
+    // up in the module-only top tree, as a plain, uncollapsible `Label`
+    // rather than a `CollapsingHeader` (see `render_tree_node`'s two
+    // branches: only a module with its own submodules gets one).
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "beta")
+            .query_by_role_and_label(Role::Label, "beta")
             .is_some()
     );
     assert_eq!(
@@ -1707,14 +2360,16 @@ fn the_top_tree_shows_empty_modules_and_no_leaves() {
         1
     );
 
-    // Expanding "beta"'s own `CollapsingHeader` in the top tree used to
-    // reveal a per-module "requirements"/"tests"/"results" nested group
-    // (the old `render_module_children`'s recursive leaf rendering, at
-    // every depth) — `render_module_children` is module-only now, so
-    // expanding it adds nothing: the count of leaf-group headers (all
-    // living in the bottom pane now, one set for the selected module)
-    // stays exactly one no matter which modules get expanded.
-    harness.get_by_role_and_label(Role::Button, "beta").click();
+    // Expanding "alpha"'s own `CollapsingHeader` in the top tree (unlike
+    // "beta", it has a real submodule of its own, "alpha_child", so it
+    // actually is one) used to reveal a per-module "requirements"/
+    // "tests"/"results" nested group (the old `render_module_children`'s
+    // recursive leaf rendering, at every depth) — `render_module_children`
+    // is module-only now, so expanding it adds nothing: the count of
+    // leaf-group headers (all living in the bottom pane now, one set for
+    // the selected module) stays exactly one no matter which modules get
+    // expanded.
+    harness.get_by_role_and_label(Role::Button, "alpha").click();
     harness.step();
     harness.step();
 
@@ -2008,7 +2663,7 @@ fn undo_and_redo_round_trip_a_real_module_creation() {
     // undo snapshot in `gui-core`.
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "interaction_test_module")
+            .query_by_role_and_label(Role::Label, "interaction_test_module")
             .is_some()
     );
     assert!(
@@ -2027,7 +2682,7 @@ fn undo_and_redo_round_trip_a_real_module_creation() {
     harness.get_by_role_and_label(Role::Button, "Undo").click();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Button, "interaction_test_module")
+        h.query_by_role_and_label(Role::Label, "interaction_test_module")
             .is_none()
     });
 
@@ -2041,7 +2696,7 @@ fn undo_and_redo_round_trip_a_real_module_creation() {
     harness.get_by_role_and_label(Role::Button, "Redo").click();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Button, "interaction_test_module")
+        h.query_by_role_and_label(Role::Label, "interaction_test_module")
             .is_some()
     });
 }
@@ -3823,6 +4478,170 @@ fn adding_a_local_attachment_to_an_existing_requirement_appears_in_the_list() {
 }
 
 #[test]
+fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_creates_it() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    // "Create new result" only shows once the requirement has at least one
+    // test procedure of its own (see `CreateResultDialogState`'s own doc
+    // comment) — `create_scratch_requirement` leaves it with none, so add
+    // one first via the real "Add test procedure" composer, same flow as
+    // `requirement_form_test_reference_composer_pick_auto_populates_the_commit`,
+    // but completed all the way through (that test stops after the Pick
+    // step) and saved for real.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "Edit").is_some()
+    });
+    harness.get_by_role_and_label(Role::Button, "Edit").click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Edit Requirement").is_some()
+    });
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add test procedure")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Label, "Add Test Procedure")
+        .parent()
+        .expect("test reference composer modal container not found")
+        .get_all_by_role_and_label(Role::Button, "Pick…")
+        .next()
+        .expect("test reference composer Pick button not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    // "smoke" is a real test leaf in `test_project` (see `tests/smoke` in
+    // `requirement.ron`'s fixtures).
+    harness
+        .get_all_by_label("smoke")
+        .last()
+        .expect("modal row not found")
+        .click();
+    harness.step();
+    harness.step();
+
+    // The composer's own confirm button — the reveal button of the same
+    // name is gone while the composer is open, so this is unambiguous.
+    harness
+        .get_by_role_and_label(Role::Button, "Add test procedure")
+        .click_accesskit();
+    harness.step();
+
+    // Persist the new test reference for real — the empty-results state's
+    // "Create new result" button reads `form.tests`, which only matters
+    // once this requirement actually has a saved test procedure, not just
+    // an in-progress form edit.
+    harness
+        .get_all_by_role_and_label(Role::Button, "Save")
+        .nth(1)
+        .expect("form Save button not found")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Requirement").is_some()
+    });
+
+    // Back in the read-only viewer — "Create new result" doesn't mutate
+    // the requirement itself (it opens the Create Result dialog, which
+    // creates a separate Result entity), so it's shown here too, unlike
+    // Local attachments' own Add/Remove controls.
+    assert!(
+        harness
+            .query_by_label("No results reference this requirement yet.")
+            .is_some()
+    );
+    harness
+        .get_by_role_and_label(Role::Button, "Create new result")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "New Result").is_some()
+    });
+
+    let fields: Vec<_> = harness
+        .get_by_role_and_label(Role::Label, "New Result")
+        .parent()
+        .expect("create-result modal container not found")
+        .get_all_by_role(Role::TextInput)
+        .collect();
+    let identifier_field = fields.first().expect("result identifier field not found");
+    let title_field = fields.get(1).expect("result title field not found");
+
+    // Prefilled as `<today> [<requirement name>] [<test name>]` (see
+    // `GuiApp::create_result_clicked`/`default_result_name`) — checked
+    // structurally (a `YYYY-MM-DD` date, then the two bracketed names)
+    // rather than against a hardcoded date, which would go stale.
+    let prefilled = identifier_field
+        .value()
+        .expect("identifier field has no value");
+    let (date_part, rest) = prefilled
+        .split_once(' ')
+        .expect("identifier missing date/name separator");
+    assert_eq!(date_part.len(), 10);
+    assert!(
+        date_part
+            .char_indices()
+            .all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() })
+    );
+    assert_eq!(rest, "[scratchreq] [smoke]");
+
+    // "Generate title from identifier" is checked by default, same as
+    // the Duplicate/Recreate dialogs' own "Regenerate title" checkbox —
+    // and, since it's checked, the title field already mirrors the
+    // identifier and is disabled rather than independently editable.
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::CheckBox, "Generate title from identifier")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
+    assert_eq!(title_field.value().as_deref(), Some(prefilled.as_str()));
+    assert!(title_field.accesskit_node().is_disabled());
+
+    identifier_field.focus();
+    identifier_field.type_text(" (edited)");
+    harness.step();
+
+    // Still synced live after editing the identifier, not just at open.
+    let fields: Vec<_> = harness
+        .get_by_role_and_label(Role::Label, "New Result")
+        .parent()
+        .expect("create-result modal container not found")
+        .get_all_by_role(Role::TextInput)
+        .collect();
+    let identifier_field = fields.first().expect("result identifier field not found");
+    let title_field = fields.get(1).expect("result title field not found");
+    let edited_identifier = identifier_field
+        .value()
+        .expect("identifier field has no value");
+    assert!(edited_identifier.ends_with(" (edited)"));
+    assert_eq!(title_field.value().as_deref(), Some(edited_identifier.as_str()));
+
+    harness
+        .get_by_role_and_label(Role::Button, "Create result")
+        .click();
+    harness.step();
+
+    // The confirm click sends a real `AddResult` and, on success, navigates
+    // straight to the new result's own read-only viewer — same "go look at
+    // what you just created" reasoning as the Duplicate prompt.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Result").is_some()
+    });
+    assert!(harness.query_by_label("\u{e18a} unsaved changes").is_some());
+}
+
+#[test]
 fn opening_a_project_defaults_to_the_root_view_page() {
     let mut harness = harness();
     harness.step();
@@ -3928,19 +4747,30 @@ fn module_page_shows_summary_then_renames_a_real_module() {
 
     harness.get_by_role_and_label(Role::Button, "Edit").click();
     harness.step();
+    // `Role::TextInput`, not bare `by_value` — a childless module's own
+    // tree row is a plain `egui::Label` (see `render_tree_node`'s two
+    // branches), and it turns out a `Label`'s accesskit *value* (not just
+    // its label) also reports its text, so an unqualified `value("beta")`
+    // query ambiguously matches that still-visible row instead of the
+    // rename form's actual text field.
     wait_until(&mut harness, |h| {
-        h.query_all_by_value("beta").next().is_some()
+        h.query_all(By::new().role(Role::TextInput).value("beta"))
+            .next()
+            .is_some()
     });
 
     let name_field = harness
-        .get_all_by_value("beta")
+        .get_all(By::new().role(Role::TextInput).value("beta"))
         .next()
         .expect("name field not found");
     name_field.focus();
     name_field.type_text("_renamed");
     harness.step();
     assert!(
-        harness.get_all_by_value("beta_renamed").next().is_some(),
+        harness
+            .query_all(By::new().role(Role::TextInput).value("beta_renamed"))
+            .next()
+            .is_some(),
         "name field did not become beta_renamed"
     );
 

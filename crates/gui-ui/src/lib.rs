@@ -45,8 +45,9 @@ use std::time::Instant;
 
 use gui_core::{
     Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools,
-    Outcome, ReferenceAction, ReferenceRepairError, ReferenceSite, ReferenceTarget,
-    RequestId, RequirementDraft, SaveError, TestDraft, TreeNode, TreeSnapshot,
+    Outcome, ReferenceAction, ReferencePath, ReferenceRepairError, ReferenceSite, ReferenceTarget,
+    RequestId, RequirementDraft, ResultDraft, SaveError, TestDraft, TreeNode, TreeSnapshot,
+    title_case_from_name,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -187,6 +188,48 @@ pub struct GuiApp {
     /// the two are never in flight for the same dialog at once but are
     /// still logically distinct fetches.
     commit_all_request: Option<RequestId>,
+    /// The "View diff" modal — `Some` while it's open, on top of
+    /// `commit_all_dialog`. See `DiffDialogState`'s own doc comment.
+    diff_dialog: Option<DiffDialogState>,
+    /// Which `GetDiff` request `diff_dialog` is waiting on — same
+    /// stale-reply guard shape as `changed_files_request`.
+    diff_request: Option<RequestId>,
+    /// The tree's right-click Copy/Paste "clipboard" for requirements —
+    /// `(the source's own name, its full content)`, `None` until a Copy
+    /// has actually completed. Purely local to `gui-ui`: nothing is sent
+    /// to `gui-core` until a subsequent Paste. The name travels alongside
+    /// the draft (which doesn't carry its own name — see `logical`'s data
+    /// model notes) so `paste_requirement_clicked` has something to base
+    /// a deduplicated name on.
+    requirement_clipboard: Option<(EntryName, RequirementDraft)>,
+    /// Which `GetEntryDetail` request a right-click Copy is waiting on —
+    /// same stale-reply guard shape as `changed_files_request`, paired
+    /// with the name of the requirement being copied since the completion
+    /// only carries an `EntryDetail`, not the `LogicalPath` that was asked
+    /// for.
+    copy_requirement_request: Option<(RequestId, EntryName)>,
+    /// Which `AddRequirement` request a right-click Paste is waiting on —
+    /// kept separate from every other `AddRequirement` source (the New
+    /// Requirement form, the Recreate flow, the Duplicate prompt's own
+    /// `DuplicateRequirementState::pending_request`) so `apply_event`'s
+    /// dedicated arm for it doesn't fire for theirs, and theirs
+    /// (`apply_create_result`, gated on `self.editor`) doesn't fire for
+    /// this one.
+    paste_requirement_request: Option<RequestId>,
+    /// Which `GetEntryDetail` request a right-click Duplicate is waiting
+    /// on, paired with the source's own `LogicalPath` — same stale-reply
+    /// shape as `copy_requirement_request`. The fetched content feeds
+    /// `open_duplicate_requirement_dialog`, not straight into an
+    /// `AddRequirement` — see `DuplicateRequirementState`'s own doc
+    /// comment on why Duplicate stops to ask for a name instead of just
+    /// picking one the way Paste does.
+    duplicate_requirement_request: Option<(RequestId, LogicalPath)>,
+    /// The tree's right-click "Duplicate" name prompt — `Some` while it's
+    /// open. See `DuplicateRequirementState`'s own doc comment.
+    duplicate_requirement_dialog: Option<DuplicateRequirementState>,
+    /// The requirement view's "Create new result" prompt — `Some` while
+    /// it's open. See `CreateResultDialogState`'s own doc comment.
+    create_result_dialog: Option<CreateResultDialogState>,
     config: GuiConfig,
     /// Where `config` was loaded from — kept so a zoom click can write
     /// the changed config straight back to the same file (`GuiConfig::
@@ -222,6 +265,15 @@ pub struct GuiApp {
     /// The requirement "Recreate" prompt — `Some` while it's open. See
     /// `RecreateRequirementState`'s own doc comment.
     recreate_requirement_dialog: Option<RecreateRequirementState>,
+    /// Which `GetEntryDetail` request the tree's right-click "Recreate…"
+    /// is waiting on, paired with the target it was asked for (same
+    /// "completion only carries an `EntryDetail`, not the `LogicalPath`"
+    /// reasoning as `copy_requirement_request`) — the tree has no open
+    /// form for `recreate_requirement_clicked` to read live contents from,
+    /// so this fetches a fresh snapshot instead and feeds it to the same
+    /// `open_recreate_requirement_dialog` the form's "Recreate…" button
+    /// uses.
+    recreate_requirement_context_request: Option<(RequestId, LogicalPath)>,
     /// The test "Recreate" prompt — `Some` while it's open. See
     /// `RecreateTestState`'s own doc comment.
     recreate_test_dialog: Option<RecreateTestState>,
@@ -413,12 +465,14 @@ pub struct DeleteConfirmState {
 }
 
 /// The requirement "Recreate" prompt's own state — opened by
-/// `GuiApp::recreate_requirement_clicked` from an already-existing
-/// requirement's form (never a create-mode one, which has no stable name
-/// yet to replace). Confirming with a nonempty name deletes the requirement
-/// at `target` and adds it back under `new_name` with the same content
-/// (`requirement`, the form's live contents — `current_contents`, not the
-/// possibly-stale `original` — snapshotted when the dialog opened) — two
+/// `GuiApp::open_recreate_requirement_dialog`, either from an already-
+/// existing requirement's form (`recreate_requirement_clicked`, using the
+/// form's live contents) or from the tree's right-click "Recreate…"
+/// (`recreate_requirement_from_tree_clicked`, using a freshly-fetched
+/// `GetEntryDetail` reply) — never a create-mode form, which has no stable
+/// name yet to replace. Confirming with a nonempty name deletes the
+/// requirement at `target` and adds it back under `new_name` with the same
+/// content (`requirement`, snapshotted when the dialog opened) — two
 /// separate `Command`s chained by
 /// `GuiApp::apply_recreate_delete_result`/`apply_recreate_create_result`,
 /// since there's no single "rename this entry's `EntryName`" command for a
@@ -427,6 +481,15 @@ pub struct DeleteConfirmState {
 /// `true` for the rest of the dialog's life — including a retry after a
 /// failed create, which by then must only resend the create, not the
 /// (already-succeeded) delete.
+///
+/// `regenerate_title` is a checkbox in `render_recreate_requirement_dialog`,
+/// checked by default: when the delete leg is about to go out,
+/// `recreate_requirement_confirmed` overwrites `requirement.title` with
+/// `title_case_from_name(new_name)` if it's still `true`, same
+/// autopopulation `ModuleDraft::add_requirement` applies to a brand-new
+/// requirement — a rename normally means the old title (derived from the
+/// old name) is stale too. Unchecking it keeps the original title verbatim,
+/// for a rename that shouldn't touch a hand-edited title.
 ///
 /// Before the delete leg goes out, `recreate_requirement_confirmed` first
 /// sends `Command::FindReferences` for `target` (tracked by
@@ -445,6 +508,7 @@ pub struct RecreateRequirementState {
     target: LogicalPath,
     requirement: Box<RequirementDraft>,
     new_name: String,
+    regenerate_title: bool,
     deleted: bool,
     find_references_request: Option<RequestId>,
     checked_references: bool,
@@ -468,6 +532,86 @@ pub struct RecreateTestState {
     checked_references: bool,
     reference_choices: Vec<(ReferenceSite, ReferenceAction)>,
     repairing: bool,
+    pending_request: Option<RequestId>,
+    error: Option<String>,
+}
+
+/// The tree's right-click "Duplicate" name prompt — opened by
+/// `GuiApp::open_duplicate_requirement_dialog` once the source's content
+/// has been fetched. Unlike Paste (which silently dedupes into whatever
+/// name `unique_copy_name` picks), Duplicate stops and asks: `new_name`
+/// starts prefilled with that same suggestion but is freely editable, and
+/// nothing is sent to `gui-core` until `GuiApp::duplicate_requirement_confirmed`.
+/// `existing_names` is a snapshot of `source`'s own module's requirement
+/// names as of when the dialog opened, letting
+/// `render_duplicate_requirement_dialog` reject an obvious collision (or
+/// an empty name) without a round trip; the real `Command::AddRequirement`
+/// still validates for real once sent, since this snapshot can go stale
+/// (concurrent edits, or simply the tree changing while the dialog sits
+/// open) — `apply_duplicate_requirement_result`'s `Err` case is what
+/// catches that.
+///
+/// `regenerate_title` is a checkbox in `render_duplicate_requirement_dialog`,
+/// checked by default — same field, same default, and same
+/// `title_case_from_name(new_name)` overwrite in
+/// `duplicate_requirement_confirmed` as `RecreateRequirementState`'s own
+/// (see that struct's doc comment): the source's title was presumably
+/// written for the source's own name, so a fresh copy under a different
+/// name gets a title to match unless the user opts out.
+#[derive(Debug, Clone)]
+pub struct DuplicateRequirementState {
+    source: LogicalPath,
+    requirement: Box<RequirementDraft>,
+    new_name: String,
+    regenerate_title: bool,
+    existing_names: std::collections::BTreeSet<String>,
+    pending_request: Option<RequestId>,
+    error: Option<String>,
+}
+
+/// The requirement view's "Create new result" prompt — opened from the
+/// empty-results state in `render_requirement_form` (see that fn's Results
+/// block) rather than living inside `RequirementFormState` itself, since a
+/// result is a separate entry submitted via its own `Command::AddResult`,
+/// not part of the requirement's own draft (same reasoning as the
+/// Duplicate/Recreate prompts). `requirement`/`tests` are a snapshot of the
+/// currently-viewed requirement's own path and test-reference list taken
+/// when the dialog opened — the requirement is already loaded in
+/// `RequirementFormState`, so there's no `GetEntryDetail` round trip first,
+/// unlike `open_duplicate_requirement_dialog`. Only tests already listed on
+/// this requirement are offered (`test_index` picks one), matching how
+/// "requirement met" is computed (`logical::validated`) — a result naming
+/// a test the requirement doesn't reference wouldn't count toward anything.
+/// `requirement_commit`/`test_commit` start empty and are filled
+/// automatically via `Command::ResolveLocalCommit` (see
+/// `create_result_fetch_requirement_commit`/`create_result_fetch_test_commit`)
+/// the same way the "Auto" buttons on dependency/test-reference rows work,
+/// but fired as soon as the dialog opens (and again on `test_index`
+/// changing) rather than waiting for an explicit click — still plain
+/// editable fields in `render_create_result_dialog`, in case the fetch
+/// fails or the entry has no commit yet.
+///
+/// `name` starts prefilled by `create_result_clicked` with
+/// `today_iso_date() [requirement name] [test name]` (see that fn), and
+/// `title` starts equal to it — `regenerate_title`, checked by default,
+/// re-syncs `title` to whatever `name` is at confirm time (same
+/// "checkbox, applied once on confirm rather than live" shape as
+/// `DuplicateRequirementState::regenerate_title`), so a user who edits the
+/// identifier and leaves the checkbox checked doesn't also have to
+/// hand-edit the title to match.
+#[derive(Debug, Clone)]
+pub struct CreateResultDialogState {
+    requirement: LogicalPath,
+    requirement_commit: String,
+    requirement_commit_pending: Option<RequestId>,
+    tests: Vec<TestRefDraft>,
+    test_index: usize,
+    test_commit: String,
+    test_commit_pending: Option<RequestId>,
+    name: String,
+    title: String,
+    regenerate_title: bool,
+    status: gui_core::StatusV1,
     pending_request: Option<RequestId>,
     error: Option<String>,
 }
@@ -619,6 +763,19 @@ pub struct CommitAllDialogState {
     pub error: Option<String>,
 }
 
+/// The "View diff" modal's state — opened by clicking one of
+/// `CommitAllDialogState::changed_files` in the "Commit all changes"
+/// dialog. `path` is kept (rather than looked up again at render time) so
+/// the modal's heading still shows which file it's for even after the
+/// underlying `Command::GetDiff` reply comes back.
+#[derive(Debug, Default)]
+pub struct DiffDialogState {
+    pub path: PathBuf,
+    pub loading: bool,
+    pub diff: String,
+    pub error: Option<String>,
+}
+
 /// The path-picker modal's state — open (`Some`) for exactly as long as
 /// it's showing. Replaces what used to be a per-field `egui::ComboBox`
 /// (one each for the Result form's `requirement_path`/`test_path`, and the
@@ -689,6 +846,14 @@ impl GuiApp {
             commit_all_dialog: None,
             changed_files_request: None,
             commit_all_request: None,
+            diff_dialog: None,
+            diff_request: None,
+            requirement_clipboard: None,
+            copy_requirement_request: None,
+            paste_requirement_request: None,
+            duplicate_requirement_request: None,
+            duplicate_requirement_dialog: None,
+            create_result_dialog: None,
             zoom_input: config.zoom_percent.to_string(),
             tree_filter: String::new(),
             tree_force_open: None,
@@ -703,6 +868,7 @@ impl GuiApp {
             validate_before_save_dialog: None,
             delete_confirm_dialog: None,
             recreate_requirement_dialog: None,
+            recreate_requirement_context_request: None,
             recreate_test_dialog: None,
             module_rename_find_references_request: None,
             broken_references_dialog: None,
@@ -871,10 +1037,20 @@ impl GuiApp {
                     self.dirty = true;
                 }
             }
+            Outcome::AddRequirement(result) if self.paste_requirement_request == Some(request) => {
+                self.paste_requirement_request = None;
+                if result.is_ok() {
+                    self.dirty = true;
+                }
+            }
             Outcome::AddRequirement(result) => {
                 let is_recreate_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
+                let is_duplicate_pending =
+                    matches!(&self.duplicate_requirement_dialog, Some(d) if d.pending_request == Some(request));
                 if is_recreate_pending {
                     self.apply_recreate_create_result(request, result);
+                } else if is_duplicate_pending {
+                    self.apply_duplicate_requirement_result(request, result);
                 } else {
                     self.apply_create_result(request, result);
                 }
@@ -892,7 +1068,15 @@ impl GuiApp {
                 }
             }
             Outcome::UpdateTest(result) => self.apply_update_result(request, result),
-            Outcome::AddResult(result) => self.apply_create_result(request, result),
+            Outcome::AddResult(result) => {
+                let is_create_result_dialog_pending =
+                    matches!(&self.create_result_dialog, Some(d) if d.pending_request == Some(request));
+                if is_create_result_dialog_pending {
+                    self.apply_create_result_dialog_result(request, result);
+                } else {
+                    self.apply_create_result(request, result);
+                }
+            }
             Outcome::UpdateResult(result) => self.apply_update_result(request, result),
             Outcome::AddModule(result) => self.apply_create_result(request, result),
             Outcome::RemoveRequirement(removed) => {
@@ -1006,6 +1190,34 @@ impl GuiApp {
             Outcome::EntryDetail(detail) if self.detail_request == Some(request) => {
                 self.apply_entry_detail(detail);
             }
+            Outcome::EntryDetail(detail)
+                if self.copy_requirement_request.as_ref().is_some_and(|(r, _)| *r == request) =>
+            {
+                let (_, name) = self.copy_requirement_request.take().unwrap();
+                self.apply_copy_requirement_result(name, detail);
+            }
+            Outcome::EntryDetail(detail)
+                if self
+                    .recreate_requirement_context_request
+                    .as_ref()
+                    .is_some_and(|(r, _)| *r == request) =>
+            {
+                let (_, target) = self.recreate_requirement_context_request.take().unwrap();
+                if let Some(EntryDetail::Requirement { original, .. }) = detail {
+                    self.open_recreate_requirement_dialog(target, *original);
+                }
+            }
+            Outcome::EntryDetail(detail)
+                if self
+                    .duplicate_requirement_request
+                    .as_ref()
+                    .is_some_and(|(r, _)| *r == request) =>
+            {
+                let (_, source) = self.duplicate_requirement_request.take().unwrap();
+                if let Some(EntryDetail::Requirement { original, .. }) = detail {
+                    self.open_duplicate_requirement_dialog(source, *original);
+                }
+            }
             // Same stale-reply guard, and the same "re-check `self.editor`
             // at apply time, not just when the request was sent" nuance —
             // if the user navigated to a *different* requirement while
@@ -1036,6 +1248,9 @@ impl GuiApp {
             Outcome::CommitAll(result) if self.commit_all_request == Some(request) => {
                 self.apply_commit_all_result(result.map_err(|e| e.to_string()));
             }
+            Outcome::GetDiff(result) if self.diff_request == Some(request) => {
+                self.apply_diff_result(result.map_err(|e| e.to_string()));
+            }
             Outcome::ResolveLocalCommit(result) => {
                 // Not yet having a commit at all is the ordinary state for
                 // an entry added in this editing session but not yet
@@ -1048,7 +1263,8 @@ impl GuiApp {
                     Err(e) => Err(e.to_string()),
                 };
                 self.apply_commit_fetch_result(request, result.clone());
-                self.apply_test_commit_fetch_result(request, result);
+                self.apply_test_commit_fetch_result(request, result.clone());
+                self.apply_create_result_dialog_commit_fetch_result(request, result);
             }
             Outcome::ResolveRemoteCommit(result) => {
                 let result = match result {
@@ -1715,6 +1931,453 @@ impl GuiApp {
         self.send_command(Command::GetModuleSummary { module, request });
     }
 
+    /// The tree's right-click "Copy" on a requirement leaf — fetches its
+    /// full `RequirementDraft` (the tree's own `TreeNode` only carries a
+    /// name/status summary, not enough to reconstruct one) so
+    /// `paste_requirement_clicked` has real content to work with once the
+    /// reply lands. Nothing is written to `requirement_clipboard` until
+    /// then; see `apply_copy_requirement_result`.
+    fn copy_requirement_clicked(&mut self, target: LogicalPath) {
+        let request = self.next_request_id();
+        self.copy_requirement_request = Some((request, target.name.clone()));
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetEntryDetail {
+            target,
+            kind: EntryKind::Requirement,
+            request,
+        });
+    }
+
+    /// `None` means the copied requirement disappeared before the fetch
+    /// completed (e.g. deleted in the meantime) — left as a no-op rather
+    /// than clearing an already-populated clipboard, so a stale-but-still-
+    /// valid previous Copy isn't wiped out by an unrelated failed one.
+    fn apply_copy_requirement_result(&mut self, name: EntryName, detail: Option<EntryDetail>) {
+        if let Some(EntryDetail::Requirement { original, .. }) = detail {
+            self.requirement_clipboard = Some((name, *original));
+        }
+    }
+
+    /// The tree's right-click "Paste" on a module (or the project root,
+    /// via `module: Vec::new()`) — creates a new requirement there from
+    /// whatever `copy_requirement_clicked` last fetched onto the
+    /// clipboard, named by `unique_copy_name` to avoid colliding with
+    /// whatever's already in `module`.
+    ///
+    /// Two fields of the copied draft are deliberately reset rather than
+    /// carried over verbatim: `commit` is this app's own "as of the last
+    /// time this was loaded from disk" bookkeeping (see
+    /// `RequirementDraft::commit`'s own doc comment) — meaningless, and
+    /// actively wrong, for an entry that's never been saved. `attachments`
+    /// names files physically inside the *original* requirement's own
+    /// `attachments/` folder; the pasted copy doesn't have that folder (only
+    /// `Command::AddRequirementAttachment`'s real file copy could give it
+    /// one), so carrying the reference over without the backing file would
+    /// just leave a dangling local pool entry. `dependencies`/
+    /// `attachment_refs`/`tests` all point at project-wide state that
+    /// stays valid no matter which requirement references it, so those
+    /// carry over unchanged.
+    fn paste_requirement_clicked(&mut self, module: Vec<EntryName>) {
+        let Some((source_name, draft)) = self.requirement_clipboard.clone() else {
+            return;
+        };
+        let Some(tree) = &self.tree else { return };
+        let Some(node) = view::resolve_tree_module(&tree.root, &module) else {
+            return;
+        };
+        let existing: std::collections::HashSet<&str> = node
+            .children
+            .iter()
+            .filter(|child| child.kind == EntryKind::Requirement)
+            .map(|child| child.name.as_str())
+            .collect();
+        let (name, pasted) = prepare_pasted_requirement(&source_name, draft, &existing);
+
+        let request = self.next_request_id();
+        self.paste_requirement_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::AddRequirement {
+            module,
+            name,
+            requirement: Box::new(pasted),
+            request,
+        });
+    }
+
+    /// The tree's right-click "Duplicate" on a requirement leaf — fetches
+    /// the source's full content via `GetEntryDetail` (tracked by
+    /// `duplicate_requirement_request`, paired with `target` since the
+    /// completion only carries an `EntryDetail`) without touching
+    /// `requirement_clipboard` (an explicit Copy the user made earlier
+    /// stays on the clipboard, unaffected), then hands it to
+    /// `open_duplicate_requirement_dialog` once that reply lands — see
+    /// `DuplicateRequirementState`'s own doc comment for what happens next.
+    fn duplicate_requirement_clicked(&mut self, target: LogicalPath) {
+        let request = self.next_request_id();
+        self.duplicate_requirement_request = Some((request, target.clone()));
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetEntryDetail {
+            target,
+            kind: EntryKind::Requirement,
+            request,
+        });
+    }
+
+    /// Opens the "Duplicate" name prompt once `duplicate_requirement_clicked`'s
+    /// fetch lands — pre-fills `new_name` with `unique_copy_name`'s
+    /// suggestion against `source`'s own module (same dedup convention as
+    /// an ordinary Paste) but leaves the actual choice to the user rather
+    /// than creating it immediately; `existing_names` is snapshotted here
+    /// so `render_duplicate_requirement_dialog` can reject an obvious
+    /// collision without waiting on a round trip. `commit`/`attachments`
+    /// are reset up front via `prepare_pasted_requirement`, same
+    /// "meaningless/dangling for a copy that's never been saved" reasoning
+    /// as `paste_requirement_clicked`'s own doc comment — only the name is
+    /// still undecided at this point.
+    fn open_duplicate_requirement_dialog(&mut self, source: LogicalPath, requirement: RequirementDraft) {
+        let Some(tree) = &self.tree else { return };
+        let Some(node) = view::resolve_tree_module(&tree.root, &source.modules) else {
+            return;
+        };
+        let existing: std::collections::HashSet<&str> = node
+            .children
+            .iter()
+            .filter(|child| child.kind == EntryKind::Requirement)
+            .map(|child| child.name.as_str())
+            .collect();
+        let (suggested_name, duplicated) = prepare_pasted_requirement(&source.name, requirement, &existing);
+        let existing_names: std::collections::BTreeSet<String> =
+            existing.into_iter().map(str::to_string).collect();
+
+        self.duplicate_requirement_dialog = Some(DuplicateRequirementState {
+            source,
+            requirement: Box::new(duplicated),
+            new_name: suggested_name.0,
+            regenerate_title: true,
+            existing_names,
+            pending_request: None,
+            error: None,
+        });
+    }
+
+    /// "Cancel" clicked in the Duplicate prompt — closes it. Nothing has
+    /// been sent yet at that point (`duplicate_requirement_confirmed` is
+    /// the only thing that mutates anything), so there's nothing to undo.
+    fn duplicate_requirement_cancelled(&mut self) {
+        self.duplicate_requirement_dialog = None;
+    }
+
+    /// "Duplicate" clicked inside the prompt — a no-op if the name field is
+    /// still empty or collides with a sibling already known about from
+    /// `existing_names` (surfaced as `dialog.error` either way, same as an
+    /// empty name; the real `Command::AddRequirement` still validates for
+    /// real, since `existing_names` is only as fresh as the last
+    /// `TreeChanged`).
+    fn duplicate_requirement_confirmed(&mut self) {
+        let Some(dialog) = self.duplicate_requirement_dialog.clone() else {
+            return;
+        };
+        let new_name = dialog.new_name.trim().to_string();
+        if new_name.is_empty() {
+            if let Some(dialog) = &mut self.duplicate_requirement_dialog {
+                dialog.error = Some("Name must not be empty.".to_string());
+            }
+            return;
+        }
+        if dialog.existing_names.contains(&new_name) {
+            if let Some(dialog) = &mut self.duplicate_requirement_dialog {
+                dialog.error = Some(format!("\"{new_name}\" already exists in this module."));
+            }
+            return;
+        }
+        if dialog.regenerate_title {
+            if let Some(dialog) = &mut self.duplicate_requirement_dialog {
+                dialog.requirement.title = title_case_from_name(&new_name);
+            }
+        }
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        let requirement = {
+            let dialog = self
+                .duplicate_requirement_dialog
+                .as_mut()
+                .expect("just matched Some above");
+            dialog.pending_request = Some(request);
+            dialog.error = None;
+            dialog.requirement.clone()
+        };
+        self.send_command(Command::AddRequirement {
+            module: dialog.source.modules,
+            name: EntryName(new_name),
+            requirement,
+            request,
+        });
+    }
+
+    /// Routes an `AddRequirement` outcome back to the Duplicate prompt that
+    /// sent it — `false` (not this dialog's reply) falls through to
+    /// whichever other `AddRequirement` source actually owns it (the New
+    /// Requirement form, Paste, Recreate's retry leg). Success closes the
+    /// dialog, marks the project dirty, and navigates to the new
+    /// duplicate — the user just typed its name and presumably wants to
+    /// see it landed correctly, same "go look at what you just created"
+    /// reasoning as `apply_create_result`. Failure (e.g. the real
+    /// `AlreadyExists`/`InvalidName` this dialog's own client-side checks
+    /// didn't happen to catch) leaves the dialog open with the error
+    /// instead of silently discarding what the user typed.
+    fn apply_duplicate_requirement_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::AddChildError>,
+    ) -> bool {
+        let is_pending =
+            matches!(&self.duplicate_requirement_dialog, Some(d) if d.pending_request == Some(request));
+        if !is_pending {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                self.dirty = true;
+                let dialog = self
+                    .duplicate_requirement_dialog
+                    .take()
+                    .expect("just matched Some above");
+                let target = LogicalPath {
+                    modules: dialog.source.modules,
+                    name: EntryName(dialog.new_name.trim().to_string()),
+                };
+                self.select(target, EntryKind::Requirement);
+            }
+            Err(err) => {
+                if let Some(dialog) = &mut self.duplicate_requirement_dialog {
+                    dialog.pending_request = None;
+                    dialog.error = Some(err.to_string());
+                }
+            }
+        }
+        true
+    }
+
+    /// "Create new result" clicked in the requirement view's empty-results
+    /// state — see `render_requirement_form`. A no-op if the requirement
+    /// form has since navigated away, or the requirement has no test
+    /// procedures of its own yet (nothing to pick in the dialog's test
+    /// selector — see `CreateResultDialogState`'s own doc comment on why
+    /// only this requirement's own tests are offered).
+    fn create_result_clicked(&mut self) {
+        let EditorState::NewRequirement(form) = &self.editor else {
+            return;
+        };
+        let Some(target) = form.editing_target.clone() else {
+            return;
+        };
+        if form.tests.is_empty() {
+            return;
+        }
+        let tests = form.tests.clone();
+        let name = default_result_name(&today_iso_date(), &target.name, &tests[0]);
+        self.create_result_dialog = Some(CreateResultDialogState {
+            requirement: target.clone(),
+            requirement_commit: String::new(),
+            requirement_commit_pending: None,
+            tests,
+            test_index: 0,
+            test_commit: String::new(),
+            test_commit_pending: None,
+            title: name.clone(),
+            name,
+            regenerate_title: true,
+            status: gui_core::StatusV1::default(),
+            pending_request: None,
+            error: None,
+        });
+        self.create_result_fetch_requirement_commit(target);
+        self.create_result_fetch_test_commit(0);
+    }
+
+    /// Fires the requirement leg of the dialog's automatic commit
+    /// resolution — see `CreateResultDialogState`'s own doc comment on why
+    /// this happens on open rather than an explicit "Auto" click.
+    fn create_result_fetch_requirement_commit(&mut self, target: LogicalPath) {
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        let Some(dialog) = &mut self.create_result_dialog else {
+            return;
+        };
+        dialog.requirement_commit_pending = Some(request);
+        self.send_command(Command::ResolveLocalCommit {
+            target,
+            kind: EntryKind::Requirement,
+            request,
+        });
+    }
+
+    /// Fires the test leg of the dialog's automatic commit resolution for
+    /// `tests[test_index]` — called both when the dialog first opens and
+    /// again whenever the user switches the selected test in
+    /// `render_create_result_dialog`. A no-op if the selected test's own
+    /// reference path doesn't parse against the requirement's module
+    /// context — same "fails silently, the field just stays whatever it
+    /// was" precedent as `AutoCommitKind::Local`'s own doc comment; the
+    /// field stays manually editable either way.
+    fn create_result_fetch_test_commit(&mut self, test_index: usize) {
+        let Some(dialog) = &self.create_result_dialog else {
+            return;
+        };
+        let Some(test_ref) = dialog.tests.get(test_index) else {
+            return;
+        };
+        let Some(target) = gui_core::resolve_reference_path(
+            &ReferencePath(test_ref.path.clone()),
+            &dialog.requirement.modules,
+            "tests",
+        ) else {
+            return;
+        };
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        let Some(dialog) = &mut self.create_result_dialog else {
+            return;
+        };
+        dialog.test_commit_pending = Some(request);
+        self.send_command(Command::ResolveLocalCommit {
+            target,
+            kind: EntryKind::Test,
+            request,
+        });
+    }
+
+    /// Applies a `ResolveLocalCommit` reply to whichever leg of the Create
+    /// Result dialog requested it. A no-op if the dialog has since closed
+    /// or the reply belongs to neither in-flight fetch — same "a stale
+    /// reply is simply dropped" precedent as `apply_commit_fetch_result`.
+    fn apply_create_result_dialog_commit_fetch_result(
+        &mut self,
+        request: RequestId,
+        result: Result<Option<String>, String>,
+    ) {
+        let Some(dialog) = &mut self.create_result_dialog else {
+            return;
+        };
+        if dialog.requirement_commit_pending == Some(request) {
+            dialog.requirement_commit_pending = None;
+            match result {
+                Ok(Some(commit)) => dialog.requirement_commit = commit,
+                Ok(None) => {}
+                Err(message) => dialog.error = Some(message),
+            }
+        } else if dialog.test_commit_pending == Some(request) {
+            dialog.test_commit_pending = None;
+            match result {
+                Ok(Some(commit)) => dialog.test_commit = commit,
+                Ok(None) => {}
+                Err(message) => dialog.error = Some(message),
+            }
+        }
+    }
+
+    /// "Cancel" clicked in the Create Result prompt — closes it. Nothing
+    /// has been sent yet apart from the (harmless, read-only) commit
+    /// fetches, same as `duplicate_requirement_cancelled`.
+    fn create_result_cancelled(&mut self) {
+        self.create_result_dialog = None;
+    }
+
+    /// "Create result" clicked inside the prompt — a no-op if the name
+    /// field is empty. The real `Command::AddResult` still validates for
+    /// real once sent (a real name collision, an invalid reference path,
+    /// etc.), surfaced the same way as any other create form's `error`.
+    fn create_result_confirmed(&mut self) {
+        let Some(dialog) = self.create_result_dialog.clone() else {
+            return;
+        };
+        let name = dialog.name.trim().to_string();
+        if name.is_empty() {
+            if let Some(dialog) = &mut self.create_result_dialog {
+                dialog.error = Some("Name must not be empty.".to_string());
+            }
+            return;
+        }
+        let Some(test_ref) = dialog.tests.get(dialog.test_index) else {
+            if let Some(dialog) = &mut self.create_result_dialog {
+                dialog.error = Some("Select a test procedure.".to_string());
+            }
+            return;
+        };
+        // Same "regenerate at confirm time, not live" shape as
+        // `duplicate_requirement_confirmed`'s own `regenerate_title` — the
+        // identifier here is already presented as a sensible title in its
+        // own right, so this is a plain copy rather than a `title_case_
+        // from_name`-style transform.
+        let title = if dialog.regenerate_title {
+            name.clone()
+        } else {
+            dialog.title.trim().to_string()
+        };
+        let mut result = ResultDraft::new(
+            title,
+            ReferencePath(absolute_reference_path(&dialog.requirement, "requirements")),
+            dialog.requirement_commit.clone(),
+            ReferencePath(test_ref.path.clone()),
+            dialog.test_commit.clone(),
+        );
+        result.status = dialog.status.clone();
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        let module = {
+            let dialog = self
+                .create_result_dialog
+                .as_mut()
+                .expect("just matched Some above");
+            dialog.pending_request = Some(request);
+            dialog.error = None;
+            dialog.requirement.modules.clone()
+        };
+        self.send_command(Command::AddResult {
+            module,
+            name: EntryName(name),
+            result: Box::new(result),
+            request,
+        });
+    }
+
+    /// Routes an `AddResult` outcome back to the Create Result prompt that
+    /// sent it — same "close, mark dirty, navigate to the new entry on
+    /// success; leave it open with the error on failure" shape as
+    /// `apply_duplicate_requirement_result`.
+    fn apply_create_result_dialog_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::AddChildError>,
+    ) -> bool {
+        let is_pending =
+            matches!(&self.create_result_dialog, Some(d) if d.pending_request == Some(request));
+        if !is_pending {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                self.dirty = true;
+                let dialog = self
+                    .create_result_dialog
+                    .take()
+                    .expect("just matched Some above");
+                let target = LogicalPath {
+                    modules: dialog.requirement.modules,
+                    name: EntryName(dialog.name.trim().to_string()),
+                };
+                self.select(target, EntryKind::Result);
+            }
+            Err(err) => {
+                if let Some(dialog) = &mut self.create_result_dialog {
+                    dialog.pending_request = None;
+                    dialog.error = Some(err.to_string());
+                }
+            }
+        }
+        true
+    }
+
     /// Opens the path-picker modal — the Result form's "Pick…" buttons and
     /// the Requirement form's dependency-row "Pick…" button all funnel
     /// through here. `target` decides both where a selection gets written
@@ -1962,6 +2625,7 @@ impl GuiApp {
                 requirement_commit,
                 test_path,
                 test_commit,
+                status: original.status.clone(),
                 original,
                 editing_target: Some(target),
                 read_only,
@@ -2052,6 +2716,37 @@ impl GuiApp {
                 files.sort_by_key(|path| (path.components().count(), path.clone()));
                 dialog.changed_files = files;
             }
+            Err(message) => dialog.error = Some(message),
+        }
+    }
+
+    /// Opens the "View diff" modal for `path` (relative to the project
+    /// root, exactly as listed in `commit_all_dialog`'s file list) and
+    /// fetches its diff. Leaves `commit_all_dialog` open underneath — the
+    /// diff modal is dismissed independently, back to the file list.
+    fn diff_file_clicked(&mut self, path: PathBuf) {
+        self.diff_dialog = Some(DiffDialogState {
+            path: path.clone(),
+            loading: true,
+            ..DiffDialogState::default()
+        });
+        let request = self.next_request_id();
+        self.diff_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetDiff { path, request });
+    }
+
+    fn diff_dialog_closed(&mut self) {
+        self.diff_dialog = None;
+    }
+
+    fn apply_diff_result(&mut self, result: Result<String, String>) {
+        let Some(dialog) = &mut self.diff_dialog else {
+            return;
+        };
+        dialog.loading = false;
+        match result {
+            Ok(diff) => dialog.diff = diff,
             Err(message) => dialog.error = Some(message),
         }
     }
@@ -2804,6 +3499,22 @@ impl GuiApp {
                 return;
             }
         };
+        self.open_delete_confirm_dialog(target, label);
+    }
+
+    /// The tree's right-click "Delete…" on a requirement leaf — unlike
+    /// `editor_delete_clicked`, this needs no open form: the tree already
+    /// has everything `DeleteConfirmState` wants (`target`, and `label`
+    /// straight from its own `EntryName`).
+    fn delete_requirement_from_tree_clicked(&mut self, target: LogicalPath) {
+        let label = target.name.as_str().to_string();
+        self.open_delete_confirm_dialog(DeleteTarget::Requirement(target), label);
+    }
+
+    /// Shared by `editor_delete_clicked` and
+    /// `delete_requirement_from_tree_clicked` — see `DeleteConfirmState`'s
+    /// own doc comment.
+    fn open_delete_confirm_dialog(&mut self, target: DeleteTarget, label: String) {
         self.delete_confirm_dialog = Some(DeleteConfirmState {
             target,
             label,
@@ -2899,11 +3610,11 @@ impl GuiApp {
     /// Opens the "Recreate" prompt for the requirement currently open in
     /// the editor — a no-op unless it's an already-existing entry
     /// (`editing_target: Some(_)`; a create-mode form has no stable name
-    /// yet to replace). Snapshots `form.original` as the content to carry
-    /// over, same as `editor_delete_clicked` snapshots the target/label:
-    /// both close over what's true right now rather than re-reading the
-    /// form later, since the form itself may have changed (or closed) by
-    /// the time the dialog is actually confirmed.
+    /// yet to replace). Snapshots `form.current_contents()` as the content
+    /// to carry over, same as `editor_delete_clicked` snapshots the
+    /// target/label: both close over what's true right now rather than
+    /// re-reading the form later, since the form itself may have changed
+    /// (or closed) by the time the dialog is actually confirmed.
     fn recreate_requirement_clicked(&mut self) {
         let EditorState::NewRequirement(form) = &self.editor else {
             return;
@@ -2911,11 +3622,37 @@ impl GuiApp {
         let Some(target) = form.editing_target.clone() else {
             return;
         };
+        self.open_recreate_requirement_dialog(target, form.current_contents());
+    }
+
+    /// The tree's right-click "Recreate…" on a requirement leaf — unlike
+    /// `recreate_requirement_clicked`, there's no open form here to read
+    /// live contents from, so this fetches a fresh `GetEntryDetail`
+    /// snapshot first (tracked by `recreate_requirement_context_request`,
+    /// same stale-reply shape as `copy_requirement_clicked`) and only opens
+    /// the dialog once that reply lands, in `apply_event`.
+    fn recreate_requirement_from_tree_clicked(&mut self, target: LogicalPath) {
+        let request = self.next_request_id();
+        self.recreate_requirement_context_request = Some((request, target.clone()));
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetEntryDetail {
+            target,
+            kind: EntryKind::Requirement,
+            request,
+        });
+    }
+
+    /// Shared by both ways of opening the requirement "Recreate" prompt —
+    /// see `RecreateRequirementState`'s own doc comment. `regenerate_title`
+    /// starts `true`: see that struct's doc comment on what unchecking it
+    /// in the dialog does instead.
+    fn open_recreate_requirement_dialog(&mut self, target: LogicalPath, requirement: RequirementDraft) {
         let new_name = target.name.as_str().to_string();
         self.recreate_requirement_dialog = Some(RecreateRequirementState {
             target,
-            requirement: Box::new(form.current_contents()),
+            requirement: Box::new(requirement),
             new_name,
+            regenerate_title: true,
             deleted: false,
             find_references_request: None,
             checked_references: false,
@@ -2980,6 +3717,11 @@ impl GuiApp {
                 request,
             });
             return;
+        }
+        if !dialog.deleted && dialog.regenerate_title {
+            if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                dialog.requirement.title = title_case_from_name(&new_name);
+            }
         }
         let request = self.next_request_id();
         let command = if dialog.deleted {
@@ -3830,12 +4572,15 @@ impl eframe::App for GuiApp {
         self.render_unsaved_form_dialog(ui);
         self.render_validate_before_save_dialog(ui);
         self.render_delete_confirm_dialog(ui);
+        self.render_duplicate_requirement_dialog(ui);
+        self.render_create_result_dialog(ui);
         self.render_recreate_requirement_dialog(ui);
         self.render_recreate_test_dialog(ui);
         self.render_broken_references_dialog(ui);
         self.render_load_error_dialog(ui);
         self.render_attachments_dialog(ui);
         self.render_commit_all_dialog(ui);
+        self.render_diff_dialog(ui);
         self.render_path_picker_dialog(ui);
         self.render_exit_dialog(ui);
         #[cfg(all(feature = "debug-panel", debug_assertions))]
@@ -3924,6 +4669,71 @@ fn module_display_name(tree: Option<&TreeSnapshot>, path: &[EntryName]) -> Strin
         }
     }
     node.name.as_str().to_string()
+}
+
+/// The Create Result dialog's own identifier prefill (see
+/// `GuiApp::create_result_clicked`) — `<today's date> [<requirement's own
+/// name>] [<test's own name>]`, e.g. `2026-01-31 [vscode] [demonstration]`.
+/// `test_ref.path` is a reference-path string (`/tests/smoke`, or a nested
+/// `/modules/.../tests/smoke`), so only its last `/`-separated segment (the
+/// test's own leaf name) is used, matching `requirement_name`'s already-bare
+/// `EntryName`.
+fn default_result_name(today: &str, requirement_name: &EntryName, test_ref: &TestRefDraft) -> String {
+    let test_name = test_ref.path.rsplit('/').next().unwrap_or(&test_ref.path);
+    format!("{today} [{}] [{test_name}]", requirement_name.as_str())
+}
+
+/// Today's UTC calendar date as `YYYY-MM-DD`, zero-padded — used only for
+/// `default_result_name`'s prefill. UTC rather than local time since
+/// nothing else in this app tracks a timezone.
+fn today_iso_date() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// Picks a name for a pasted requirement that doesn't collide with
+/// anything already in `existing` (the paste target's own current
+/// requirement names): `base` unchanged if it's free, else `"<base>
+/// copy"`, then `"<base> copy 2"`, `"<base> copy 3"`, ... — the same
+/// "keep trying suffixes" idea a file manager's own paste uses for a
+/// duplicate filename.
+fn unique_copy_name(base: &str, existing: &std::collections::HashSet<&str>) -> String {
+    if !existing.contains(base) {
+        return base.to_string();
+    }
+    let first = format!("{base} copy");
+    if !existing.contains(first.as_str()) {
+        return first;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base} copy {n}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Builds the `(name, draft)` a right-click Paste actually sends as
+/// `Command::AddRequirement`, given what was on the clipboard (`source_name`/
+/// `draft`, as `copy_requirement_clicked` fetched them) and the paste
+/// target's own current requirement names (`existing`). Pulled out of
+/// `paste_requirement_clicked` itself so the naming/reset logic — the part
+/// worth getting right — is unit-testable without a real `GuiApp`/
+/// `CoreHandle` round trip.
+///
+/// `commit` and `attachments` are deliberately reset rather than carried
+/// over verbatim — see `paste_requirement_clicked`'s own doc comment for
+/// why; every other field of `draft` passes through unchanged.
+fn prepare_pasted_requirement(
+    source_name: &EntryName,
+    mut draft: RequirementDraft,
+    existing: &std::collections::HashSet<&str>,
+) -> (EntryName, RequirementDraft) {
+    let name = EntryName(unique_copy_name(source_name.as_str(), existing));
+    draft.commit = None;
+    draft.attachments.clear();
+    (name, draft)
 }
 
 pub(crate) fn absolute_reference_path(target: &LogicalPath, kind_segment: &str) -> String {
@@ -4751,6 +5561,408 @@ mod test {
         // read-only viewer, not straight into the editable form — see
         // `editor_edit_clicked`'s own test below for the switch.
         assert!(form.read_only);
+    }
+
+    fn requirement_tree_node(name: &str) -> gui_core::TreeNode {
+        gui_core::TreeNode {
+            name: disk_entry_name(name),
+            kind: EntryKind::Requirement,
+            status: gui_core::EntryStatus::Unvalidated,
+            children: Vec::new(),
+        }
+    }
+
+    fn module_tree_node(name: &str, children: Vec<gui_core::TreeNode>) -> gui_core::TreeNode {
+        gui_core::TreeNode {
+            name: disk_entry_name(name),
+            kind: EntryKind::Module,
+            status: gui_core::EntryStatus::Unvalidated,
+            children,
+        }
+    }
+
+    fn entry_detail_for(draft: RequirementDraft) -> Outcome {
+        Outcome::EntryDetail(Some(EntryDetail::Requirement {
+            title: draft.title.clone(),
+            requirement_text: draft.requirement_text.clone(),
+            requirement_guidance: draft.requirement_guidance.clone(),
+            test_guidance: draft.test_guidance.clone(),
+            dependencies: draft.dependencies.clone(),
+            attachments: Vec::new(),
+            met_status: gui_core::RequirementMetStatus::Unvalidated,
+            results: Vec::new(),
+            original: Box::new(draft),
+        }))
+    }
+
+    #[test]
+    fn copy_requirement_clicked_populates_the_clipboard_on_a_matching_reply() {
+        let mut app = test_app();
+
+        app.copy_requirement_clicked(LogicalPath::root(disk_entry_name("definition")));
+        assert!(app.requirement_clipboard.is_none());
+        let (request, name) = app.copy_requirement_request.clone().unwrap();
+        assert_eq!(name, disk_entry_name("definition"));
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: entry_detail_for(RequirementDraft::new("Definition")),
+        });
+
+        let (copied_name, draft) = app.requirement_clipboard.as_ref().unwrap();
+        assert_eq!(*copied_name, disk_entry_name("definition"));
+        assert_eq!(draft.title, "Definition");
+        assert!(app.copy_requirement_request.is_none());
+    }
+
+    #[test]
+    fn a_missing_entry_detail_reply_leaves_an_existing_clipboard_untouched() {
+        let mut app = test_app();
+        app.requirement_clipboard = Some((disk_entry_name("existing"), RequirementDraft::new("Existing")));
+
+        app.copy_requirement_clicked(LogicalPath::root(disk_entry_name("gone")));
+        let (request, _) = app.copy_requirement_request.clone().unwrap();
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::EntryDetail(None),
+        });
+
+        let (name, _) = app.requirement_clipboard.as_ref().unwrap();
+        assert_eq!(*name, disk_entry_name("existing"));
+    }
+
+    #[test]
+    fn unique_copy_name_appends_copy_then_a_counter() {
+        let mut existing = std::collections::HashSet::new();
+        assert_eq!(unique_copy_name("definition", &existing), "definition");
+
+        existing.insert("definition");
+        assert_eq!(unique_copy_name("definition", &existing), "definition copy");
+
+        existing.insert("definition copy");
+        assert_eq!(unique_copy_name("definition", &existing), "definition copy 2");
+
+        existing.insert("definition copy 2");
+        assert_eq!(unique_copy_name("definition", &existing), "definition copy 3");
+    }
+
+    #[test]
+    fn prepare_pasted_requirement_resets_commit_and_attachments_but_keeps_everything_else() {
+        let mut draft = RequirementDraft::new("Definition");
+        draft.requirement_text = "The system shall...".to_string();
+        draft.commit = Some("deadbeef".to_string());
+        draft.attachments.insert(PathBuf::from("diagram.png"));
+        let existing = std::collections::HashSet::new();
+
+        let (name, pasted) = prepare_pasted_requirement(&disk_entry_name("definition"), draft, &existing);
+
+        assert_eq!(name, disk_entry_name("definition"));
+        assert_eq!(pasted.requirement_text, "The system shall...");
+        assert_eq!(pasted.commit, None);
+        assert!(pasted.attachments.is_empty());
+    }
+
+    #[test]
+    fn prepare_pasted_requirement_dedupes_against_existing_siblings() {
+        let draft = RequirementDraft::new("Definition");
+        let existing: std::collections::HashSet<&str> = ["definition"].into_iter().collect();
+
+        let (name, _) = prepare_pasted_requirement(&disk_entry_name("definition"), draft, &existing);
+
+        assert_eq!(name, disk_entry_name("definition copy"));
+    }
+
+    #[test]
+    fn paste_requirement_clicked_does_nothing_with_an_empty_clipboard() {
+        let mut app = test_app();
+        app.apply_event(Event::TreeChanged(TreeSnapshot {
+            root: module_tree_node("Project", Vec::new()),
+            can_undo: false,
+            can_redo: false,
+        }));
+
+        // `TreeChanged` itself always fires a sidebar-pools fetch for the
+        // selected module (see `apply_event`), so `pending`'s count right
+        // after it — not zero — is the right baseline for "paste sent
+        // nothing new" below.
+        let pending_before = app.pending.len();
+        app.paste_requirement_clicked(Vec::new());
+
+        assert!(app.paste_requirement_request.is_none());
+        assert_eq!(app.pending.len(), pending_before);
+    }
+
+    #[test]
+    fn paste_requirement_clicked_does_nothing_for_an_unknown_module() {
+        let mut app = test_app();
+        app.requirement_clipboard = Some((disk_entry_name("definition"), RequirementDraft::new("Definition")));
+        app.apply_event(Event::TreeChanged(TreeSnapshot {
+            root: module_tree_node("Project", Vec::new()),
+            can_undo: false,
+            can_redo: false,
+        }));
+
+        let pending_before = app.pending.len();
+        app.paste_requirement_clicked(vec![disk_entry_name("nonexistent")]);
+
+        assert!(app.paste_requirement_request.is_none());
+        assert_eq!(app.pending.len(), pending_before);
+    }
+
+    #[test]
+    fn a_successful_paste_marks_dirty_without_touching_the_editor() {
+        let mut app = test_app();
+        app.requirement_clipboard = Some((disk_entry_name("definition"), RequirementDraft::new("Definition")));
+        app.apply_event(Event::TreeChanged(TreeSnapshot {
+            root: module_tree_node(
+                "Project",
+                vec![module_tree_node("sub", vec![requirement_tree_node("definition")])],
+            ),
+            can_undo: false,
+            can_redo: false,
+        }));
+
+        app.paste_requirement_clicked(vec![disk_entry_name("sub")]);
+        let request = app.paste_requirement_request.unwrap();
+        assert!(matches!(app.editor, EditorState::None));
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::AddRequirement(Ok(())),
+        });
+
+        assert!(app.dirty);
+        assert!(app.paste_requirement_request.is_none());
+        // Unlike `apply_create_result` (the New Requirement form's own
+        // completion path), a Paste never opened a form in the first
+        // place, so there's nothing for it to navigate away from.
+        assert!(matches!(app.editor, EditorState::None));
+    }
+
+    #[test]
+    fn duplicate_requirement_clicked_fetches_the_source_and_tracks_it() {
+        let mut app = test_app();
+
+        let target = LogicalPath::root(disk_entry_name("definition"));
+        app.duplicate_requirement_clicked(target.clone());
+
+        let (request, fetched_target) = app
+            .duplicate_requirement_request
+            .clone()
+            .expect("a GetEntryDetail fetch should be pending");
+        assert_eq!(fetched_target, target);
+        assert!(app.pending.contains_key(&request));
+    }
+
+    #[test]
+    fn a_missing_duplicate_fetch_result_leaves_no_dialog_open() {
+        let mut app = test_app();
+        app.apply_event(Event::TreeChanged(TreeSnapshot {
+            root: module_tree_node("Project", vec![requirement_tree_node("definition")]),
+            can_undo: false,
+            can_redo: false,
+        }));
+        let pending_before = app.pending.len();
+
+        app.duplicate_requirement_clicked(LogicalPath::root(disk_entry_name("gone")));
+        let (request, _) = app.duplicate_requirement_request.clone().unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::EntryDetail(None),
+        });
+
+        assert!(app.duplicate_requirement_request.is_none());
+        assert!(app.duplicate_requirement_dialog.is_none());
+        // The fetch's own pending entry is removed once it completes, and
+        // nothing new was sent once it came back empty — net unchanged
+        // from before the fetch started.
+        assert_eq!(app.pending.len(), pending_before);
+    }
+
+    /// Fetches "definition" via the tree-based Duplicate flow and applies
+    /// the reply — the common setup for every test below that starts from
+    /// an already-open `duplicate_requirement_dialog`.
+    fn app_with_open_duplicate_dialog() -> GuiApp {
+        let mut app = test_app();
+        app.apply_event(Event::TreeChanged(TreeSnapshot {
+            root: module_tree_node("Project", vec![requirement_tree_node("definition")]),
+            can_undo: false,
+            can_redo: false,
+        }));
+
+        app.duplicate_requirement_clicked(LogicalPath::root(disk_entry_name("definition")));
+        let (fetch_request, _) = app.duplicate_requirement_request.clone().unwrap();
+        app.apply_event(Event::Completed {
+            request: fetch_request,
+            outcome: entry_detail_for(RequirementDraft::new("Definition")),
+        });
+        app
+    }
+
+    #[test]
+    fn a_successful_duplicate_fetch_opens_the_dialog_with_a_suggested_name() {
+        let app = app_with_open_duplicate_dialog();
+
+        assert!(app.duplicate_requirement_request.is_none());
+        let dialog = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(dialog.source, LogicalPath::root(disk_entry_name("definition")));
+        assert_eq!(dialog.new_name, "definition copy");
+        assert!(dialog.regenerate_title);
+        assert!(dialog.existing_names.contains("definition"));
+        assert!(dialog.pending_request.is_none());
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn duplicate_requirement_confirmed_with_an_empty_name_sets_an_error() {
+        let mut app = app_with_open_duplicate_dialog();
+        if let Some(dialog) = &mut app.duplicate_requirement_dialog {
+            dialog.new_name = "   ".to_string();
+        }
+
+        app.duplicate_requirement_confirmed();
+
+        let dialog = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open");
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+    }
+
+    #[test]
+    fn duplicate_requirement_confirmed_with_a_colliding_name_sets_an_error() {
+        let mut app = app_with_open_duplicate_dialog();
+        if let Some(dialog) = &mut app.duplicate_requirement_dialog {
+            dialog.new_name = "definition".to_string();
+        }
+
+        app.duplicate_requirement_confirmed();
+
+        let dialog = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open");
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+    }
+
+    #[test]
+    fn duplicate_requirement_confirmed_with_a_valid_name_sends_add_requirement() {
+        let mut app = app_with_open_duplicate_dialog();
+
+        app.duplicate_requirement_confirmed();
+
+        let dialog = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert!(dialog.pending_request.is_some());
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn duplicate_requirement_confirmed_regenerates_the_title_from_the_new_name_by_default() {
+        let mut app = app_with_open_duplicate_dialog();
+        if let Some(dialog) = &mut app.duplicate_requirement_dialog {
+            dialog.new_name = "shiny_new_name".to_string();
+        }
+
+        app.duplicate_requirement_confirmed();
+
+        let dialog = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert_eq!(dialog.requirement.title, "Shiny New Name");
+    }
+
+    #[test]
+    fn duplicate_requirement_confirmed_keeps_the_original_title_when_unchecked() {
+        let mut app = app_with_open_duplicate_dialog();
+        if let Some(dialog) = &mut app.duplicate_requirement_dialog {
+            dialog.new_name = "shiny_new_name".to_string();
+            dialog.regenerate_title = false;
+        }
+
+        app.duplicate_requirement_confirmed();
+
+        let dialog = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert_eq!(dialog.requirement.title, "Definition");
+    }
+
+    #[test]
+    fn duplicate_requirement_cancelled_closes_the_dialog() {
+        let mut app = app_with_open_duplicate_dialog();
+
+        app.duplicate_requirement_cancelled();
+
+        assert!(app.duplicate_requirement_dialog.is_none());
+    }
+
+    #[test]
+    fn a_successful_duplicate_closes_the_dialog_and_navigates_to_the_new_entry() {
+        let mut app = app_with_open_duplicate_dialog();
+        app.duplicate_requirement_confirmed();
+        let request = app.duplicate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::AddRequirement(Ok(())),
+        });
+
+        assert!(app.dirty);
+        assert!(app.duplicate_requirement_dialog.is_none());
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("definition copy")))
+        );
+    }
+
+    #[test]
+    fn a_failed_duplicate_create_leaves_the_dialog_open_with_an_error() {
+        let mut app = app_with_open_duplicate_dialog();
+        app.duplicate_requirement_confirmed();
+        let request = app.duplicate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::AddRequirement(Err(gui_core::AddChildError::ModuleNotFound)),
+        });
+
+        let dialog = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open");
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn delete_requirement_from_tree_clicked_opens_the_confirmation_with_no_form_open() {
+        let mut app = test_app();
+        assert!(matches!(app.editor, EditorState::None));
+
+        app.delete_requirement_from_tree_clicked(LogicalPath::root(disk_entry_name("definition")));
+
+        let dialog = app
+            .delete_confirm_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(
+            dialog.target,
+            DeleteTarget::Requirement(LogicalPath::root(disk_entry_name("definition")))
+        );
+        assert_eq!(dialog.label, "definition");
+        assert!(dialog.pending_request.is_none());
     }
 
     #[test]
@@ -6110,6 +7322,64 @@ mod test {
     }
 
     #[test]
+    fn diff_file_clicked_opens_the_dialog_loading_for_that_path() {
+        let mut app = test_app();
+
+        app.diff_file_clicked(PathBuf::from("sub/file.txt"));
+
+        let dialog = app.diff_dialog.as_ref().unwrap();
+        assert_eq!(dialog.path, PathBuf::from("sub/file.txt"));
+        assert!(dialog.loading);
+        assert!(dialog.diff.is_empty());
+        assert!(app.diff_request.is_some());
+    }
+
+    #[test]
+    fn a_matching_get_diff_reply_populates_the_dialog() {
+        let mut app = test_app();
+        app.diff_file_clicked(PathBuf::from("root.txt"));
+        let request = app.diff_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::GetDiff(Ok("--- a/root.txt\n+++ b/root.txt\n".to_string())),
+        });
+
+        let dialog = app.diff_dialog.as_ref().unwrap();
+        assert!(!dialog.loading);
+        assert_eq!(dialog.diff, "--- a/root.txt\n+++ b/root.txt\n");
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn a_failed_get_diff_reports_the_error_inline() {
+        let mut app = test_app();
+        app.diff_file_clicked(PathBuf::from("root.txt"));
+        let request = app.diff_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::GetDiff(Err(gui_core::GetDiffError::NoProjectPath)),
+        });
+
+        let dialog = app.diff_dialog.as_ref().unwrap();
+        assert!(!dialog.loading);
+        assert!(dialog.error.is_some());
+    }
+
+    #[test]
+    fn diff_dialog_closed_clears_the_dialog_but_leaves_commit_all_dialog_open() {
+        let mut app = test_app();
+        app.commit_all_button_clicked();
+        app.diff_file_clicked(PathBuf::from("root.txt"));
+
+        app.diff_dialog_closed();
+
+        assert!(app.diff_dialog.is_none());
+        assert!(app.commit_all_dialog.is_some());
+    }
+
+    #[test]
     fn commit_clicked_with_an_empty_message_does_nothing() {
         let mut app = test_app();
         app.commit_all_button_clicked();
@@ -7325,6 +8595,85 @@ mod test {
         assert_eq!(dialog.new_name, "definition");
         assert!(!dialog.deleted);
         assert!(dialog.pending_request.is_none());
+    }
+
+    #[test]
+    fn recreate_requirement_from_tree_clicked_opens_the_dialog_after_a_fetch() {
+        let mut app = test_app();
+
+        app.recreate_requirement_from_tree_clicked(LogicalPath::root(disk_entry_name("definition")));
+
+        assert!(app.recreate_requirement_dialog.is_none());
+        let (request, target) = app
+            .recreate_requirement_context_request
+            .clone()
+            .expect("a GetEntryDetail fetch should be pending");
+        assert_eq!(target, LogicalPath::root(disk_entry_name("definition")));
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: entry_detail_for(RequirementDraft::new("Definition")),
+        });
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should be open");
+        assert_eq!(dialog.target, LogicalPath::root(disk_entry_name("definition")));
+        assert_eq!(dialog.new_name, "definition");
+        assert!(dialog.regenerate_title);
+        assert!(!dialog.deleted);
+        assert!(app.recreate_requirement_context_request.is_none());
+    }
+
+    #[test]
+    fn a_missing_recreate_from_tree_fetch_leaves_the_dialog_closed() {
+        let mut app = test_app();
+        app.recreate_requirement_from_tree_clicked(LogicalPath::root(disk_entry_name("gone")));
+        let (request, _) = app.recreate_requirement_context_request.clone().unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::EntryDetail(None),
+        });
+
+        assert!(app.recreate_requirement_dialog.is_none());
+        assert!(app.recreate_requirement_context_request.is_none());
+    }
+
+    #[test]
+    fn recreate_requirement_confirmed_regenerates_the_title_from_the_new_name_by_default() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "shiny_new_name".to_string();
+        }
+
+        confirm_requirement_recreate_past_references(&mut app);
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert_eq!(dialog.requirement.title, "Shiny New Name");
+    }
+
+    #[test]
+    fn recreate_requirement_confirmed_keeps_the_original_title_when_unchecked() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "shiny_new_name".to_string();
+            dialog.regenerate_title = false;
+        }
+
+        confirm_requirement_recreate_past_references(&mut app);
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert_eq!(dialog.requirement.title, "Definition");
     }
 
     #[test]

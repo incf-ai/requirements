@@ -715,7 +715,12 @@ impl GuiApp {
                                             ),
                                         );
                                     }
-                                    ui.label(root_text);
+                                    // `Sense::click()` — see the no-submodules
+                                    // branch of `render_tree_node` for why a
+                                    // plain `ui.label` can't host a context menu.
+                                    let root_response =
+                                        ui.add(egui::Label::new(root_text).sense(egui::Sense::click()));
+                                    attach_paste_requirement_menu(&root_response, self, Vec::new());
                                 });
                                 render_module_children(self, ui, &root.children, &[], force_open);
                             });
@@ -811,6 +816,7 @@ impl GuiApp {
         let mut pick_test_ref_path_clicked: Option<TestRefSlot> = None;
         let mut refresh_stale_test_references_clicked = false;
         let mut recreate_clicked = false;
+        let mut create_result_clicked = false;
         // Set by a click on one of the read-only viewer's Dependencies/Test
         // references/Results links — acted on after `form`'s borrow of
         // `self.editor` ends below, same reasoning as every other
@@ -1217,6 +1223,17 @@ impl GuiApp {
                         ui.label("Results:");
                         if form.results.is_empty() {
                             ui.label("No results reference this requirement yet.");
+                            // Unlike Dependencies/Test references/Local
+                            // attachments, this doesn't mutate the
+                            // requirement itself — it opens the Create
+                            // Result dialog, which creates a separate
+                            // Result entity referencing this requirement.
+                            // So it's offered in the read-only viewer too.
+                            if form.tests.is_empty() {
+                                ui.label("Add a test procedure above before creating a result.");
+                            } else if ui.button("Create new result").clicked() {
+                                create_result_clicked = true;
+                            }
                         }
                         for result in &form.results {
                             // Unlike Dependencies/Test references above,
@@ -1224,10 +1241,7 @@ impl GuiApp {
                             // `LogicalPath` (see `RequirementResult`), so
                             // there's no parsing step before it's clickable.
                             if ui
-                                .link(format!(
-                                    "{} ({:?}) — {}",
-                                    result.title, result.status, result.path
-                                ))
+                                .link(format!("{} ({:?})", result.title, result.status))
                                 .clicked()
                             {
                                 navigate_clicked = Some((result.path.clone(), EntryKind::Result));
@@ -1279,6 +1293,8 @@ impl GuiApp {
             self.editor_delete_clicked();
         } else if recreate_clicked {
             self.recreate_requirement_clicked();
+        } else if create_result_clicked {
+            self.create_result_clicked();
         } else if add_attachment_clicked {
             self.local_attachment_add_clicked(LocalPoolKind::RequirementAttachment);
         } else if let Some(path) = remove_attachment {
@@ -1602,6 +1618,10 @@ impl GuiApp {
                         ui.label("Test procedure commit:");
                         ui.label(&form.test_commit);
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Status:");
+                        ui.label(format!("{:?}", form.status));
+                    });
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
@@ -1662,6 +1682,33 @@ impl GuiApp {
                         "Commits aren't picked automatically yet — copy the target's \
                      current commit by hand (see README's Open questions).",
                     );
+                    ui.horizontal(|ui| {
+                        ui.label("Status:");
+                        if ui
+                            .selectable_label(matches!(form.status, gui_core::StatusV1::Pass), "Pass")
+                            .clicked()
+                        {
+                            form.status = gui_core::StatusV1::Pass;
+                            form.edited = true;
+                        }
+                        if ui
+                            .selectable_label(matches!(form.status, gui_core::StatusV1::Fail), "Fail")
+                            .clicked()
+                        {
+                            form.status = gui_core::StatusV1::Fail;
+                            form.edited = true;
+                        }
+                        if ui
+                            .selectable_label(
+                                matches!(form.status, gui_core::StatusV1::Incomplete),
+                                "Incomplete",
+                            )
+                            .clicked()
+                        {
+                            form.status = gui_core::StatusV1::Incomplete;
+                            form.edited = true;
+                        }
+                    });
                 }
                 if let Some(error) = &form.error {
                     ui.colored_label(egui::Color32::RED, error);
@@ -2172,6 +2219,7 @@ impl GuiApp {
 
         let mut close_clicked = false;
         let mut commit_clicked = false;
+        let mut diff_clicked: Option<PathBuf> = None;
 
         // Keep at least this many pixels between the modal's bottom edge and
         // the window edge — `egui::Modal` centers on the full screen but
@@ -2248,7 +2296,9 @@ impl GuiApp {
                                     ui.label("No changes.");
                                 } else {
                                     for path in &dialog.changed_files {
-                                        ui.label(path.display().to_string());
+                                        if ui.link(path.display().to_string()).clicked() {
+                                            diff_clicked = Some(path.clone());
+                                        }
                                     }
                                 }
                             });
@@ -2289,6 +2339,70 @@ impl GuiApp {
             self.commit_all_dialog_commit_clicked();
         } else if close_clicked {
             self.commit_all_dialog_closed();
+        } else if let Some(path) = diff_clicked {
+            self.diff_file_clicked(path);
+        }
+    }
+
+    /// The "View diff" modal — opened by clicking a file in
+    /// `render_commit_all_dialog`'s file list. Renders the unified diff
+    /// `Command::GetDiff` returned one line at a time, colored red/green
+    /// via `theme_colors::diff_line_colors` (which returns `None` for
+    /// context/header lines, left in the theme's ordinary text color) so
+    /// it reads correctly in both light and dark mode. `ScrollArea::both`
+    /// rather than `::vertical` since diff lines routinely run wider than
+    /// the modal and shouldn't wrap (wrapping would misalign the +/-
+    /// markers from the text they annotate).
+    pub(crate) fn render_diff_dialog(&mut self, ui: &mut egui::Ui) {
+        if self.diff_dialog.is_none() {
+            return;
+        }
+
+        let mut close_clicked = false;
+        let screen_rect = ui.ctx().content_rect();
+        let width = screen_rect.width() * 0.7;
+        let max_height = (screen_rect.height() - 120.0).max(200.0);
+
+        egui::Modal::new(egui::Id::new("diff_dialog")).show(ui.ctx(), |ui| {
+            let Some(dialog) = &self.diff_dialog else {
+                return;
+            };
+            ui.set_width(width);
+            ui.heading(format!("Diff: {}", dialog.path.display()));
+            ui.separator();
+
+            if dialog.loading {
+                ui.label("Loading…");
+            } else if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            } else if dialog.diff.trim().is_empty() {
+                ui.label("No textual diff available (binary file, or no changes).");
+            } else {
+                egui::ScrollArea::both()
+                    .max_height(max_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        let dark_mode = ui.visuals().dark_mode;
+                        for line in dialog.diff.lines() {
+                            let kind = theme_colors::classify_diff_line(line);
+                            let mut text = egui::RichText::new(line).monospace();
+                            if let Some((fg, bg)) = theme_colors::diff_line_colors(dark_mode, kind) {
+                                text = text.color(fg).background_color(bg);
+                            }
+                            ui.label(text);
+                        }
+                    });
+            }
+
+            ui.separator();
+            if ui.button("Close").clicked() {
+                close_clicked = true;
+            }
+        });
+
+        if close_clicked {
+            self.diff_dialog_closed();
         }
     }
 
@@ -2425,6 +2539,217 @@ impl GuiApp {
         }
     }
 
+    /// The tree's right-click "Duplicate" name prompt — see
+    /// `DuplicateRequirementState`'s own doc comment. Enter in the name
+    /// field submits the same as clicking "Duplicate", but only when that
+    /// button would actually be enabled — same guard shape as the Recreate
+    /// dialogs' own `enter_pressed_in_name_field` handling.
+    pub(crate) fn render_duplicate_requirement_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.duplicate_requirement_dialog.clone() else {
+            return;
+        };
+
+        let mut new_name = dialog.new_name;
+        let mut regenerate_title = dialog.regenerate_title;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let mut enter_pressed_in_name_field = false;
+        let busy = dialog.pending_request.is_some();
+        egui::Modal::new(egui::Id::new("duplicate_requirement_dialog")).show(ui.ctx(), |ui| {
+            ui.heading("Duplicate Requirement");
+            ui.label(format!(
+                "Creates a copy of \"{}\" in the same module under a new name.",
+                dialog.source.name
+            ));
+            ui.horizontal(|ui| {
+                ui.label("New name:");
+                let name_response = ui.add_enabled(!busy, egui::TextEdit::singleline(&mut new_name));
+                if name_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter_pressed_in_name_field = true;
+                }
+            });
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut regenerate_title, "Regenerate title from new name"),
+            );
+            let name_taken = dialog.existing_names.contains(new_name.trim());
+            if name_taken {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!("\"{}\" already exists in this module.", new_name.trim()),
+                );
+            }
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+            let can_confirm = !busy && !new_name.trim().is_empty() && !name_taken;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(can_confirm, egui::Button::new("Duplicate")).clicked() {
+                    confirmed = true;
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
+                    cancelled = true;
+                }
+            });
+            if enter_pressed_in_name_field && can_confirm {
+                confirmed = true;
+            }
+        });
+
+        if confirmed {
+            if let Some(dialog) = &mut self.duplicate_requirement_dialog {
+                dialog.new_name = new_name;
+                dialog.regenerate_title = regenerate_title;
+            }
+            self.duplicate_requirement_confirmed();
+        } else if cancelled {
+            self.duplicate_requirement_cancelled();
+        } else if let Some(dialog) = &mut self.duplicate_requirement_dialog {
+            dialog.new_name = new_name;
+            dialog.regenerate_title = regenerate_title;
+        }
+    }
+
+    /// The requirement view's "Create new result" prompt — opened by
+    /// `GuiApp::create_result_clicked` from the empty-results state in
+    /// `render_requirement_form`. See `CreateResultDialogState`'s own doc
+    /// comment for why the test picker only offers this requirement's own
+    /// `tests`, and why the commit fields are pre-filled automatically but
+    /// stay plain editable text (the underlying fetch can fail silently,
+    /// same as the dependency/test-reference rows' own "Auto" button).
+    pub(crate) fn render_create_result_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.create_result_dialog.clone() else {
+            return;
+        };
+
+        let mut name = dialog.name;
+        let mut title = dialog.title;
+        let mut regenerate_title = dialog.regenerate_title;
+        let mut test_index = dialog.test_index;
+        let mut status = dialog.status.clone();
+        let mut requirement_commit = dialog.requirement_commit.clone();
+        let mut test_commit = dialog.test_commit.clone();
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let busy = dialog.pending_request.is_some();
+        egui::Modal::new(egui::Id::new("create_result_dialog")).show(ui.ctx(), |ui| {
+            ui.heading("New Result");
+            ui.label(format!("For requirement \"{}\".", dialog.requirement.name));
+            ui.horizontal(|ui| {
+                ui.label("Identifier:");
+                ui.add_enabled(!busy, egui::TextEdit::singleline(&mut name));
+            });
+            // Kept in sync with `name` every frame while checked, same
+            // "checkbox drives a derived field" idea as the Duplicate/
+            // Recreate dialogs' own `regenerate_title` — here it's also
+            // visible live (not just applied at confirm) since the
+            // transform is a plain copy, cheap enough to just show.
+            if regenerate_title {
+                title = name.clone();
+            }
+            ui.horizontal(|ui| {
+                ui.label("Title:");
+                ui.add_enabled(!busy && !regenerate_title, egui::TextEdit::singleline(&mut title));
+            });
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut regenerate_title, "Generate title from identifier"),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Test procedure:");
+                egui::ComboBox::new("create_result_test_picker", "")
+                    .selected_text(
+                        dialog
+                            .tests
+                            .get(test_index)
+                            .map(|t| t.path.as_str())
+                            .unwrap_or(""),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, test_ref) in dialog.tests.iter().enumerate() {
+                            ui.selectable_value(&mut test_index, i, test_ref.path.as_str());
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Status:");
+                if ui
+                    .selectable_label(matches!(status, gui_core::StatusV1::Pass), "Pass")
+                    .clicked()
+                {
+                    status = gui_core::StatusV1::Pass;
+                }
+                if ui
+                    .selectable_label(matches!(status, gui_core::StatusV1::Fail), "Fail")
+                    .clicked()
+                {
+                    status = gui_core::StatusV1::Fail;
+                }
+                if ui
+                    .selectable_label(matches!(status, gui_core::StatusV1::Incomplete), "Incomplete")
+                    .clicked()
+                {
+                    status = gui_core::StatusV1::Incomplete;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Requirement commit:");
+                ui.add_enabled(!busy, egui::TextEdit::singleline(&mut requirement_commit));
+                if dialog.requirement_commit_pending.is_some() {
+                    ui.label("(resolving…)");
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Test commit:");
+                ui.add_enabled(!busy, egui::TextEdit::singleline(&mut test_commit));
+                if dialog.test_commit_pending.is_some() {
+                    ui.label("(resolving…)");
+                }
+            });
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+            let can_confirm = !busy && !name.trim().is_empty() && !dialog.tests.is_empty();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(can_confirm, egui::Button::new("Create result")).clicked() {
+                    confirmed = true;
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+        let test_changed = test_index != dialog.test_index;
+        if confirmed {
+            if let Some(dialog) = &mut self.create_result_dialog {
+                dialog.name = name;
+                dialog.title = title;
+                dialog.regenerate_title = regenerate_title;
+                dialog.test_index = test_index;
+                dialog.status = status;
+                dialog.requirement_commit = requirement_commit;
+                dialog.test_commit = test_commit;
+            }
+            self.create_result_confirmed();
+        } else if cancelled {
+            self.create_result_cancelled();
+        } else {
+            if let Some(dialog) = &mut self.create_result_dialog {
+                dialog.name = name;
+                dialog.title = title;
+                dialog.regenerate_title = regenerate_title;
+                dialog.test_index = test_index;
+                dialog.status = status;
+                dialog.requirement_commit = requirement_commit;
+                dialog.test_commit = test_commit;
+            }
+            if test_changed {
+                self.create_result_fetch_test_commit(test_index);
+            }
+        }
+    }
+
     /// The requirement "Recreate" prompt — opens from the "Recreate…"
     /// button next to a saved requirement's stable name. Cancel is only
     /// offered before the delete leg has gone out (`!dialog.deleted`):
@@ -2440,9 +2765,11 @@ impl GuiApp {
         };
 
         let mut new_name = dialog.new_name;
+        let mut regenerate_title = dialog.regenerate_title;
         let mut reference_choices = dialog.reference_choices;
         let mut confirmed = false;
         let mut cancelled = false;
+        let mut enter_pressed_in_name_field = false;
         let busy = dialog.pending_request.is_some();
         let button_label = if dialog.repairing { "Retry Repair" } else { "Recreate" };
         egui::Modal::new(egui::Id::new("recreate_requirement_dialog")).show(ui.ctx(), |ui| {
@@ -2453,8 +2780,16 @@ impl GuiApp {
             ));
             ui.horizontal(|ui| {
                 ui.label("New name:");
-                ui.add_enabled(!dialog.deleted, egui::TextEdit::singleline(&mut new_name));
+                let name_response =
+                    ui.add_enabled(!dialog.deleted, egui::TextEdit::singleline(&mut new_name));
+                if name_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter_pressed_in_name_field = true;
+                }
             });
+            ui.add_enabled(
+                !dialog.deleted,
+                egui::Checkbox::new(&mut regenerate_title, "Regenerate title from new name"),
+            );
             let text_empty = !dialog.deleted && dialog.requirement.requirement_text.trim().is_empty();
             if text_empty {
                 ui.colored_label(
@@ -2490,25 +2825,29 @@ impl GuiApp {
                 ui.colored_label(egui::Color32::RED, error);
             }
             let name_unchanged = !dialog.deleted && new_name.trim() == dialog.target.name.as_str();
+            let can_confirm = !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty;
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty,
-                        egui::Button::new(button_label),
-                    )
-                    .clicked()
-                {
+                if ui.add_enabled(can_confirm, egui::Button::new(button_label)).clicked() {
                     confirmed = true;
                 }
                 if ui.add_enabled(!busy && !dialog.deleted, egui::Button::new("Cancel")).clicked() {
                     cancelled = true;
                 }
             });
+            // Enter in the "New name:" field submits the same as clicking
+            // the Recreate/Retry Repair button, but only when that button
+            // would actually be enabled — a `key_pressed` check alone would
+            // otherwise let Enter bypass the empty-name/unchanged-name/
+            // empty-text guards `can_confirm` exists to enforce.
+            if enter_pressed_in_name_field && can_confirm {
+                confirmed = true;
+            }
         });
 
         if confirmed {
             if let Some(dialog) = &mut self.recreate_requirement_dialog {
                 dialog.new_name = new_name;
+                dialog.regenerate_title = regenerate_title;
                 dialog.reference_choices = reference_choices;
             }
             self.recreate_requirement_confirmed();
@@ -2516,6 +2855,7 @@ impl GuiApp {
             self.recreate_requirement_cancelled();
         } else if let Some(dialog) = &mut self.recreate_requirement_dialog {
             dialog.new_name = new_name;
+            dialog.regenerate_title = regenerate_title;
             dialog.reference_choices = reference_choices;
         }
     }
@@ -2529,6 +2869,7 @@ impl GuiApp {
         let mut reference_choices = dialog.reference_choices;
         let mut confirmed = false;
         let mut cancelled = false;
+        let mut enter_pressed_in_name_field = false;
         let busy = dialog.pending_request.is_some();
         let button_label = if dialog.repairing { "Retry Repair" } else { "Recreate" };
         egui::Modal::new(egui::Id::new("recreate_test_dialog")).show(ui.ctx(), |ui| {
@@ -2539,7 +2880,11 @@ impl GuiApp {
             ));
             ui.horizontal(|ui| {
                 ui.label("New name:");
-                ui.add_enabled(!dialog.deleted, egui::TextEdit::singleline(&mut new_name));
+                let name_response =
+                    ui.add_enabled(!dialog.deleted, egui::TextEdit::singleline(&mut new_name));
+                if name_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter_pressed_in_name_field = true;
+                }
             });
             let text_empty = !dialog.deleted && dialog.test.test_text.trim().is_empty();
             if text_empty {
@@ -2576,20 +2921,22 @@ impl GuiApp {
                 ui.colored_label(egui::Color32::RED, error);
             }
             let name_unchanged = !dialog.deleted && new_name.trim() == dialog.target.name.as_str();
+            let can_confirm = !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty;
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty,
-                        egui::Button::new(button_label),
-                    )
-                    .clicked()
-                {
+                if ui.add_enabled(can_confirm, egui::Button::new(button_label)).clicked() {
                     confirmed = true;
                 }
                 if ui.add_enabled(!busy && !dialog.deleted, egui::Button::new("Cancel")).clicked() {
                     cancelled = true;
                 }
             });
+            // Enter in the "New name:" field submits the same as clicking
+            // the Recreate/Retry Repair button, but only when that button
+            // would actually be enabled — see the requirement dialog's own
+            // comment on this same guard.
+            if enter_pressed_in_name_field && can_confirm {
+                confirmed = true;
+            }
         });
 
         if confirmed {
@@ -2761,6 +3108,27 @@ impl GuiApp {
     }
 }
 
+/// Attaches the tree's right-click "Paste" item to `response` — shared by
+/// every place a requirement can be pasted into: every module row in the
+/// top tree pane that can be a paste target (`render_tree_node`'s two
+/// branches below, plus the specially-rendered project root in
+/// `render_left_pane`), and the bottom pane's own "requirements" leaf-
+/// group header (`render_leaf_group`), which targets whichever module is
+/// currently selected. Disabled (not hidden) with nothing on
+/// `app.requirement_clipboard`, so right-clicking any of these always
+/// shows the same menu shape whether or not a Copy has happened yet.
+fn attach_paste_requirement_menu(response: &egui::Response, app: &mut GuiApp, module: Vec<EntryName>) {
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(app.requirement_clipboard.is_some(), egui::Button::new("Paste"))
+            .clicked()
+        {
+            app.paste_requirement_clicked(module.clone());
+            ui.close();
+        }
+    });
+}
+
 /// Only ever called for a `Module` node — `render_module_children` filters
 /// to `EntryKind::Module` before recursing here, since the top tree pane
 /// no longer renders leaves at all.
@@ -2828,7 +3196,7 @@ fn render_tree_node(
         if has_submodules {
             ui.visuals_mut().indent_has_left_vline = false;
             ui.spacing_mut().indent = 18.0;
-            egui::CollapsingHeader::new(name_text)
+            let header = egui::CollapsingHeader::new(name_text)
                 .default_open(false)
                 .open(force_open)
                 .show(ui, |ui| {
@@ -2840,6 +3208,7 @@ fn render_tree_node(
                         force_open,
                     );
                 });
+            attach_paste_requirement_menu(&header.header_response, app, this_module_path.clone());
         } else {
             // No submodules: no expand arrow, but reserve the same
             // horizontal space a CollapsingHeader's toggle button would
@@ -2851,7 +3220,11 @@ fn render_tree_node(
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.allocate_exact_size(size, egui::Sense::hover());
             ui.spacing_mut().item_spacing = prev_item_spacing;
-            ui.label(name_text);
+            // `Sense::click()` — a plain `ui.label` senses only hover, and
+            // `Response::context_menu` requires a click-sensing response
+            // (see its own doc comment) to detect the right-click at all.
+            let response = ui.add(egui::Label::new(name_text).sense(egui::Sense::click()));
+            attach_paste_requirement_menu(&response, app, this_module_path.clone());
         }
     });
 }
@@ -2901,7 +3274,15 @@ fn render_leaf_group(
             child.kind == kind && node_matches_filter(child, module_path, &app.tree_filter)
         })
         .collect();
-    if matching.is_empty() {
+    // Requirements are the one kind with a right-click "Paste" of their
+    // own (see `attach_paste_requirement_menu`) — a module with zero
+    // requirements normally has no "requirements" group at all to right-
+    // click, so it's shown anyway (as "requirements (0)") whenever
+    // there's actually something on the clipboard to paste, rather than
+    // forcing the user out to the top tree pane's own per-module Paste
+    // just because this particular module happens to be empty so far.
+    let can_paste_here = kind == EntryKind::Requirement && app.requirement_clipboard.is_some();
+    if matching.is_empty() && !can_paste_here {
         return;
     }
     let header = match display.recursive_total {
@@ -2916,7 +3297,7 @@ fn render_leaf_group(
     // every count change would silently re-collapse an already-open
     // group back to `default_open(false)`, hiding leaves that still
     // match the filter.
-    egui::CollapsingHeader::new(header)
+    let response = egui::CollapsingHeader::new(header)
         .id_salt((title, module_path))
         .default_open(false)
         .open(display.force_open)
@@ -2925,6 +3306,9 @@ fn render_leaf_group(
                 render_leaf(app, ui, leaf, module_path);
             }
         });
+    if kind == EntryKind::Requirement {
+        attach_paste_requirement_menu(&response.header_response, app, module_path.to_vec());
+    }
 }
 
 /// The two per-frame, per-group settings `render_leaf_group` needs beyond
@@ -2986,7 +3370,8 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
         }
         _ => name_text.into_atoms(),
     };
-    if ui.selectable_label(false, content).clicked() {
+    let response = ui.selectable_label(false, content);
+    if response.clicked() {
         let target = LogicalPath {
             modules: module_path.to_vec(),
             name: node.name.clone(),
@@ -3000,6 +3385,35 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
             app.select(target, node.kind);
         }
     }
+    // Copy/Paste/Duplicate/Recreate/Delete are requirement-only affordances
+    // for now — tests/results don't have `paste_requirement_clicked`/
+    // `duplicate_requirement_clicked`/`recreate_requirement_from_tree_clicked`/
+    // `delete_requirement_from_tree_clicked` counterparts to receive one.
+    if node.kind == EntryKind::Requirement {
+        let target = LogicalPath {
+            modules: module_path.to_vec(),
+            name: node.name.clone(),
+        };
+        response.context_menu(|ui| {
+            if ui.button("Copy").clicked() {
+                app.copy_requirement_clicked(target.clone());
+                ui.close();
+            }
+            if ui.button("Duplicate").clicked() {
+                app.duplicate_requirement_clicked(target.clone());
+                ui.close();
+            }
+            if ui.button("Recreate…").clicked() {
+                app.recreate_requirement_from_tree_clicked(target.clone());
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Delete…").clicked() {
+                app.delete_requirement_from_tree_clicked(target.clone());
+                ui.close();
+            }
+        });
+    }
 }
 
 /// Walks `root` by `path`, matching only `Module` children at each
@@ -3008,7 +3422,7 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
 /// read-model tree gui-ui already has in hand each frame). An empty
 /// `path` returns `root` itself, the same "empty means project root"
 /// convention `selected_module` uses.
-fn resolve_tree_module<'a>(root: &'a TreeNode, path: &[EntryName]) -> Option<&'a TreeNode> {
+pub(crate) fn resolve_tree_module<'a>(root: &'a TreeNode, path: &[EntryName]) -> Option<&'a TreeNode> {
     let mut current = root;
     for name in path {
         current = current

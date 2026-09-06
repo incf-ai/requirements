@@ -15,8 +15,9 @@ use crate::tree::{
 };
 use crate::{
     AddChildError, AddLocalPoolError, AddPoolChildError, AddPoolFileError, Command, CommitAllError, EntryKind, Event,
-    GetChangedFilesError, LogicalPath, Outcome, ProjectState, RedoError, ReferencePath, RefreshStaleTestReferencesError,
-    RenameModuleError, RenameProjectError, RequestId, ResolveLocalCommitError, SaveError, UndoError, UpdateChildError,
+    GetChangedFilesError, GetDiffError, LogicalPath, Outcome, ProjectState, RedoError, ReferencePath,
+    RefreshStaleTestReferencesError, RenameModuleError, RenameProjectError, RequestId, ResolveLocalCommitError, SaveError,
+    UndoError, UpdateChildError,
 };
 
 /// The boundary `gui-ui` talks across. Plain `Send + Sync`, non-blocking
@@ -301,6 +302,7 @@ where
             Command::ResolveLocalCommit { target, kind, request } => self.spawn_resolve_local_commit(target, kind, request),
             Command::ResolveRemoteCommit { url, path, request } => self.spawn_resolve_remote_commit(url, path, request),
             Command::GetChangedFiles { request } => self.spawn_get_changed_files(request),
+            Command::GetDiff { path, request } => self.spawn_get_diff(path, request),
             Command::CommitAll { message, request } => self.spawn_commit_all(message, request),
             Command::FindReferences { target, request } => {
                 self.spawn_read(request, move |state| find_references(&state, &target))
@@ -1174,6 +1176,22 @@ where
         });
     }
 
+    /// See `Command::GetDiff`'s own doc comment — same shape as
+    /// `spawn_get_changed_files`, against a caller-supplied `path` instead
+    /// of the whole working directory.
+    fn spawn_get_diff(&self, path: PathBuf, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(request, Outcome::GetDiff(Err(GetDiffError::NoProjectPath)));
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = Outcome::GetDiff(git.diff(&project_path, &path).map_err(GetDiffError::from));
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
     /// See `Command::CommitAll`'s own doc comment.
     fn spawn_commit_all(&self, message: String, request: RequestId) {
         let Some(project_path) = self.project_path.clone() else {
@@ -1403,12 +1421,12 @@ mod test {
     use disk::{DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, TestReferenceKind};
     use logical::LogicalPath;
     use logical::draft::RequirementDraft;
-    use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, StdFilesystem};
+    use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, DiffError, StdFilesystem};
 
     use logical::draft::AddNamedChildError;
 
     use crate::{
-        AddPoolFileError, EntryDetail, EntryKind, GetChangedFilesError, RefreshStaleTestReferencesError,
+        AddPoolFileError, EntryDetail, EntryKind, GetChangedFilesError, GetDiffError, RefreshStaleTestReferencesError,
         RequirementMetStatus, TestUnmetReason, TreeSnapshot, UnmetReason,
     };
 
@@ -1431,6 +1449,10 @@ mod test {
 
         fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
             Ok(())
+        }
+
+        fn diff(&self, _dir: &Path, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("diff for {}", path.display()))
         }
     }
 
@@ -1502,6 +1524,10 @@ mod test {
 
         fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
             Ok(())
+        }
+
+        fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("{}:{}", dir.display(), path.display()))
         }
     }
 
@@ -3848,6 +3874,46 @@ mod test {
             result.unwrap(),
             vec![PathBuf::from("root.txt"), PathBuf::from("sub/file.txt")]
         );
+    }
+
+    #[tokio::test]
+    async fn get_diff_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands
+            .send(Command::GetDiff {
+                path: PathBuf::from("root.txt"),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::GetDiff(Err(GetDiffError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_diff_returns_gits_reply() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetDiff {
+                path: PathBuf::from("root.txt"),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetDiff(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetDiff");
+        };
+        // `FixedGit`'s own fixed reply — see its doc comment.
+        assert_eq!(result.unwrap(), "diff for root.txt");
     }
 
     #[tokio::test]

@@ -15,8 +15,8 @@ use std::path::PathBuf;
 
 use gui_core::{
     Command, DependencyReferenceKind, EntryName, LocalGitReference, LogicalPath, ReferencePath,
-    RemoteGitReference, RequestId, RequirementDraft, ResultDraft, ResultKindV1, TestDraft,
-    TestReferenceKind,
+    RemoteGitReference, RequestId, RequirementDraft, ResultDraft, ResultKindV1, StatusV1,
+    TestDraft, TestReferenceKind,
 };
 
 fn non_empty(text: &str) -> Option<String> {
@@ -190,7 +190,7 @@ impl TestRefDraft {
 
 impl std::fmt::Display for TestRefDraft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} @ {}", self.path, self.commit)
+        write!(f, "{}", self.path)
     }
 }
 
@@ -495,10 +495,10 @@ pub struct ResultFormState {
     pub requirement_commit: String,
     pub test_path: String,
     pub test_commit: String,
+    pub status: StatusV1,
     /// See `RequirementFormState::original`'s own doc comment — same
-    /// reasoning, preserving `status` (there's no UI to edit it at all
-    /// today — it used to silently reset to `StatusV1::default()`,
-    /// `Incomplete`, on every save) and `attachment_refs`.
+    /// reasoning, preserving `attachment_refs` (there's no UI to edit that
+    /// at all today).
     pub original: Box<ResultDraft>,
     pub editing_target: Option<LogicalPath>,
     /// See `RequirementFormState::read_only`'s doc comment — same idea.
@@ -522,6 +522,7 @@ impl Default for ResultFormState {
             requirement_commit: String::new(),
             test_path: String::new(),
             test_commit: String::new(),
+            status: StatusV1::default(),
             original: Box::new(ResultDraft::new(
                 String::new(),
                 ReferencePath(String::new()),
@@ -549,6 +550,7 @@ impl ResultFormState {
         result.requirement_commit = self.requirement_commit.clone();
         result.test_path = gui_core::ReferencePath(self.test_path.clone());
         result.test_commit = self.test_commit.clone();
+        result.status = self.status.clone();
         result.attachments = self.attachments.iter().cloned().collect();
         match &self.editing_target {
             Some(target) => Command::UpdateResult {
@@ -910,20 +912,21 @@ mod test {
     }
 
     #[test]
-    fn result_form_build_command_preserves_the_status_the_form_has_no_ui_for() {
-        let mut original = ResultDraft::new(
+    fn result_form_build_command_uses_the_forms_own_status_not_originals() {
+        let original = ResultDraft::new(
             "Old Title",
             ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("tests/generic_test".to_string()),
             "t1",
         );
-        original.status = StatusV1::Pass;
+        assert!(matches!(original.status, StatusV1::Incomplete));
 
         let form = ResultFormState {
             title: "New Title".to_string(),
             editing_target: Some(LogicalPath::root(EntryName("definition".to_string()))),
             original: Box::new(original),
+            status: StatusV1::Pass,
             ..Default::default()
         };
 
