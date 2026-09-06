@@ -2081,9 +2081,11 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
     // The tree loaded at all — "beta" (a childless module, so a plain
     // `Label` rather than a collapsible `CollapsingHeader`, see
     // `render_tree_node`'s two branches) is a convenient proof of that.
-    // Every leaf group folder ("requirements"/"tests"/"results") starts
+    // Every leaf group folder ("requirements"/"test procedures") starts
     // collapsed — see `render_leaf_group`'s own `default_open(false)` —
-    // so none of their children are reachable yet.
+    // so none of their children (a requirement's own nested results
+    // included, since those render immediately under it once its group is
+    // open — see `render_leaf`'s own doc comment) are reachable yet.
     assert!(
         harness
             .query_by_role_and_label(Role::Label, "beta")
@@ -2091,7 +2093,6 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
     );
     assert!(leaf_group_button_present(&harness, "requirements"));
     assert!(leaf_group_button_present(&harness, "test procedures"));
-    assert!(leaf_group_button_present(&harness, "results"));
     assert!(
         harness
             .query_by_role_and_label(Role::Button, "\u{e32c} design")
@@ -2113,20 +2114,26 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
 }
 
 #[test]
-fn the_tree_groups_leaves_under_requirements_tests_and_results_folders() {
+fn the_tree_groups_leaves_under_requirements_and_test_procedures_folders() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
     wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
 
-    // The three folders themselves — root-level, since `test_project`
-    // has root-level requirements/tests/results, not just ones nested in
-    // a submodule. A `CollapsingHeader`'s own label reports as
-    // `Role::Button` (it's clickable, toggling expand/collapse), same as
-    // a module's own name — not `Role::Label`.
+    // The two folders themselves — root-level, since `test_project` has
+    // root-level requirements/tests, not just ones nested in a submodule.
+    // A `CollapsingHeader`'s own label reports as `Role::Button` (it's
+    // clickable, toggling expand/collapse), same as a module's own name —
+    // not `Role::Label`. There's no separate "results" folder any more —
+    // a requirement's results are nested under it (see
+    // `disk::RequirementOnDisk::results`), not a flat sibling group.
     assert!(leaf_group_button_present(&harness, "requirements"));
     assert!(leaf_group_button_present(&harness, "test procedures"));
-    assert!(leaf_group_button_present(&harness, "results"));
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "results")
+            .is_none()
+    );
 
     // `open_project_at` already clicked "Expand All" — a real leaf
     // underneath is visible and clickable. "design" is a real
@@ -2135,6 +2142,15 @@ fn the_tree_groups_leaves_under_requirements_tests_and_results_folders() {
     assert!(
         harness
             .query_by_role_and_label(Role::Button, "\u{e32c} design")
+            .is_some()
+    );
+
+    // "design"'s own nested result (also named "design" in the fixture)
+    // renders right under it, indented — plain text with no status
+    // glyph, unlike its owning requirement's row.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "design")
             .is_some()
     );
 }
@@ -2362,13 +2378,12 @@ fn the_top_tree_shows_empty_modules_and_no_leaves() {
 
     // Expanding "alpha"'s own `CollapsingHeader` in the top tree (unlike
     // "beta", it has a real submodule of its own, "alpha_child", so it
-    // actually is one) used to reveal a per-module "requirements"/
-    // "tests"/"results" nested group (the old `render_module_children`'s
-    // recursive leaf rendering, at every depth) — `render_module_children`
-    // is module-only now, so expanding it adds nothing: the count of
-    // leaf-group headers (all living in the bottom pane now, one set for
-    // the selected module) stays exactly one no matter which modules get
-    // expanded.
+    // actually is one) used to reveal a per-module "requirements"/"tests"
+    // nested group (the old `render_module_children`'s recursive leaf
+    // rendering, at every depth) — `render_module_children` is module-only
+    // now, so expanding it adds nothing: the count of leaf-group headers
+    // (all living in the bottom pane now, one set for the selected
+    // module) stays exactly one no matter which modules get expanded.
     harness.get_by_role_and_label(Role::Button, "alpha").click();
     harness.step();
     harness.step();
@@ -2382,12 +2397,6 @@ fn the_top_tree_shows_empty_modules_and_no_leaves() {
     assert_eq!(
         harness
             .get_all(By::new().role(Role::Button).label_contains("test procedures"))
-            .count(),
-        1
-    );
-    assert_eq!(
-        harness
-            .get_all(By::new().role(Role::Button).label_contains("results"))
             .count(),
         1
     );
@@ -4806,6 +4815,17 @@ fn result_form_requirement_path_picker_fills_the_field() {
     harness.step();
     open_test_project(&mut harness);
 
+    // Baseline count of "design"-labelled nodes before the form even
+    // opens: the "design" requirement's own tree leaf, plus its nested
+    // result (also named "design" in the fixture — see `render_leaf`'s
+    // own doc comment on why a result renders right under its
+    // requirement). Compared against the post-pick count below to prove
+    // the picked value actually landed in the form, since the field is a
+    // read-only label now (not a `text_edit`), so `get_all_by_value`
+    // doesn't apply to it the way it does to the still-editable
+    // `test_path` field's own picker test.
+    let design_label_count_before = harness.get_all_by_label("design").count();
+
     harness
         .get_by_role_and_label(Role::Button, "New Result")
         .click();
@@ -4836,20 +4856,18 @@ fn result_form_requirement_path_picker_fills_the_field() {
             .is_some()
     );
 
-    // "design" is a real root-level requirement in `test_project`;
-    // the modal row's text is `LogicalPath`'s own `Display` (bare
-    // "design" for a root-level entry — no "modules/..." prefix,
-    // unlike the tree's own leaf button, which additionally prefixes a
-    // status glyph — "\u{e32c} design" — so the two don't collide). Two
-    // matching "design" nodes turn up under `get_all_by_label` rather
-    // than one, though: the *first* is the tree's own leaf button (its
-    // accessibility label is apparently derived without the glyph prefix,
-    // despite its visible text being "\u{e32c} design" — confirmed
-    // empirically: clicking it navigates to "Edit Requirement" instead of
-    // filling this form's field), and the *second* is the actual modal
-    // row, drawn later (the modal renders last in `ui()`) and so later in
-    // tree order. `.last()` picks the real row; `.next()`/`.first()` would
-    // silently exercise the wrong widget.
+    // "design" is a real root-level requirement in `test_project`; the
+    // modal row's text is `LogicalPath`'s own `Display` (bare "design"
+    // for a root-level entry — no "modules/..." prefix, unlike the tree's
+    // own leaf button, which additionally prefixes a status glyph —
+    // "\u{e32c} design" — so the two don't collide). More than one
+    // matching "design" node turns up under `get_all_by_label` at this
+    // point (the tree's own requirement leaf button and its nested result
+    // leaf — see `design_label_count_before` above — plus the modal row
+    // itself while it's open); the modal row is always drawn last (the
+    // modal renders last in `ui()`), so `.last()` reliably picks it
+    // regardless of how many other "design"-labelled nodes exist —
+    // `.next()`/`.first()` would silently exercise the wrong widget.
     harness
         .get_all_by_label("design")
         .last()
@@ -4863,11 +4881,12 @@ fn result_form_requirement_path_picker_fills_the_field() {
             .query_by_role_and_label(Role::Label, "Pick a requirement")
             .is_none()
     );
-    assert!(
-        harness
-            .get_all_by_value("/requirements/design")
-            .next()
-            .is_some()
+    // The picked requirement now shows up as one more "design"-labelled
+    // node than the pre-pick baseline — this form's own read-only display
+    // of `form.requirement`.
+    assert_eq!(
+        harness.get_all_by_label("design").count(),
+        design_label_count_before + 1
     );
     assert!(
         harness
@@ -4988,14 +5007,16 @@ fn editing_an_existing_result_can_add_a_local_attachment() {
 
     // Field order among `Role::TextInput` nodes in edit mode: the status
     // bar's own zoom field(0) and the left pane's own filter field(1) —
-    // both always first — then name(2), title(3), requirement_path(4),
-    // requirement_commit(5), test_path(6), test_commit(7), then — since
-    // this form is editing an existing entry — the local-attachment path
-    // field(8). Same "TextInput vs. MultilineTextInput" and tree-order
-    // reasoning as the Requirement form's own attachment test.
+    // both always first — then name(2), title(3), requirement_commit(4),
+    // test_path(5), test_commit(6), then — since this form is editing an
+    // existing entry — the local-attachment path field(7). No
+    // `requirement_path` text field any more — the requirement is a
+    // read-only label now (picked structurally, not typed), so it doesn't
+    // count as a `TextInput`. Same "TextInput vs. MultilineTextInput" and
+    // tree-order reasoning as the Requirement form's own attachment test.
     let attachment_path_field = harness
         .get_all_by_role(Role::TextInput)
-        .nth(8)
+        .nth(7)
         .expect("local-attachment path field not found");
     attachment_path_field.focus();
     attachment_path_field.type_text("interaction_test_result_attachment.md");
