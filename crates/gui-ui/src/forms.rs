@@ -619,8 +619,15 @@ pub struct ModuleDetailFormState {
 impl ModuleDetailFormState {
     /// `path: []` (the project root) can't go through `RenameModule` — see
     /// `Command::RenameProject`'s own doc comment on why the root needs a
-    /// separate command.
-    pub fn build_command(&self, request: RequestId) -> Command {
+    /// separate command. `reference_actions` is the user's per-row choices
+    /// from the broken-references modal (see `GuiApp::broken_references_dialog`)
+    /// — empty when there was nothing to repair, which leaves `RenameModule`'s
+    /// behavior unchanged from before that modal existed.
+    pub fn build_command(
+        &self,
+        reference_actions: Vec<(gui_core::ReferenceSite, gui_core::ReferenceAction)>,
+        request: RequestId,
+    ) -> Command {
         if self.path.is_empty() {
             Command::RenameProject {
                 new_name: self.new_name.clone(),
@@ -630,6 +637,7 @@ impl ModuleDetailFormState {
             Command::RenameModule {
                 target: self.path.clone(),
                 new_name: EntryName(self.new_name.clone()),
+                reference_actions,
                 request,
             }
         }
@@ -640,7 +648,7 @@ impl ModuleDetailFormState {
 mod test {
     use std::collections::BTreeSet;
 
-    use gui_core::{StatusV1, TestReferenceKind};
+    use gui_core::{ReferenceAction, ReferenceSite, ReferenceSiteKind, StatusV1, TestReferenceKind};
 
     use super::*;
 
@@ -944,20 +952,42 @@ mod test {
         let form = module_detail_form(vec![EntryName("setup".to_string())], "renamed");
 
         let Command::RenameModule {
-            target, new_name, ..
-        } = form.build_command(1)
+            target,
+            new_name,
+            reference_actions,
+            ..
+        } = form.build_command(Vec::new(), 1)
         else {
             panic!("expected RenameModule");
         };
         assert_eq!(target, vec![EntryName("setup".to_string())]);
         assert_eq!(new_name, EntryName("renamed".to_string()));
+        assert!(reference_actions.is_empty());
+    }
+
+    #[test]
+    fn module_detail_form_build_command_for_a_nested_module_forwards_reference_actions() {
+        let form = module_detail_form(vec![EntryName("setup".to_string())], "renamed");
+        let site = ReferenceSite {
+            referrer: LogicalPath {
+                modules: Vec::new(),
+                name: EntryName("referrer".to_string()),
+            },
+            kind: ReferenceSiteKind::RequirementDependency { index: 0 },
+        };
+        let actions = vec![(site.clone(), ReferenceAction::Remove)];
+
+        let Command::RenameModule { reference_actions, .. } = form.build_command(actions.clone(), 1) else {
+            panic!("expected RenameModule");
+        };
+        assert_eq!(reference_actions, actions);
     }
 
     #[test]
     fn module_detail_form_build_command_for_the_project_root_sends_rename_project() {
         let form = module_detail_form(Vec::new(), "Renamed Project");
 
-        let Command::RenameProject { new_name, .. } = form.build_command(1) else {
+        let Command::RenameProject { new_name, .. } = form.build_command(Vec::new(), 1) else {
             panic!("expected RenameProject");
         };
         assert_eq!(new_name, "Renamed Project");

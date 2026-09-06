@@ -722,7 +722,7 @@ fn the_initial_layout_renders_every_toolbar_button_and_empty_state_messages() {
         "Back",
         "Forward",
         "New Requirement",
-        "New Test",
+        "New Test Procedure",
         "New Result",
         "New Module",
         "Attachments…",
@@ -1442,7 +1442,7 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
             .is_some()
     );
     assert!(leaf_group_button_present(&harness, "requirements"));
-    assert!(leaf_group_button_present(&harness, "tests"));
+    assert!(leaf_group_button_present(&harness, "test procedures"));
     assert!(leaf_group_button_present(&harness, "results"));
     assert!(
         harness
@@ -1477,7 +1477,7 @@ fn the_tree_groups_leaves_under_requirements_tests_and_results_folders() {
     // `Role::Button` (it's clickable, toggling expand/collapse), same as
     // a module's own name — not `Role::Label`.
     assert!(leaf_group_button_present(&harness, "requirements"));
-    assert!(leaf_group_button_present(&harness, "tests"));
+    assert!(leaf_group_button_present(&harness, "test procedures"));
     assert!(leaf_group_button_present(&harness, "results"));
 
     // `open_project_at` already clicked "Expand All" — a real leaf
@@ -1531,7 +1531,7 @@ fn an_empty_module_shows_no_leaf_group_folders() {
     );
     assert_eq!(
         harness
-            .query_all_by_role_and_label(Role::Button, "tests")
+            .query_all_by_role_and_label(Role::Button, "test procedures")
             .count(),
         0
     );
@@ -1726,7 +1726,7 @@ fn the_top_tree_shows_empty_modules_and_no_leaves() {
     );
     assert_eq!(
         harness
-            .get_all(By::new().role(Role::Button).label_contains("tests"))
+            .get_all(By::new().role(Role::Button).label_contains("test procedures"))
             .count(),
         1
     );
@@ -2334,7 +2334,7 @@ fn the_requirement_viewer_explains_why_it_is_unmet() {
     assert!(harness.query_by_label("Unmet").is_some());
     assert!(
         harness
-            .query_by_label_contains("Test \"tests/smoke\": its reference is stale")
+            .query_by_label_contains("Test procedure \"tests/smoke\": its reference is stale")
             .is_some()
     );
 }
@@ -2379,7 +2379,7 @@ fn clicking_validate_refreshes_an_already_open_requirement_viewer() {
     assert!(harness.query_by_label("Unvalidated").is_none());
     assert!(
         harness
-            .query_by_label_contains("Test \"tests/smoke\": its reference is stale")
+            .query_by_label_contains("Test procedure \"tests/smoke\": its reference is stale")
             .is_some()
     );
     // Still the same viewer, not bounced back to some other screen.
@@ -2485,7 +2485,7 @@ fn the_update_stale_references_button_appears_only_for_a_stale_reference_and_fix
     assert!(harness.query_by_label("Unmet").is_some());
     assert!(
         harness
-            .query_by_label_contains("Test \"tests/smoke\": its reference is stale")
+            .query_by_label_contains("Test procedure \"tests/smoke\": its reference is stale")
             .is_none()
     );
     assert!(
@@ -3628,16 +3628,16 @@ fn requirement_form_test_reference_composer_pick_auto_populates_the_commit() {
         .click();
     harness.step();
 
-    // The composer's fields stay hidden until "Add test reference" is
+    // The composer's fields stay hidden until "Add test procedure" is
     // clicked once to reveal them.
     harness
-        .get_by_role_and_label(Role::Button, "Add test reference")
+        .get_by_role_and_label(Role::Button, "Add test procedure")
         .click_accesskit();
     harness.step();
     harness.step();
 
     harness
-        .get_by_role_and_label(Role::Label, "Add Test Reference")
+        .get_by_role_and_label(Role::Label, "Add Test Procedure")
         .parent()
         .expect("test reference composer modal container not found")
         .get_all_by_role_and_label(Role::Button, "Pick…")
@@ -3661,7 +3661,7 @@ fn requirement_form_test_reference_composer_pick_auto_populates_the_commit() {
     // test above, exercising `TestRefSlot::New` through
     // `test_ref_commit_auto_clicked` instead.
     wait_until(&mut harness, |h| {
-        h.get_by_role_and_label(Role::Label, "Add Test Reference")
+        h.get_by_role_and_label(Role::Label, "Add Test Procedure")
             .parent()
             .expect("test reference composer modal container not found")
             .get_all_by_role(Role::TextInput)
@@ -3784,7 +3784,7 @@ fn adding_a_local_attachment_to_an_existing_requirement_appears_in_the_list() {
     // until "Add dependency" is clicked, so they don't appear here), then
     // — "integration" also has two real test references (`tests/smoke`,
     // `tests/contract` — see `requirement.ron`) — their own path(6)/
-    // commit(7) and path(8)/commit(9) fields (the "Add test reference"
+    // commit(7) and path(8)/commit(9) fields (the "Add test procedure"
     // composer's fields are likewise hidden by default), then — since
     // this form is in edit mode — the local-attachment path field(10).
     // Fragile to reordering singleline fields specifically, which is why
@@ -3839,7 +3839,7 @@ fn opening_a_project_defaults_to_the_root_view_page() {
         h.query_by_label("Requirements: 4").is_some()
     });
     assert!(harness.query_by_label("Submodules: 3").is_some());
-    assert!(harness.query_by_label("Tests: 4").is_some());
+    assert!(harness.query_by_label("Test Procedures: 4").is_some());
     assert!(harness.query_by_label("Results: 4").is_some());
     assert!(
         harness
@@ -4070,7 +4070,7 @@ fn result_form_test_path_picker_fills_the_field() {
 
     assert!(
         harness
-            .query_by_role_and_label(Role::Label, "Pick a test")
+            .query_by_role_and_label(Role::Label, "Pick a test procedure")
             .is_some()
     );
 
@@ -4195,7 +4195,7 @@ fn editing_an_existing_test_can_add_a_local_attachment_and_template_file() {
 
     // Same bare-name reasoning as the result leaf above — only
     // requirements carry a status glyph.
-    open_leaf_for_editing(&mut harness, "smoke", "Edit Test");
+    open_leaf_for_editing(&mut harness, "smoke", "Edit Test Procedure");
 
     // Field order among `Role::TextInput` nodes in edit mode: the status
     // bar's own zoom field(0) and the left pane's own filter field(1) —

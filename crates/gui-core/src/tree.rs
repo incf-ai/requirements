@@ -18,6 +18,12 @@ fn draft_ref(state: &ProjectState) -> &ProjectDraft {
     }
 }
 
+/// `Command::FindReferences`'s read handler — see that command's own doc
+/// comment.
+pub(crate) fn find_references(state: &ProjectState, target: &logical::ReferenceTarget) -> Outcome {
+    Outcome::FindReferences(logical::find_references(draft_ref(state), target))
+}
+
 pub(crate) fn resolve_module<'a>(root: &'a ModuleDraft, path: &[EntryName]) -> Option<&'a ModuleDraft> {
     let mut current = root;
     for name in path {

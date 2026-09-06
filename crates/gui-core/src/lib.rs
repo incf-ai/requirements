@@ -25,6 +25,9 @@ pub use logical::LogicalPath;
 pub use logical::AddPoolFileError;
 pub use logical::draft::{RequirementDraft, ResultDraft, TestDraft};
 pub use logical::{RequirementResult, TestUnmetReason, UnmetReason, UnsatisfiedTest, resolve_reference_path};
+pub use logical::{
+    ReferenceAction, ReferenceRepairError, ReferenceSite, ReferenceSiteKind, ReferenceTarget,
+};
 
 use std::path::PathBuf;
 
@@ -191,6 +194,15 @@ pub enum Command {
     RenameModule {
         target: Vec<EntryName>,
         new_name: EntryName,
+        /// The user's chosen `ReferenceAction` for each broken reference
+        /// `FindReferences` reported before the rename was confirmed —
+        /// empty when there were none, which is the common case and keeps
+        /// the pre-repair rename behavior unchanged. Applied via
+        /// `logical::apply_reference_actions` against `target` (as a
+        /// `ReferenceTarget::Module`, so it catches references into any
+        /// descendant too) → the renamed path, immediately after the
+        /// module's key swap succeeds.
+        reference_actions: Vec<(ReferenceSite, ReferenceAction)>,
         request: RequestId,
     },
     /// The project-root counterpart to `RenameModule` — the root has no
@@ -353,6 +365,34 @@ pub enum Command {
         message: String,
         request: RequestId,
     },
+    /// Every reference in the project that would break if `target` were
+    /// renamed or removed — the read `gui-ui` fires before sending a
+    /// destructive `RemoveRequirement`/`RemoveTest`/`RenameModule`, to
+    /// decide whether to show the broken-references modal at all (empty
+    /// result skips it). Read-only: never touches `mutation_in_flight`,
+    /// same as `GetEntryDetail` and friends.
+    FindReferences {
+        target: ReferenceTarget,
+        request: RequestId,
+    },
+    /// Applies the user's chosen `ReferenceAction` for each broken
+    /// reference found by a prior `FindReferences`, against a requirement/
+    /// test that has just been recreated under a new name (module rename
+    /// applies its own `reference_actions` inline as part of
+    /// `Command::RenameModule` instead, since a module rename is already a
+    /// single atomic key-swap — this command exists for the requirement/
+    /// test recreate flow, which is already two round trips: `Remove*` then
+    /// `Add*`, with this as the third step once the new path exists to
+    /// repair references onto).
+    RepairReferences {
+        old_target: ReferenceTarget,
+        /// `None` for a plain removal with no replacement (`Repair`
+        /// actions are then invalid — see `ReferenceRepairError::
+        /// RepairWithoutNewTarget`); `Some` for a rename/recreate.
+        new_target: Option<ReferenceTarget>,
+        actions: Vec<(ReferenceSite, ReferenceAction)>,
+        request: RequestId,
+    },
 
     Shutdown,
 }
@@ -417,6 +457,8 @@ pub enum Outcome {
     ResolveRemoteCommit(Result<String, syscalls::CommitForRemoteError>),
     GetChangedFiles(Result<Vec<PathBuf>, GetChangedFilesError>),
     CommitAll(Result<(), CommitAllError>),
+    FindReferences(Vec<ReferenceSite>),
+    RepairReferences(Result<(), ReferenceRepairError>),
     /// A command that needs a loaded project arrived when `state` is
     /// `None` (no `LoadProject` has ever succeeded, or the current
     /// project failed to load).
@@ -434,6 +476,14 @@ pub enum ResolveLocalCommitError {
     NoProjectPath,
     #[error(transparent)]
     Commit(#[from] syscalls::CommitForPathError),
+}
+
+impl ResolveLocalCommitError {
+    /// Same "not an error, just not committed yet" case as
+    /// `syscalls::CommitForPathError::is_not_tracked`.
+    pub fn is_not_tracked(&self) -> bool {
+        matches!(self, ResolveLocalCommitError::Commit(e) if e.is_not_tracked())
+    }
 }
 
 /// `GetChangedFiles`'s own error type — same "no project on disk yet"
@@ -555,6 +605,8 @@ pub enum RenameModuleError {
     NotFound,
     #[error(transparent)]
     Add(#[from] AddNamedChildError),
+    #[error(transparent)]
+    ReferenceRepair(#[from] ReferenceRepairError),
 }
 
 /// `rename_project`'s own error type — much narrower than

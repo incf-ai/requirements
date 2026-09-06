@@ -10,7 +10,7 @@ use syscalls::{Filesystem, Git, RemoteGit};
 use tokio::sync::mpsc;
 
 use crate::tree::{
-    build_tree_snapshot, dependency_chain, get_entry_detail, get_module_pools, get_module_summary,
+    build_tree_snapshot, dependency_chain, find_references, get_entry_detail, get_module_pools, get_module_summary,
     get_requirement_met_status, resolve_module_mut,
 };
 use crate::{
@@ -253,8 +253,9 @@ where
             Command::RenameModule {
                 target,
                 new_name,
+                reference_actions,
                 request,
-            } => self.rename_module(target, new_name, request),
+            } => self.rename_module(target, new_name, reference_actions, request),
             Command::RenameProject { new_name, request } => self.rename_project(new_name, request),
             Command::AddAttachment { module, path, request } => self.add_attachment(module, path, request),
             Command::RemoveAttachment { module, path, request } => self.remove_attachment(module, path, request),
@@ -301,6 +302,15 @@ where
             Command::ResolveRemoteCommit { url, path, request } => self.spawn_resolve_remote_commit(url, path, request),
             Command::GetChangedFiles { request } => self.spawn_get_changed_files(request),
             Command::CommitAll { message, request } => self.spawn_commit_all(message, request),
+            Command::FindReferences { target, request } => {
+                self.spawn_read(request, move |state| find_references(&state, &target))
+            }
+            Command::RepairReferences {
+                old_target,
+                new_target,
+                actions,
+                request,
+            } => self.repair_references(old_target, new_target, actions, request),
             Command::Shutdown => unreachable!("handled in run_actor's select! before dispatch is called"),
         }
     }
@@ -769,28 +779,95 @@ where
     /// logic — a throwaway blank module gets created there and then
     /// immediately overwritten with the real (renamed-from) content, so
     /// `add_module`'s own checks are what actually gate the rename.
-    fn rename_module(&mut self, target: Vec<disk::EntryName>, new_name: disk::EntryName, request: RequestId) {
+    /// Unlike every other `RenameModule` step above `mutate_module`
+    /// couldn't be reused here: once the rename itself succeeds,
+    /// `reference_actions` needs to repair references that can live
+    /// *anywhere* in the tree (not just within the renamed module's own
+    /// subtree), which needs `&mut ProjectDraft` — `mutate_module` only
+    /// ever hands its closure `&mut ModuleDraft` for the resolved target.
+    /// So this resolves the parent module itself, directly against
+    /// `draft.tree`.
+    fn rename_module(
+        &mut self,
+        target: Vec<disk::EntryName>,
+        new_name: disk::EntryName,
+        reference_actions: Vec<(logical::ReferenceSite, logical::ReferenceAction)>,
+        request: RequestId,
+    ) {
         let Some((old_name, parent_path)) = target.split_last() else {
             self.complete(request, Outcome::RenameModule(Err(RenameModuleError::CannotRenameRoot)));
             return;
         };
         let old_name = old_name.clone();
-        self.mutate_module(
-            request,
-            parent_path,
-            || Outcome::RenameModule(Err(RenameModuleError::ModuleNotFound)),
-            move |parent| {
+        let parent_path = parent_path.to_vec();
+        let old_path = target.clone();
+        let mut new_path = parent_path.clone();
+        new_path.push(new_name.clone());
+
+        if self.state.is_none() {
+            self.complete(request, Outcome::NoProjectLoaded);
+            return;
+        }
+        self.push_undo_snapshot();
+        self.ensure_draft();
+        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
+            unreachable!("ensure_draft leaves state as Draft")
+        };
+
+        let rename_result = match resolve_module_mut(&mut draft.tree, &parent_path) {
+            None => Err(RenameModuleError::ModuleNotFound),
+            Some(parent) => {
                 if !parent.modules.contains_key(&old_name) {
-                    return Outcome::RenameModule(Err(RenameModuleError::NotFound));
+                    Err(RenameModuleError::NotFound)
+                } else if let Err(err) = parent.add_module(new_name.as_str()) {
+                    Err(RenameModuleError::Add(err))
+                } else {
+                    let renamed = parent.modules.remove(&old_name).expect("just confirmed present above");
+                    parent.modules.insert(new_name.clone(), renamed);
+                    Ok(())
                 }
-                if let Err(err) = parent.add_module(new_name.as_str()) {
-                    return Outcome::RenameModule(Err(RenameModuleError::Add(err)));
-                }
-                let renamed = parent.modules.remove(&old_name).expect("just confirmed present above");
-                parent.modules.insert(new_name, renamed);
-                Outcome::RenameModule(Ok(()))
-            },
-        );
+            }
+        };
+
+        let outcome = match rename_result {
+            Ok(()) if !reference_actions.is_empty() => {
+                let old_target = logical::ReferenceTarget::Module(old_path);
+                let new_target = logical::ReferenceTarget::Module(new_path);
+                logical::apply_reference_actions(draft, &old_target, Some(&new_target), &reference_actions)
+                    .map_err(RenameModuleError::ReferenceRepair)
+            }
+            other => other,
+        };
+        self.complete(request, Outcome::RenameModule(outcome));
+        self.push_tree_changed();
+    }
+
+    /// `RepairReferences`'s handler — applies `actions` (a prior
+    /// `FindReferences`'s per-site user choices) to `old_target`/
+    /// `new_target`, for the requirement/test recreate flow: `gui-ui`
+    /// sends this as a third step once `RemoveRequirement`/`RemoveTest`
+    /// then `AddRequirement`/`AddTest` have both already succeeded, so the
+    /// new path already exists to repair `Repair` actions onto. Doesn't
+    /// push its own undo snapshot — it's always part of a larger rename/
+    /// recreate sequence `gui-ui` already snapshotted around.
+    fn repair_references(
+        &mut self,
+        old_target: logical::ReferenceTarget,
+        new_target: Option<logical::ReferenceTarget>,
+        actions: Vec<(logical::ReferenceSite, logical::ReferenceAction)>,
+        request: RequestId,
+    ) {
+        if self.state.is_none() {
+            self.complete(request, Outcome::NoProjectLoaded);
+            return;
+        }
+        self.ensure_draft();
+        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
+            unreachable!("ensure_draft leaves state as Draft")
+        };
+        let result = logical::apply_reference_actions(draft, &old_target, new_target.as_ref(), &actions);
+        self.complete(request, Outcome::RepairReferences(result));
+        self.push_tree_changed();
     }
 
     /// `RenameModule`'s root-only counterpart — see `Command::RenameProject`'s
@@ -1323,7 +1400,7 @@ fn entry_directory(project_path: &Path, target: &LogicalPath, kind: EntryKind) -
 mod test {
     use std::path::{Path, PathBuf};
 
-    use disk::{EntryName, LocalGitReference, ReferencePath, TestReferenceKind};
+    use disk::{DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, TestReferenceKind};
     use logical::LogicalPath;
     use logical::draft::RequirementDraft;
     use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, StdFilesystem};
@@ -3207,6 +3284,7 @@ mod test {
             .send(Command::RenameModule {
                 target: vec![entry_name("beta")],
                 new_name: entry_name("renamed_setup"),
+                reference_actions: Vec::new(),
                 request: 3,
             })
             .unwrap();
@@ -3254,6 +3332,7 @@ mod test {
             .send(Command::RenameModule {
                 target: vec![],
                 new_name: entry_name("whatever"),
+                reference_actions: Vec::new(),
                 request: 2,
             })
             .unwrap();
@@ -3288,6 +3367,7 @@ mod test {
             .send(Command::RenameModule {
                 target: vec![entry_name("beta")],
                 new_name: entry_name("another_module"),
+                reference_actions: Vec::new(),
                 request: 3,
             })
             .unwrap();
@@ -3323,12 +3403,317 @@ mod test {
             .send(Command::RenameModule {
                 target: vec![entry_name("does_not_exist")],
                 new_name: entry_name("whatever"),
+                reference_actions: Vec::new(),
                 request: 2,
             })
             .unwrap();
         assert!(matches!(
             recv_completed(&mut events, 2).await,
             Outcome::RenameModule(Err(RenameModuleError::NotFound))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_module_with_reference_actions_repairs_a_descendant_reference() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        // "beta" is a real submodule; put a requirement inside it that
+        // the rename must be able to reach (module rename's "include
+        // descendants" scope — see `reference_repair.rs`'s
+        // `ReferenceTarget::Module` doc comment).
+        commands
+            .send(add_requirement_command(vec![entry_name("beta")], "inner", "Inner", 2))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
+
+        commands
+            .send(add_requirement_command(vec![], "outer", "Outer", 3))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::AddRequirement(Ok(()))));
+
+        let mut dependent = RequirementDraft::new("Outer");
+        dependent.requirement_text = "Text".to_string();
+        dependent.dependencies.push(DependencyReferenceKind::RequirementReferenceV1(LocalGitReference {
+            path: ReferencePath("/modules/beta/requirements/inner".to_string()),
+            commit: "deadbeef".to_string(),
+        }));
+        commands
+            .send(Command::UpdateRequirement {
+                target: LogicalPath::root(entry_name("outer")),
+                requirement: Box::new(dependent),
+                request: 4,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 4).await, Outcome::UpdateRequirement(Ok(()))));
+
+        let site = logical::ReferenceSite {
+            referrer: LogicalPath::root(entry_name("outer")),
+            kind: logical::ReferenceSiteKind::RequirementDependency { index: 0 },
+        };
+        commands
+            .send(Command::RenameModule {
+                target: vec![entry_name("beta")],
+                new_name: entry_name("renamed_setup"),
+                reference_actions: vec![(site, logical::ReferenceAction::Repair)],
+                request: 5,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 5).await, Outcome::RenameModule(Ok(()))));
+
+        commands
+            .send(Command::GetEntryDetail {
+                target: LogicalPath::root(entry_name("outer")),
+                kind: EntryKind::Requirement,
+                request: 6,
+            })
+            .unwrap();
+        match recv_completed(&mut events, 6).await {
+            Outcome::EntryDetail(Some(EntryDetail::Requirement { dependencies, .. })) => {
+                assert!(matches!(
+                    dependencies.as_slice(),
+                    [DependencyReferenceKind::RequirementReferenceV1(local)]
+                        if local.path.0 == "/modules/renamed_setup/requirements/inner"
+                ));
+            }
+            other => panic!("expected EntryDetail(Some(Requirement)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn find_references_without_a_loaded_project_reports_no_project_loaded() {
+        let (commands, mut events) = spawn_test_actor();
+        commands
+            .send(Command::FindReferences {
+                target: logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("design"))),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::NoProjectLoaded));
+    }
+
+    #[tokio::test]
+    async fn find_references_returns_the_dependency_referencing_it() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(add_requirement_command(vec![], "base", "Base", 2))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
+
+        commands
+            .send(add_requirement_command(vec![], "dependent", "Dependent", 3))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::AddRequirement(Ok(()))));
+
+        let mut dependent = RequirementDraft::new("Dependent");
+        dependent.requirement_text = "Text".to_string();
+        dependent.dependencies.push(DependencyReferenceKind::RequirementReferenceV1(LocalGitReference {
+            path: ReferencePath("/requirements/base".to_string()),
+            commit: "deadbeef".to_string(),
+        }));
+        commands
+            .send(Command::UpdateRequirement {
+                target: LogicalPath::root(entry_name("dependent")),
+                requirement: Box::new(dependent),
+                request: 4,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 4).await, Outcome::UpdateRequirement(Ok(()))));
+
+        commands
+            .send(Command::FindReferences {
+                target: logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("base"))),
+                request: 5,
+            })
+            .unwrap();
+        match recv_completed(&mut events, 5).await {
+            Outcome::FindReferences(sites) => {
+                assert_eq!(
+                    sites,
+                    vec![logical::ReferenceSite {
+                        referrer: LogicalPath::root(entry_name("dependent")),
+                        kind: logical::ReferenceSiteKind::RequirementDependency { index: 0 },
+                    }]
+                );
+            }
+            other => panic!("expected FindReferences, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn find_references_with_no_referrers_is_empty() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(add_requirement_command(vec![], "lonely", "Lonely", 2))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
+
+        commands
+            .send(Command::FindReferences {
+                target: logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("lonely"))),
+                request: 3,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::FindReferences(sites) if sites.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn repair_references_without_a_loaded_project_reports_no_project_loaded() {
+        let (commands, mut events) = spawn_test_actor();
+        commands
+            .send(Command::RepairReferences {
+                old_target: logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("base"))),
+                new_target: Some(logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("renamed")))),
+                actions: Vec::new(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::NoProjectLoaded));
+    }
+
+    #[tokio::test]
+    async fn repair_references_repairs_a_requirement_dependency_onto_the_new_target() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(add_requirement_command(vec![], "base", "Base", 2))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
+
+        commands
+            .send(add_requirement_command(vec![], "renamed", "Renamed", 3))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::AddRequirement(Ok(()))));
+
+        commands
+            .send(add_requirement_command(vec![], "dependent", "Dependent", 4))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 4).await, Outcome::AddRequirement(Ok(()))));
+
+        let mut dependent = RequirementDraft::new("Dependent");
+        dependent.requirement_text = "Text".to_string();
+        dependent.dependencies.push(DependencyReferenceKind::RequirementReferenceV1(LocalGitReference {
+            path: ReferencePath("/requirements/base".to_string()),
+            commit: "deadbeef".to_string(),
+        }));
+        commands
+            .send(Command::UpdateRequirement {
+                target: LogicalPath::root(entry_name("dependent")),
+                requirement: Box::new(dependent),
+                request: 5,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 5).await, Outcome::UpdateRequirement(Ok(()))));
+
+        let site = logical::ReferenceSite {
+            referrer: LogicalPath::root(entry_name("dependent")),
+            kind: logical::ReferenceSiteKind::RequirementDependency { index: 0 },
+        };
+        commands
+            .send(Command::RepairReferences {
+                old_target: logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("base"))),
+                new_target: Some(logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("renamed")))),
+                actions: vec![(site, logical::ReferenceAction::Repair)],
+                request: 6,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 6).await, Outcome::RepairReferences(Ok(()))));
+
+        commands
+            .send(Command::GetEntryDetail {
+                target: LogicalPath::root(entry_name("dependent")),
+                kind: EntryKind::Requirement,
+                request: 7,
+            })
+            .unwrap();
+        match recv_completed(&mut events, 7).await {
+            Outcome::EntryDetail(Some(EntryDetail::Requirement { dependencies, .. })) => {
+                assert!(matches!(
+                    dependencies.as_slice(),
+                    [DependencyReferenceKind::RequirementReferenceV1(local)]
+                        if local.path.0 == "/requirements/renamed"
+                ));
+            }
+            other => panic!("expected EntryDetail(Some(Requirement)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_references_with_repair_action_but_no_new_target_reports_the_error() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        let mut referrer = RequirementDraft::new("Base");
+        referrer.requirement_text = "Text".to_string();
+        referrer.dependencies.push(DependencyReferenceKind::RequirementReferenceV1(LocalGitReference {
+            path: ReferencePath("/requirements/base".to_string()),
+            commit: "deadbeef".to_string(),
+        }));
+        commands
+            .send(Command::AddRequirement {
+                module: Vec::new(),
+                name: entry_name("base"),
+                requirement: Box::new(referrer),
+                request: 2,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
+
+        let site = logical::ReferenceSite {
+            referrer: LogicalPath::root(entry_name("base")),
+            kind: logical::ReferenceSiteKind::RequirementDependency { index: 0 },
+        };
+        commands
+            .send(Command::RepairReferences {
+                old_target: logical::ReferenceTarget::Requirement(LogicalPath::root(entry_name("base"))),
+                new_target: None,
+                actions: vec![(site, logical::ReferenceAction::Repair)],
+                request: 3,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 3).await,
+            Outcome::RepairReferences(Err(logical::ReferenceRepairError::RepairWithoutNewTarget))
         ));
     }
 

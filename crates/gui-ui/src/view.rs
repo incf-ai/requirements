@@ -6,8 +6,9 @@
 use std::path::PathBuf;
 
 use gui_core::{
-    EntryKind, EntryName, EntryStatus, LogicalPath, ReferencePath, RequirementMetStatus,
-    ResultKindV1, TestUnmetReason, TreeNode, TreeSnapshot, UnmetReason,
+    EntryKind, EntryName, EntryStatus, LogicalPath, ReferenceAction, ReferenceSiteKind,
+    ReferencePath, RequirementMetStatus, ResultKindV1, TestUnmetReason, TreeNode, TreeSnapshot,
+    UnmetReason,
 };
 
 use crate::{
@@ -16,6 +17,17 @@ use crate::{
     TestRefSlot, ThemeChoice, ValidateBeforeSaveDialogState, absolute_reference_path,
     flatten_leaf_paths, icons, leaf_kind_segment, theme_colors,
 };
+
+/// A short label for a `ReferenceSiteKind`, for the broken-references
+/// modal's rows — see `GuiApp::render_broken_references_dialog`.
+fn reference_site_kind_label(kind: ReferenceSiteKind) -> &'static str {
+    match kind {
+        ReferenceSiteKind::RequirementTestReference { .. } => "test procedure",
+        ReferenceSiteKind::RequirementDependency { .. } => "dependency",
+        ReferenceSiteKind::ResultRequirementRef => "result's requirement reference",
+        ReferenceSiteKind::ResultTestRef => "result's test procedure",
+    }
+}
 
 /// Pops a native OS folder picker (`rfd`) titled `title` — blocking, but
 /// bounded by the user's own interaction with it, not by anything
@@ -68,6 +80,20 @@ fn icon_text_button(ui: &mut egui::Ui, enabled: bool, icon: &str, label: &str) -
 /// `render_requirement_form`'s own `&mut self.editor` borrow, where
 /// calling back out to a `&self`/`&mut self` method isn't available (same
 /// reason `render_dependency_fields` etc. are free functions too).
+/// A read-only text/guidance field: its label is always drawn, but the
+/// `Frame::group` around the content is only drawn when there's content to
+/// set off — an empty field would otherwise show as a frame around nothing.
+fn render_grouped_text(ui: &mut egui::Ui, label: &str, text: &str) {
+    ui.label(label);
+    if text.is_empty() {
+        ui.label(text);
+    } else {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(text);
+        });
+    }
+}
+
 fn render_requirement_status(ui: &mut egui::Ui, status: &RequirementMetStatus) {
     let (entry_status, label) = match status {
         RequirementMetStatus::Unvalidated => (EntryStatus::Unvalidated, "Unvalidated"),
@@ -99,7 +125,7 @@ fn render_requirement_status(ui: &mut egui::Ui, status: &RequirementMetStatus) {
 fn describe_unmet_reason(reason: &UnmetReason) -> Vec<String> {
     match reason {
         UnmetReason::UnknownRequirement => vec!["This requirement could not be found.".to_string()],
-        UnmetReason::NoTests => vec!["It has no tests.".to_string()],
+        UnmetReason::NoTests => vec!["It has no test procedures.".to_string()],
         UnmetReason::NotYetSaved => {
             vec!["It hasn't been saved yet, so there's no known commit to check.".to_string()]
         }
@@ -108,15 +134,17 @@ fn describe_unmet_reason(reason: &UnmetReason) -> Vec<String> {
             .map(|unsatisfied| {
                 let why = match unsatisfied.reason {
                     TestUnmetReason::UnresolvedReference => {
-                        "its reference doesn't resolve to a real test"
+                        "its reference doesn't resolve to a real test procedure"
                     }
-                    TestUnmetReason::TestNotYetSaved => "the test hasn't been saved yet",
+                    TestUnmetReason::TestNotYetSaved => {
+                        "the test procedure hasn't been saved yet"
+                    }
                     TestUnmetReason::StaleReference => {
-                        "its reference is stale (pointing at an old commit of the test)"
+                        "its reference is stale (pointing at an old commit of the test procedure)"
                     }
                     TestUnmetReason::NoPassingResult => "no current, passing result exists for it",
                 };
-                format!("Test \"{}\": {why}.", unsatisfied.test)
+                format!("Test procedure \"{}\": {why}.", unsatisfied.test)
             })
             .collect(),
     }
@@ -430,7 +458,7 @@ impl GuiApp {
                         self.new_requirement_clicked();
                     }
                 }
-                if icon_button(ui, true, icons::NEW_TEST, "New Test").clicked() {
+                if icon_button(ui, true, icons::NEW_TEST, "New Test Procedure").clicked() {
                     if self.editor_has_unsaved_edits() {
                         self.unsaved_form_dialog_opened(PendingNavigation::NewTest);
                     } else {
@@ -678,7 +706,16 @@ impl GuiApp {
                                     {
                                         self.select_module(Vec::new());
                                     }
-                                    ui.strong(root.name.as_str());
+                                    let mut root_text =
+                                        egui::RichText::new(root.name.as_str()).strong();
+                                    if is_root_current {
+                                        root_text = root_text.color(
+                                            theme_colors::module_current_color(
+                                                ui.visuals().dark_mode,
+                                            ),
+                                        );
+                                    }
+                                    ui.label(root_text);
                                 });
                                 render_module_children(self, ui, &root.children, &[], force_open);
                             });
@@ -867,7 +904,7 @@ impl GuiApp {
                 let editing = form.editing_target.is_some();
                 let read_only = form.read_only;
                 ui.horizontal(|ui| {
-                    ui.label("Name:");
+                    ui.label("Identifier:");
                     if read_only {
                         ui.label(&form.name);
                     } else {
@@ -896,12 +933,9 @@ impl GuiApp {
                         ui.label("Title:");
                         ui.label(&form.title);
                     });
-                    ui.label("Requirement text:");
-                    ui.label(&form.requirement_text);
-                    ui.label("Requirement guidance:");
-                    ui.label(&form.requirement_guidance);
-                    ui.label("Test guidance:");
-                    ui.label(&form.test_guidance);
+                    render_grouped_text(ui, "Requirement text:", &form.requirement_text);
+                    render_grouped_text(ui, "Requirement guidance:", &form.requirement_guidance);
+                    render_grouped_text(ui, "Test procedure guidance:", &form.test_guidance);
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
@@ -936,7 +970,7 @@ impl GuiApp {
                     {
                         form.edited = true;
                     }
-                    ui.label("Test guidance:");
+                    ui.label("Test procedure guidance:");
                     if resizable_multiline(
                         ui,
                         &format!("test_guidance:{entry_id}"),
@@ -989,7 +1023,7 @@ impl GuiApp {
                             ui.label(dep.to_string());
                         }
                     } else {
-                        dependency_edited |= render_dependency_kind_picker(ui, dep);
+                        dependency_edited |= render_dependency_kind_dropdown(ui, i, dep);
                         let (changed, auto, pick_clicked) =
                             render_dependency_fields(ui, dep, self.tree.as_ref());
                         dependency_edited |= changed;
@@ -1066,7 +1100,7 @@ impl GuiApp {
                 // requiring the entry to already exist.
                 ui.separator();
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label("Test references:");
+                ui.label("Test procedures:");
                 let mut remove_test_ref: Option<usize> = None;
                 let mut test_ref_edited = false;
                 for (i, test_ref) in form.tests.iter_mut().enumerate() {
@@ -1115,7 +1149,7 @@ impl GuiApp {
                         egui::Modal::new(egui::Id::new("add_test_reference_dialog")).show(
                             ui.ctx(),
                             |ui| {
-                                ui.heading("Add Test Reference");
+                                ui.heading("Add Test Procedure");
                                 let (_, auto, pick_clicked) = render_test_ref_fields(
                                     ui,
                                     &mut form.new_test_ref,
@@ -1128,7 +1162,7 @@ impl GuiApp {
                                     pick_test_ref_path_clicked = Some(TestRefSlot::New);
                                 }
                                 ui.horizontal(|ui| {
-                                    if ui.button("Add test reference").clicked() {
+                                    if ui.button("Add test procedure").clicked() {
                                         form.tests.push(form.new_test_ref.clone());
                                         let new_index = form.tests.len() - 1;
                                         // Auto-populate the new row's commit
@@ -1165,7 +1199,7 @@ impl GuiApp {
                                 });
                             },
                         );
-                    } else if ui.button("Add test reference").clicked() {
+                    } else if ui.button("Add test procedure").clicked() {
                         form.adding_test_ref = true;
                     }
                 }
@@ -1288,11 +1322,11 @@ impl GuiApp {
             let read_only = form.read_only;
             ui.horizontal(|ui| {
                 ui.heading(if read_only {
-                    "Test"
+                    "Test Procedure"
                 } else if editing {
-                    "Edit Test"
+                    "Edit Test Procedure"
                 } else {
-                    "New Test"
+                    "New Test Procedure"
                 });
                 if read_only {
                     if ui.button("Edit").clicked() {
@@ -1337,7 +1371,7 @@ impl GuiApp {
                 let editing = form.editing_target.is_some();
                 let read_only = form.read_only;
                 ui.horizontal(|ui| {
-                    ui.label("Name:");
+                    ui.label("Identifier:");
                     if read_only {
                         ui.label(&form.name);
                     } else if ui
@@ -1352,8 +1386,7 @@ impl GuiApp {
                         ui.label("Title:");
                         ui.label(&form.title);
                     });
-                    ui.label("Test text:");
-                    ui.label(&form.test_text);
+                    render_grouped_text(ui, "Test procedure text:", &form.test_text);
                     ui.horizontal(|ui| {
                         ui.label("Result kind:");
                         ui.label(match form.result_kind {
@@ -1371,7 +1404,7 @@ impl GuiApp {
                     // See the Requirement form's own comment on `entry_id` —
                     // same reasoning, for this test's `resizable_multiline`.
                     let entry_id = entry_id_salt(&form.editing_target);
-                    ui.label("Test text:");
+                    ui.label("Test procedure text:");
                     if resizable_multiline(ui, &format!("test_text:{entry_id}"), &mut form.test_text)
                         .changed()
                     {
@@ -1538,7 +1571,7 @@ impl GuiApp {
                 let editing = form.editing_target.is_some();
                 let read_only = form.read_only;
                 ui.horizontal(|ui| {
-                    ui.label("Name:");
+                    ui.label("Identifier:");
                     if read_only {
                         ui.label(&form.name);
                     } else if ui
@@ -1562,11 +1595,11 @@ impl GuiApp {
                         ui.label(&form.requirement_commit);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Test path:");
+                        ui.label("Test procedure path:");
                         ui.label(&form.test_path);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Test commit:");
+                        ui.label("Test procedure commit:");
                         ui.label(&form.test_commit);
                     });
                 } else {
@@ -1611,7 +1644,7 @@ impl GuiApp {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Test path:");
+                        ui.label("Test procedure path:");
                         if ui.text_edit_singleline(&mut form.test_path).changed() {
                             form.edited = true;
                         }
@@ -1620,7 +1653,7 @@ impl GuiApp {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Test commit:");
+                        ui.label("Test procedure commit:");
                         if ui.text_edit_singleline(&mut form.test_commit).changed() {
                             form.edited = true;
                         }
@@ -1689,7 +1722,7 @@ impl GuiApp {
             };
             ui.heading("New Module");
             ui.horizontal(|ui| {
-                ui.label("Name:");
+                ui.label("Identifier:");
                 ui.text_edit_singleline(&mut form.name);
             });
             if let Some(error) = &form.error {
@@ -1772,7 +1805,7 @@ impl GuiApp {
                         Some(summary) => {
                             ui.label(format!("Submodules: {}", summary.submodule_count));
                             ui.label(format!("Requirements: {}", summary.requirement_count));
-                            ui.label(format!("Tests: {}", summary.test_count));
+                            ui.label(format!("Test Procedures: {}", summary.test_count));
                             ui.label(format!("Results: {}", summary.result_count));
                             ui.separator();
                             if summary.validated {
@@ -1809,7 +1842,7 @@ impl GuiApp {
                     }
                 } else {
                     ui.horizontal(|ui| {
-                        ui.label("Name:");
+                        ui.label("Identifier:");
                         if ui.text_edit_singleline(&mut form.new_name).changed() {
                             form.edited = true;
                         }
@@ -1844,7 +1877,7 @@ impl GuiApp {
         egui::Modal::new(egui::Id::new("new_project_dialog")).show(ui.ctx(), |ui| {
             ui.heading("New Project");
             ui.horizontal(|ui| {
-                ui.label("Name:");
+                ui.label("Identifier:");
                 ui.text_edit_singleline(&mut name);
             });
             ui.horizontal(|ui| {
@@ -2282,7 +2315,7 @@ impl GuiApp {
             };
             ui.heading(match dialog.kind {
                 EntryKind::Requirement => "Pick a requirement",
-                EntryKind::Test => "Pick a test",
+                EntryKind::Test => "Pick a test procedure",
                 EntryKind::Module | EntryKind::Result => {
                     unreachable!("no picker ever targets a module or result")
                 }
@@ -2407,9 +2440,11 @@ impl GuiApp {
         };
 
         let mut new_name = dialog.new_name;
+        let mut reference_choices = dialog.reference_choices;
         let mut confirmed = false;
         let mut cancelled = false;
         let busy = dialog.pending_request.is_some();
+        let button_label = if dialog.repairing { "Retry Repair" } else { "Recreate" };
         egui::Modal::new(egui::Id::new("recreate_requirement_dialog")).show(ui.ctx(), |ui| {
             ui.heading("Recreate Requirement");
             ui.label(format!(
@@ -2418,7 +2453,7 @@ impl GuiApp {
             ));
             ui.horizontal(|ui| {
                 ui.label("New name:");
-                ui.text_edit_singleline(&mut new_name);
+                ui.add_enabled(!dialog.deleted, egui::TextEdit::singleline(&mut new_name));
             });
             let text_empty = !dialog.deleted && dialog.requirement.requirement_text.trim().is_empty();
             if text_empty {
@@ -2426,6 +2461,30 @@ impl GuiApp {
                     egui::Color32::RED,
                     "Requirement text is empty — fix it before recreating.",
                 );
+            }
+            if !reference_choices.is_empty() {
+                ui.label(format!(
+                    "This will break {} reference{} into it. Choose how to handle each one:",
+                    reference_choices.len(),
+                    if reference_choices.len() == 1 { "" } else { "s" }
+                ));
+                egui::Grid::new("recreate_requirement_references_grid").striped(true).show(ui, |ui| {
+                    for (index, (site, action)) in reference_choices.iter_mut().enumerate() {
+                        ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(site.kind)));
+                        egui::ComboBox::new(("recreate_requirement_reference_action", index), "")
+                            .selected_text(match action {
+                                ReferenceAction::Repair => "Repair",
+                                ReferenceAction::Remove => "Remove",
+                                ReferenceAction::Ignore => "Ignore",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(action, ReferenceAction::Repair, "Repair");
+                                ui.selectable_value(action, ReferenceAction::Remove, "Remove");
+                                ui.selectable_value(action, ReferenceAction::Ignore, "Ignore");
+                            });
+                        ui.end_row();
+                    }
+                });
             }
             if let Some(error) = &dialog.error {
                 ui.colored_label(egui::Color32::RED, error);
@@ -2435,7 +2494,7 @@ impl GuiApp {
                 if ui
                     .add_enabled(
                         !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty,
-                        egui::Button::new("Recreate"),
+                        egui::Button::new(button_label),
                     )
                     .clicked()
                 {
@@ -2450,12 +2509,14 @@ impl GuiApp {
         if confirmed {
             if let Some(dialog) = &mut self.recreate_requirement_dialog {
                 dialog.new_name = new_name;
+                dialog.reference_choices = reference_choices;
             }
             self.recreate_requirement_confirmed();
         } else if cancelled {
             self.recreate_requirement_cancelled();
         } else if let Some(dialog) = &mut self.recreate_requirement_dialog {
             dialog.new_name = new_name;
+            dialog.reference_choices = reference_choices;
         }
     }
 
@@ -2465,22 +2526,51 @@ impl GuiApp {
         };
 
         let mut new_name = dialog.new_name;
+        let mut reference_choices = dialog.reference_choices;
         let mut confirmed = false;
         let mut cancelled = false;
         let busy = dialog.pending_request.is_some();
+        let button_label = if dialog.repairing { "Retry Repair" } else { "Recreate" };
         egui::Modal::new(egui::Id::new("recreate_test_dialog")).show(ui.ctx(), |ui| {
-            ui.heading("Recreate Test");
+            ui.heading("Recreate Test Procedure");
             ui.label(format!(
-                "This deletes \"{}\" and creates a new test with the same contents under a new stable name.",
+                "This deletes \"{}\" and creates a new test procedure with the same contents under a new stable name.",
                 dialog.target.name
             ));
             ui.horizontal(|ui| {
                 ui.label("New name:");
-                ui.text_edit_singleline(&mut new_name);
+                ui.add_enabled(!dialog.deleted, egui::TextEdit::singleline(&mut new_name));
             });
             let text_empty = !dialog.deleted && dialog.test.test_text.trim().is_empty();
             if text_empty {
-                ui.colored_label(egui::Color32::RED, "Test text is empty — fix it before recreating.");
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "Test procedure text is empty — fix it before recreating.",
+                );
+            }
+            if !reference_choices.is_empty() {
+                ui.label(format!(
+                    "This will break {} reference{} into it. Choose how to handle each one:",
+                    reference_choices.len(),
+                    if reference_choices.len() == 1 { "" } else { "s" }
+                ));
+                egui::Grid::new("recreate_test_references_grid").striped(true).show(ui, |ui| {
+                    for (index, (site, action)) in reference_choices.iter_mut().enumerate() {
+                        ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(site.kind)));
+                        egui::ComboBox::new(("recreate_test_reference_action", index), "")
+                            .selected_text(match action {
+                                ReferenceAction::Repair => "Repair",
+                                ReferenceAction::Remove => "Remove",
+                                ReferenceAction::Ignore => "Ignore",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(action, ReferenceAction::Repair, "Repair");
+                                ui.selectable_value(action, ReferenceAction::Remove, "Remove");
+                                ui.selectable_value(action, ReferenceAction::Ignore, "Ignore");
+                            });
+                        ui.end_row();
+                    }
+                });
             }
             if let Some(error) = &dialog.error {
                 ui.colored_label(egui::Color32::RED, error);
@@ -2490,7 +2580,7 @@ impl GuiApp {
                 if ui
                     .add_enabled(
                         !busy && !new_name.trim().is_empty() && !name_unchanged && !text_empty,
-                        egui::Button::new("Recreate"),
+                        egui::Button::new(button_label),
                     )
                     .clicked()
                 {
@@ -2505,12 +2595,78 @@ impl GuiApp {
         if confirmed {
             if let Some(dialog) = &mut self.recreate_test_dialog {
                 dialog.new_name = new_name;
+                dialog.reference_choices = reference_choices;
             }
             self.recreate_test_confirmed();
         } else if cancelled {
             self.recreate_test_cancelled();
         } else if let Some(dialog) = &mut self.recreate_test_dialog {
             dialog.new_name = new_name;
+            dialog.reference_choices = reference_choices;
+        }
+    }
+
+    /// The broken-references modal opened when a module rename's
+    /// `Command::FindReferences` pre-check finds sites that would break —
+    /// see `GuiApp::broken_references_dialog`'s own doc comment. One row per
+    /// `ReferenceSite`, a `Repair`/`Remove`/`Ignore` choice each (default
+    /// `Repair`), Confirm sends the rename with those choices attached.
+    pub(crate) fn render_broken_references_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.broken_references_dialog.clone() else {
+            return;
+        };
+
+        let mut choices = dialog.choices;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let busy = dialog.pending_request.is_some();
+        egui::Modal::new(egui::Id::new("broken_references_dialog")).show(ui.ctx(), |ui| {
+            ui.heading("Broken References");
+            ui.label(format!(
+                "Renaming this module to \"{}\" will break {} reference{} into it. Choose how to handle each one:",
+                dialog.new_name,
+                choices.len(),
+                if choices.len() == 1 { "" } else { "s" }
+            ));
+            egui::Grid::new("broken_references_grid").striped(true).show(ui, |ui| {
+                for (index, (site, action)) in choices.iter_mut().enumerate() {
+                    ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(site.kind)));
+                    egui::ComboBox::new(("broken_reference_action", index), "")
+                        .selected_text(match action {
+                            ReferenceAction::Repair => "Repair",
+                            ReferenceAction::Remove => "Remove",
+                            ReferenceAction::Ignore => "Ignore",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(action, ReferenceAction::Repair, "Repair");
+                            ui.selectable_value(action, ReferenceAction::Remove, "Remove");
+                            ui.selectable_value(action, ReferenceAction::Ignore, "Ignore");
+                        });
+                    ui.end_row();
+                }
+            });
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new("Confirm")).clicked() {
+                    confirmed = true;
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+        if confirmed {
+            if let Some(dialog) = &mut self.broken_references_dialog {
+                dialog.choices = choices;
+            }
+            self.broken_references_confirmed();
+        } else if cancelled {
+            self.broken_references_cancelled();
+        } else if let Some(dialog) = &mut self.broken_references_dialog {
+            dialog.choices = choices;
         }
     }
 
@@ -2530,7 +2686,10 @@ impl GuiApp {
                 ui.label("Local gui-ui state:");
                 ui.label(format!("pending: {}", self.pending.len()));
                 ui.label(format!("dirty: {}", self.dirty));
-                ui.label(format!("selection: {:?}", self.selection));
+                ui.label(format!(
+                    "selection: {:?} ({:?})",
+                    self.selection, self.selected_kind
+                ));
                 ui.label(format!("selected_module: {:?}", self.selected_module));
                 ui.label(format!("project_path: {:?}", self.project_path));
                 ui.label(format!(
@@ -2650,12 +2809,50 @@ fn render_tree_node(
                 app.select_module(this_module_path.clone());
             }
         }
-        egui::CollapsingHeader::new(node.name.as_str())
-            .default_open(false)
-            .open(force_open)
-            .show(ui, |ui| {
-                render_module_children(app, ui, &node.children, &this_module_path, force_open);
-            });
+        let has_submodules = node
+            .children
+            .iter()
+            .any(|child| child.kind == EntryKind::Module);
+        // `CollapsingHeader`'s label renders through button/widget visuals
+        // (`ui.visuals().widgets.inactive.fg_stroke`), lighter than a plain
+        // `ui.label`'s `ui.visuals().text_color()` — and matches the color
+        // `render_leaf`'s `selectable_label`-based rows already use below
+        // the separator. Pin the childless-module label (which would
+        // otherwise fall back to the darker plain-label color) to that same
+        // widget stroke color, so both halves of the tree agree.
+        let mut name_text = egui::RichText::new(node.name.as_str())
+            .color(ui.visuals().widgets.inactive.fg_stroke.color);
+        if is_current {
+            name_text = name_text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
+        }
+        if has_submodules {
+            ui.visuals_mut().indent_has_left_vline = false;
+            ui.spacing_mut().indent = 18.0;
+            egui::CollapsingHeader::new(name_text)
+                .default_open(false)
+                .open(force_open)
+                .show(ui, |ui| {
+                    render_module_children(
+                        app,
+                        ui,
+                        &node.children,
+                        &this_module_path,
+                        force_open,
+                    );
+                });
+        } else {
+            // No submodules: no expand arrow, but reserve the same
+            // horizontal space a CollapsingHeader's toggle button would
+            // take (see `show_button_indented` in egui) so labels still
+            // line up with sibling modules that do have one.
+            ui.spacing_mut().indent = 18.0;
+            let size = egui::vec2(ui.spacing().indent, ui.spacing().icon_width);
+            let prev_item_spacing = ui.spacing_mut().item_spacing;
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.allocate_exact_size(size, egui::Sense::hover());
+            ui.spacing_mut().item_spacing = prev_item_spacing;
+            ui.label(name_text);
+        }
     });
 }
 
@@ -2763,17 +2960,31 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
     // other kind's bare name is a 1-`Atom` string; `.into_atoms()`
     // unifies them, see `egui::IntoAtoms`).
     use egui::IntoAtoms as _;
+    // Highlights the leaf currently open in the center pane the same way
+    // `render_tree_node` highlights the current module — an accent-colored
+    // name, so "this is the active thing" reads consistently whether it's
+    // a module or a leaf. `selected_kind` disambiguates a same-named
+    // requirement/test/result within one module (see its own doc comment).
+    let is_open = app.selection.as_ref().is_some_and(|selection| {
+        app.selected_kind == Some(node.kind)
+            && selection.modules == module_path
+            && selection.name == node.name
+    });
+    let mut name_text = egui::RichText::new(node.name.as_str());
+    if is_open {
+        name_text = name_text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
+    }
     let content = match node.kind {
         EntryKind::Requirement => {
             let (fg, bg) = crate::theme_colors::status_colors(ui.visuals().dark_mode, node.status);
             let icon = crate::icons::status_icon(node.status);
             (
                 egui::RichText::new(icon).color(fg).background_color(bg),
-                node.name.as_str().to_string(),
+                name_text,
             )
                 .into_atoms()
         }
-        _ => node.name.as_str().to_string().into_atoms(),
+        _ => name_text.into_atoms(),
     };
     if ui.selectable_label(false, content).clicked() {
         let target = LogicalPath {
@@ -2852,7 +3063,7 @@ fn render_selected_module_pane(
     render_leaf_group(
         app,
         ui,
-        "tests",
+        "test procedures",
         EntryKind::Test,
         &children,
         &module_path,
@@ -2908,6 +3119,55 @@ fn render_pool_group(ui: &mut egui::Ui, title: &str, paths: &[PathBuf]) {
 /// the "Add dependency" composer's scratch entry doesn't, since nothing
 /// real has changed until it's actually added — see both call sites in
 /// `render_requirement_form`).
+/// Same variant switch as `render_dependency_kind_picker`, as a `ComboBox`
+/// instead of radio buttons — used for an existing dependency's own row,
+/// where a compact single-line control fits the row layout better; the
+/// "Add dependency" composer keeps the radio-button picker since it isn't
+/// squeezed into a row.
+fn render_dependency_kind_dropdown(ui: &mut egui::Ui, id_source: usize, dep: &mut DependencyDraft) -> bool {
+    let mut changed = false;
+    egui::ComboBox::new(("dependency_kind", id_source), "")
+        .selected_text(match dep {
+            DependencyDraft::LocalRequirement { .. } => "Local",
+            DependencyDraft::Remote { .. } => "Remote",
+            DependencyDraft::Submodules => "Submodules",
+        })
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(matches!(dep, DependencyDraft::LocalRequirement { .. }), "Local")
+                .clicked()
+                && !matches!(dep, DependencyDraft::LocalRequirement { .. })
+            {
+                *dep = DependencyDraft::LocalRequirement {
+                    path: String::new(),
+                    commit: String::new(),
+                };
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(dep, DependencyDraft::Remote { .. }), "Remote")
+                .clicked()
+                && !matches!(dep, DependencyDraft::Remote { .. })
+            {
+                *dep = DependencyDraft::Remote {
+                    url: String::new(),
+                    path: String::new(),
+                    commit: String::new(),
+                };
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(dep, DependencyDraft::Submodules), "Submodules")
+                .clicked()
+                && !matches!(dep, DependencyDraft::Submodules)
+            {
+                *dep = DependencyDraft::Submodules;
+                changed = true;
+            }
+        });
+    changed
+}
+
 fn render_dependency_kind_picker(ui: &mut egui::Ui, dep: &mut DependencyDraft) -> bool {
     if ui
         .radio(

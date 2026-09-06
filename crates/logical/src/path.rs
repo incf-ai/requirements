@@ -107,6 +107,42 @@ pub(crate) fn parse_reference_path(
     })
 }
 
+/// Inverse of `parse_reference_path`: renders `target` as a raw
+/// `ReferencePath` string as seen from `current_module`. Prefers a
+/// module-relative string (matching how `crates/logical/src/reference_repair.rs`
+/// wants repaired references to keep their original style) but falls back to
+/// an absolute one whenever `target` isn't reachable by descending from
+/// `current_module` — relative addressing here can only dip into
+/// submodules, never climb out to a sibling or ancestor (mirrors
+/// `parse_reference_path`, which never resolves `..`).
+pub(crate) fn format_reference_path(
+    target: &LogicalPath,
+    current_module: &[EntryName],
+    prefer_absolute: bool,
+    expected_kind: &'static str,
+) -> ReferencePath {
+    let relative_modules = (!prefer_absolute && target.modules.starts_with(current_module))
+        .then(|| &target.modules[current_module.len()..]);
+
+    let mut out = String::new();
+    let modules = match relative_modules {
+        Some(modules) => modules,
+        None => {
+            out.push('/');
+            &target.modules[..]
+        }
+    };
+    for module in modules {
+        out.push_str("modules/");
+        out.push_str(module.as_str());
+        out.push('/');
+    }
+    out.push_str(expected_kind);
+    out.push('/');
+    out.push_str(target.name.as_str());
+    ReferencePath(out)
+}
+
 /// Public counterpart to `parse_reference_path`, for callers outside this
 /// crate — the read-only requirement viewer's clickable reference links —
 /// that need to resolve a raw on-disk reference string into a `LogicalPath`
@@ -220,6 +256,86 @@ mod test {
             err,
             ParseReferencePathError::MalformedModuleSegment { .. }
         ));
+    }
+
+    #[test]
+    fn formats_a_relative_reference_within_the_current_module() {
+        let current = vec![EntryName("embeddings".to_string())];
+        let path = format_reference_path(
+            &LogicalPath {
+                modules: current.clone(),
+                name: EntryName("discovery".to_string()),
+            },
+            &current,
+            false,
+            "requirements",
+        );
+        assert_eq!(path.0, "requirements/discovery");
+    }
+
+    #[test]
+    fn formats_a_relative_reference_dipping_into_a_submodule() {
+        let current = vec![];
+        let path = format_reference_path(
+            &LogicalPath {
+                modules: vec![EntryName("embeddings".to_string())],
+                name: EntryName("generic_test".to_string()),
+            },
+            &current,
+            false,
+            "tests",
+        );
+        assert_eq!(path.0, "modules/embeddings/tests/generic_test");
+    }
+
+    #[test]
+    fn formats_an_absolute_reference_at_the_project_root() {
+        let path = format_reference_path(
+            &LogicalPath::root(EntryName("generic_inspection".to_string())),
+            &[EntryName("embeddings".to_string())],
+            true,
+            "tests",
+        );
+        assert_eq!(path.0, "/tests/generic_inspection");
+    }
+
+    #[test]
+    fn formats_as_absolute_when_the_target_is_not_reachable_relatively() {
+        // `current_module` is `embeddings`, but the target lives directly
+        // under the project root — not a descendant of `embeddings` — so a
+        // relative path (which can only dip *into* submodules) can't reach
+        // it, even though the caller didn't ask for an absolute path.
+        let path = format_reference_path(
+            &LogicalPath::root(EntryName("definition".to_string())),
+            &[EntryName("embeddings".to_string())],
+            false,
+            "requirements",
+        );
+        assert_eq!(path.0, "/requirements/definition");
+    }
+
+    #[test]
+    fn format_and_parse_round_trip_for_relative_references() {
+        let current = vec![EntryName("embeddings".to_string())];
+        let target = LogicalPath {
+            modules: current.clone(),
+            name: EntryName("discovery".to_string()),
+        };
+        let raw = format_reference_path(&target, &current, false, "requirements");
+        assert_eq!(
+            parse_reference_path(&raw, &current, "requirements").unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn format_and_parse_round_trip_for_absolute_references() {
+        let target = LogicalPath {
+            modules: vec![EntryName("embeddings".to_string())],
+            name: EntryName("generic_test".to_string()),
+        };
+        let raw = format_reference_path(&target, &[], true, "tests");
+        assert_eq!(parse_reference_path(&raw, &[], "tests").unwrap(), target);
     }
 
     #[test]

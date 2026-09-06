@@ -45,7 +45,8 @@ use std::time::Instant;
 
 use gui_core::{
     Command, CoreHandle, EntryDetail, EntryKind, EntryName, Event, LogicalPath, ModulePools,
-    Outcome, RequestId, RequirementDraft, SaveError, TestDraft, TreeNode, TreeSnapshot,
+    Outcome, ReferenceAction, ReferenceRepairError, ReferenceSite, ReferenceTarget,
+    RequestId, RequirementDraft, SaveError, TestDraft, TreeNode, TreeSnapshot,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -57,6 +58,13 @@ pub struct GuiApp {
     /// project loaded yet).
     tree: Option<TreeSnapshot>,
     selection: Option<LogicalPath>,
+    /// The `EntryKind` of `selection` — kept alongside it rather than
+    /// folded into its type so the many existing `selection`
+    /// assertions/matches don't all need updating. A requirement, test,
+    /// and result can share a name within one module, so this is what
+    /// lets the treeview highlight the exact open leaf rather than every
+    /// same-named one — see `render_leaf`.
+    selected_kind: Option<EntryKind>,
     /// The module new entries get created in, and the Attachments dialog
     /// targets — independent of `selection` so a module can be the
     /// "current" one without any leaf being selected. Kept in sync with
@@ -217,6 +225,16 @@ pub struct GuiApp {
     /// The test "Recreate" prompt — `Some` while it's open. See
     /// `RecreateTestState`'s own doc comment.
     recreate_test_dialog: Option<RecreateTestState>,
+    /// Which `Command::FindReferences` request the module-rename flow
+    /// (`editor_create_clicked`'s `ExistingModule` arm) is waiting on before
+    /// deciding whether to send `RenameModule` directly or open
+    /// `broken_references_dialog` — same stale-reply guard as
+    /// `detail_request`.
+    module_rename_find_references_request: Option<RequestId>,
+    /// The broken-references modal opened when a module rename's
+    /// `FindReferences` pre-check comes back non-empty — `Some` while it's
+    /// open. See `BrokenReferencesState`'s own doc comment.
+    broken_references_dialog: Option<BrokenReferencesState>,
     /// A failed `LoadProject`'s error message — `Some` while the "couldn't
     /// open project" dialog is open. Set from `Outcome::LoadProject`'s
     /// `Err` case (e.g. the target directory isn't a git repository) so
@@ -409,12 +427,29 @@ pub struct DeleteConfirmState {
 /// `true` for the rest of the dialog's life — including a retry after a
 /// failed create, which by then must only resend the create, not the
 /// (already-succeeded) delete.
+///
+/// Before the delete leg goes out, `recreate_requirement_confirmed` first
+/// sends `Command::FindReferences` for `target` (tracked by
+/// `find_references_request`), same pre-check as a module rename — see
+/// `apply_recreate_requirement_find_references`. `checked_references`
+/// becomes `true` once that reply lands (whether or not it found anything);
+/// `reference_choices` is empty until a non-empty reply populates it with
+/// one default-`Repair` choice per site, editable in
+/// `render_recreate_requirement_dialog` before the delete leg is sent.
+/// After the create leg succeeds, a non-empty `reference_choices` is
+/// applied via `Command::RepairReferences` before the dialog closes —
+/// `repairing` marks that final leg in flight/retryable, same spirit as
+/// `deleted` marking the create leg.
 #[derive(Debug, Clone)]
 pub struct RecreateRequirementState {
     target: LogicalPath,
     requirement: Box<RequirementDraft>,
     new_name: String,
     deleted: bool,
+    find_references_request: Option<RequestId>,
+    checked_references: bool,
+    reference_choices: Vec<(ReferenceSite, ReferenceAction)>,
+    repairing: bool,
     pending_request: Option<RequestId>,
     error: Option<String>,
 }
@@ -429,6 +464,29 @@ pub struct RecreateTestState {
     test: Box<TestDraft>,
     new_name: String,
     deleted: bool,
+    find_references_request: Option<RequestId>,
+    checked_references: bool,
+    reference_choices: Vec<(ReferenceSite, ReferenceAction)>,
+    repairing: bool,
+    pending_request: Option<RequestId>,
+    error: Option<String>,
+}
+
+/// The broken-references modal's own state — opened by
+/// `apply_module_rename_find_references` when a module rename's
+/// `Command::FindReferences` pre-check comes back non-empty, rather than
+/// sending `RenameModule` outright. `choices` is one `ReferenceAction` per
+/// `ReferenceSite`, defaulting to `Repair`, editable per-row in
+/// `render_broken_references_dialog`; `target`/`new_name` are the rename
+/// this modal is gating (`target`'s parent + `new_name` is the module's
+/// destination path), carried here rather than re-read from the still-open
+/// `ModuleDetailFormState` so a stale form edit in the background can't
+/// change what Confirm actually sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokenReferencesState {
+    target: Vec<EntryName>,
+    new_name: String,
+    choices: Vec<(ReferenceSite, ReferenceAction)>,
     pending_request: Option<RequestId>,
     error: Option<String>,
 }
@@ -606,6 +664,7 @@ impl GuiApp {
             core,
             tree: None,
             selection: None,
+            selected_kind: None,
             selected_module: Vec::new(),
             editor: EditorState::default(),
             nav_history: Vec::new(),
@@ -645,6 +704,8 @@ impl GuiApp {
             delete_confirm_dialog: None,
             recreate_requirement_dialog: None,
             recreate_test_dialog: None,
+            module_rename_find_references_request: None,
+            broken_references_dialog: None,
             load_error_dialog: None,
             next_request: 0,
         }
@@ -854,10 +915,34 @@ impl GuiApp {
                 self.apply_delete_result(request, removed)
             }
             Outcome::RenameModule(result) => {
-                self.apply_module_rename_result(request, result.map_err(|e| e.to_string()))
+                let is_broken_references_pending =
+                    matches!(&self.broken_references_dialog, Some(d) if d.pending_request == Some(request));
+                if is_broken_references_pending {
+                    self.apply_broken_references_rename_result(request, result.map_err(|e| e.to_string()));
+                } else {
+                    self.apply_module_rename_result(request, result.map_err(|e| e.to_string()));
+                }
             }
             Outcome::RenameProject(result) => {
                 self.apply_module_rename_result(request, result.map_err(|e| e.to_string()))
+            }
+            Outcome::FindReferences(sites) => {
+                if self.module_rename_find_references_request == Some(request) {
+                    self.apply_module_rename_find_references(request, sites);
+                } else if matches!(&self.recreate_requirement_dialog, Some(d) if d.find_references_request == Some(request))
+                {
+                    self.apply_recreate_requirement_find_references(request, sites);
+                } else {
+                    self.apply_recreate_test_find_references(request, sites);
+                }
+            }
+            Outcome::RepairReferences(result) => {
+                if matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.repairing)
+                {
+                    self.apply_recreate_requirement_repair_result(request, result);
+                } else {
+                    self.apply_recreate_test_repair_result(request, result);
+                }
             }
             Outcome::AddAttachment(result) => {
                 self.apply_pool_change_result(result.map_err(|e| e.to_string()))
@@ -952,12 +1037,26 @@ impl GuiApp {
                 self.apply_commit_all_result(result.map_err(|e| e.to_string()));
             }
             Outcome::ResolveLocalCommit(result) => {
-                let result = result.map_err(|e| e.to_string());
+                // Not yet having a commit at all is the ordinary state for
+                // an entry added in this editing session but not yet
+                // saved/committed — not a failure worth surfacing as an
+                // error, so it's dropped to `Ok(None)` here rather than
+                // becoming `commit_fetch_error`/`test_commit_fetch_error`.
+                let result = match result {
+                    Ok(commit) => Ok(Some(commit)),
+                    Err(e) if e.is_not_tracked() => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                };
                 self.apply_commit_fetch_result(request, result.clone());
                 self.apply_test_commit_fetch_result(request, result);
             }
             Outcome::ResolveRemoteCommit(result) => {
-                self.apply_commit_fetch_result(request, result.map_err(|e| e.to_string()))
+                let result = match result {
+                    Ok(commit) => Ok(Some(commit)),
+                    Err(e) if e.is_not_tracked() => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                };
+                self.apply_commit_fetch_result(request, result)
             }
             _ => {}
         }
@@ -1477,6 +1576,7 @@ impl GuiApp {
     fn select_from_history(&mut self, target: LogicalPath, kind: EntryKind) {
         self.selected_module = target.modules.clone();
         self.selection = Some(target.clone());
+        self.selected_kind = Some(kind);
         self.editor = EditorState::None;
         let request = self.next_request_id();
         self.detail_request = Some(request);
@@ -1568,6 +1668,7 @@ impl GuiApp {
     /// shows, neither of which "clear the center pane" implies changing.
     fn clear_center_pane_from_history(&mut self) {
         self.selection = None;
+        self.selected_kind = None;
         self.editor = EditorState::None;
     }
 
@@ -1595,6 +1696,7 @@ impl GuiApp {
     fn select_module_from_history(&mut self, module: Vec<EntryName>) {
         self.selected_module = module.clone();
         self.selection = None;
+        self.selected_kind = None;
         self.fetch_sidebar_pools(module.clone());
         let display_name = module_display_name(self.tree.as_ref(), &module);
         let request = self.next_request_id();
@@ -1722,23 +1824,36 @@ impl GuiApp {
         form.pending_request = None;
 
         match result {
-            Ok(()) => {
-                self.dirty = true;
-                let mut new_path = form.path.clone();
-                if let Some(last) = new_path.last_mut() {
-                    *last = EntryName(form.new_name.clone());
-                }
-                form.path = new_path.clone();
-                form.display_name = form.new_name.clone();
-                form.read_only = true;
-                form.edited = false;
-                form.error = None;
-                self.selected_module = new_path;
-            }
+            Ok(()) => self.finish_module_rename_success(),
             Err(message) => {
+                let EditorState::ExistingModule(form) = &mut self.editor else {
+                    return;
+                };
                 form.error = Some(message);
             }
         }
+    }
+
+    /// The shared "a `RenameModule`/`RenameProject` just succeeded" update —
+    /// used by both `apply_module_rename_result` (the no-broken-references
+    /// path) and `apply_broken_references_rename_result` (the modal's
+    /// Confirm path), so the two don't drift apart.
+    fn finish_module_rename_success(&mut self) {
+        self.dirty = true;
+        let EditorState::ExistingModule(form) = &mut self.editor else {
+            return;
+        };
+        let mut new_path = form.path.clone();
+        if let Some(last) = new_path.last_mut() {
+            *last = EntryName(form.new_name.clone());
+        }
+        form.path = new_path.clone();
+        form.display_name = form.new_name.clone();
+        form.read_only = true;
+        form.edited = false;
+        form.error = None;
+        form.pending_request = None;
+        self.selected_module = new_path;
     }
 
     /// Populates `editor` with the matching form, pre-filled and in
@@ -2267,7 +2382,11 @@ impl GuiApp {
     /// form has since closed, switched to a different entry, or the row
     /// itself was removed while the fetch was in flight — same "a stale
     /// reply is simply dropped" precedent as `apply_local_pool_change`.
-    fn apply_commit_fetch_result(&mut self, request: RequestId, result: Result<String, String>) {
+    fn apply_commit_fetch_result(
+        &mut self,
+        request: RequestId,
+        result: Result<Option<String>, String>,
+    ) {
         let EditorState::NewRequirement(form) = &mut self.editor else {
             return;
         };
@@ -2275,7 +2394,11 @@ impl GuiApp {
             return;
         };
         match result {
-            Ok(commit) => {
+            // `None` means the target genuinely has no commit yet (a
+            // freshly added, not-yet-committed entry) — nothing to fill
+            // in, but not an error either.
+            Ok(None) => {}
+            Ok(Some(commit)) => {
                 let dep = match target {
                     DependencySlot::Existing(i) => form.dependencies.get_mut(i),
                     DependencySlot::New => Some(&mut form.new_dependency),
@@ -2329,7 +2452,7 @@ impl GuiApp {
     fn apply_test_commit_fetch_result(
         &mut self,
         request: RequestId,
-        result: Result<String, String>,
+        result: Result<Option<String>, String>,
     ) {
         let EditorState::NewRequirement(form) = &mut self.editor else {
             return;
@@ -2338,7 +2461,10 @@ impl GuiApp {
             return;
         };
         match result {
-            Ok(commit) => {
+            // Same "genuinely no commit yet, not an error" case as
+            // `apply_commit_fetch_result`.
+            Ok(None) => {}
+            Ok(Some(commit)) => {
                 let test_ref = match target {
                     TestRefSlot::Existing(i) => form.tests.get_mut(i),
                     TestRefSlot::New => Some(&mut form.new_test_ref),
@@ -2501,6 +2627,29 @@ impl GuiApp {
     fn editor_create_clicked(&mut self) {
         let module = self.new_entry_module_path();
         let request = self.next_request_id();
+
+        // A module rename can break references anywhere in the project
+        // (see `logical::find_references`'s prefix-match semantics for
+        // `ReferenceTarget::Module`), so — only when this is actually a
+        // `RenameModule` (not `RenameProject`, which is just the project's
+        // own display name and can't break anything) — check for those
+        // first instead of sending the rename outright. `RenameProject`
+        // and a rename with no `path` change (e.g. root) fall through to
+        // the direct send below, same as before this existed.
+        if let EditorState::ExistingModule(form) = &self.editor
+            && !form.path.is_empty()
+            && form.new_name.trim() != form.display_name
+        {
+            let target = ReferenceTarget::Module(form.path.clone());
+            self.module_rename_find_references_request = Some(request);
+            if let EditorState::ExistingModule(form) = &mut self.editor {
+                form.error = None;
+            }
+            self.pending.insert(request, PendingKind::Generic);
+            self.send_command(Command::FindReferences { target, request });
+            return;
+        }
+
         let command = match &mut self.editor {
             EditorState::NewRequirement(form) => {
                 form.pending_request = Some(request);
@@ -2525,13 +2674,103 @@ impl GuiApp {
             EditorState::ExistingModule(form) => {
                 form.pending_request = Some(request);
                 form.error = None;
-                Some(form.build_command(request))
+                Some(form.build_command(Vec::new(), request))
             }
             EditorState::None => None,
         };
         if let Some(command) = command {
             self.pending.insert(request, PendingKind::Generic);
             self.send_command(command);
+        }
+    }
+
+    /// Routes a `FindReferences` reply back to whichever flow requested it
+    /// — currently only the module-rename pre-check in
+    /// `editor_create_clicked` (`module_rename_find_references_request`).
+    /// Stale replies (a since-abandoned rename, or the module page having
+    /// navigated away) are dropped, same "ignore stale replies by request
+    /// id" shape as `detail_request`.
+    fn apply_module_rename_find_references(&mut self, request: RequestId, sites: Vec<ReferenceSite>) {
+        if self.module_rename_find_references_request != Some(request) {
+            return;
+        }
+        self.module_rename_find_references_request = None;
+        if sites.is_empty() {
+            let request = self.next_request_id();
+            let EditorState::ExistingModule(form) = &mut self.editor else {
+                return;
+            };
+            form.pending_request = Some(request);
+            form.error = None;
+            let command = form.build_command(Vec::new(), request);
+            self.pending.insert(request, PendingKind::Generic);
+            self.send_command(command);
+        } else {
+            let EditorState::ExistingModule(form) = &self.editor else {
+                return;
+            };
+            self.broken_references_dialog = Some(BrokenReferencesState {
+                target: form.path.clone(),
+                new_name: form.new_name.clone(),
+                choices: sites.into_iter().map(|site| (site, ReferenceAction::Repair)).collect(),
+                pending_request: None,
+                error: None,
+            });
+        }
+    }
+
+    /// The broken-references modal's Cancel button — closes it, leaving the
+    /// module edit form open and unrenamed, same as before the rename was
+    /// attempted.
+    fn broken_references_cancelled(&mut self) {
+        self.broken_references_dialog = None;
+    }
+
+    /// The broken-references modal's Confirm button — sends `RenameModule`
+    /// with the user's per-row choices baked in as `reference_actions`.
+    fn broken_references_confirmed(&mut self) {
+        let request = self.next_request_id();
+        let EditorState::ExistingModule(form) = &self.editor else {
+            self.broken_references_dialog = None;
+            return;
+        };
+        let Some(dialog) = &mut self.broken_references_dialog else {
+            return;
+        };
+        dialog.pending_request = Some(request);
+        dialog.error = None;
+        let target = form.path.clone();
+        let new_name = EntryName(dialog.new_name.clone());
+        let reference_actions = dialog.choices.clone();
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::RenameModule {
+            target,
+            new_name,
+            reference_actions,
+            request,
+        });
+    }
+
+    /// Applies the `RenameModule` outcome the broken-references modal is
+    /// waiting on — success closes the modal and updates the module form
+    /// exactly as `apply_module_rename_result` does for the no-references
+    /// path; failure leaves the modal open with the error, so the user's
+    /// row choices aren't lost.
+    fn apply_broken_references_rename_result(&mut self, request: RequestId, result: Result<(), String>) {
+        let Some(dialog) = &mut self.broken_references_dialog else {
+            return;
+        };
+        if dialog.pending_request != Some(request) {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                self.broken_references_dialog = None;
+                self.finish_module_rename_success();
+            }
+            Err(message) => {
+                dialog.error = Some(message);
+            }
         }
     }
 
@@ -2678,6 +2917,10 @@ impl GuiApp {
             requirement: Box::new(form.current_contents()),
             new_name,
             deleted: false,
+            find_references_request: None,
+            checked_references: false,
+            reference_choices: Vec::new(),
+            repairing: false,
             pending_request: None,
             error: None,
         });
@@ -2703,6 +2946,10 @@ impl GuiApp {
         let Some(dialog) = self.recreate_requirement_dialog.clone() else {
             return;
         };
+        if dialog.repairing {
+            self.send_recreate_requirement_repair();
+            return;
+        }
         let new_name = dialog.new_name.trim().to_string();
         if new_name.is_empty() {
             return;
@@ -2719,6 +2966,19 @@ impl GuiApp {
                     "Requirement text must not be empty — fix it before recreating.".to_string(),
                 );
             }
+            return;
+        }
+        if !dialog.deleted && !dialog.checked_references {
+            let request = self.next_request_id();
+            self.pending.insert(request, PendingKind::Generic);
+            if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                dialog.find_references_request = Some(request);
+                dialog.error = None;
+            }
+            self.send_command(Command::FindReferences {
+                target: ReferenceTarget::Requirement(dialog.target.clone()),
+                request,
+            });
             return;
         }
         let request = self.next_request_id();
@@ -2741,6 +3001,99 @@ impl GuiApp {
             dialog.error = None;
         }
         self.send_command(command);
+    }
+
+    /// Routes a `FindReferences` reply back to the requirement Recreate
+    /// dialog's pre-delete check (see `RecreateRequirementState`'s own doc
+    /// comment). `false` (not this dialog's reply) falls through to
+    /// whichever other flow requested it. An empty result means the rename
+    /// breaks nothing, so it immediately re-drives `confirmed` to send the
+    /// delete leg exactly as if no check had happened; a non-empty result
+    /// populates `reference_choices` for the user to review (default
+    /// `Repair` each) and stops, waiting for another "Recreate" click.
+    fn apply_recreate_requirement_find_references(&mut self, request: RequestId, sites: Vec<ReferenceSite>) -> bool {
+        let is_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.find_references_request == Some(request));
+        if !is_pending {
+            return false;
+        }
+        let dialog = self
+            .recreate_requirement_dialog
+            .as_mut()
+            .expect("just matched Some above");
+        dialog.find_references_request = None;
+        dialog.checked_references = true;
+        let is_empty = sites.is_empty();
+        dialog.reference_choices = sites.into_iter().map(|site| (site, ReferenceAction::Repair)).collect();
+        if is_empty {
+            self.recreate_requirement_confirmed();
+        }
+        true
+    }
+
+    /// Sends the recreate flow's final leg — `Command::RepairReferences`
+    /// applying `reference_choices` against the just-created new path.
+    /// Called once after `AddRequirement` succeeds, and again on retry if
+    /// that first attempt failed (`repairing` stays `true` either way).
+    fn send_recreate_requirement_repair(&mut self) {
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        let Some(dialog) = &mut self.recreate_requirement_dialog else {
+            return;
+        };
+        dialog.repairing = true;
+        dialog.pending_request = Some(request);
+        dialog.error = None;
+        let old_target = ReferenceTarget::Requirement(dialog.target.clone());
+        let new_target = ReferenceTarget::Requirement(LogicalPath {
+            modules: dialog.target.modules.clone(),
+            name: EntryName(dialog.new_name.trim().to_string()),
+        });
+        let actions = dialog.reference_choices.clone();
+        self.send_command(Command::RepairReferences {
+            old_target,
+            new_target: Some(new_target),
+            actions,
+            request,
+        });
+    }
+
+    /// Routes a `RepairReferences` outcome back to the requirement Recreate
+    /// dialog's final leg. Success closes the dialog and navigates to the
+    /// new entry, same as the no-references path. Failure leaves the
+    /// dialog open with an error — the requirement itself was already
+    /// recreated successfully by this point, so `repairing` stays `true`
+    /// and another "Recreate" click retries only the repair.
+    fn apply_recreate_requirement_repair_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), ReferenceRepairError>,
+    ) -> bool {
+        let is_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.repairing);
+        if !is_pending {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                let dialog = self
+                    .recreate_requirement_dialog
+                    .take()
+                    .expect("just matched Some above");
+                let new_target = LogicalPath {
+                    modules: dialog.target.modules,
+                    name: EntryName(dialog.new_name.trim().to_string()),
+                };
+                self.select(new_target, EntryKind::Requirement);
+            }
+            Err(err) => {
+                if let Some(dialog) = &mut self.recreate_requirement_dialog {
+                    dialog.pending_request = None;
+                    dialog.error = Some(format!(
+                        "The requirement was recreated, but repairing references failed: {err}. Try again, or Cancel to leave them broken."
+                    ));
+                }
+            }
+        }
+        true
     }
 
     /// Routes a `RemoveRequirement` outcome back to the Recreate dialog's
@@ -2811,15 +3164,23 @@ impl GuiApp {
         match result {
             Ok(()) => {
                 self.dirty = true;
-                let dialog = self
+                let has_reference_choices = self
                     .recreate_requirement_dialog
-                    .take()
-                    .expect("just matched Some above");
-                let new_target = LogicalPath {
-                    modules: dialog.target.modules,
-                    name: EntryName(dialog.new_name.trim().to_string()),
-                };
-                self.select(new_target, EntryKind::Requirement);
+                    .as_ref()
+                    .is_some_and(|dialog| !dialog.reference_choices.is_empty());
+                if has_reference_choices {
+                    self.send_recreate_requirement_repair();
+                } else {
+                    let dialog = self
+                        .recreate_requirement_dialog
+                        .take()
+                        .expect("just matched Some above");
+                    let new_target = LogicalPath {
+                        modules: dialog.target.modules,
+                        name: EntryName(dialog.new_name.trim().to_string()),
+                    };
+                    self.select(new_target, EntryKind::Requirement);
+                }
             }
             Err(err) => {
                 if let Some(dialog) = &mut self.recreate_requirement_dialog {
@@ -2850,6 +3211,10 @@ impl GuiApp {
             test: Box::new(form.current_contents()),
             new_name,
             deleted: false,
+            find_references_request: None,
+            checked_references: false,
+            reference_choices: Vec::new(),
+            repairing: false,
             pending_request: None,
             error: None,
         });
@@ -2867,6 +3232,10 @@ impl GuiApp {
         let Some(dialog) = self.recreate_test_dialog.clone() else {
             return;
         };
+        if dialog.repairing {
+            self.send_recreate_test_repair();
+            return;
+        }
         let new_name = dialog.new_name.trim().to_string();
         if new_name.is_empty() {
             return;
@@ -2879,8 +3248,22 @@ impl GuiApp {
         }
         if !dialog.deleted && dialog.test.test_text.trim().is_empty() {
             if let Some(dialog) = &mut self.recreate_test_dialog {
-                dialog.error = Some("Test text must not be empty — fix it before recreating.".to_string());
+                dialog.error =
+                    Some("Test procedure text must not be empty — fix it before recreating.".to_string());
             }
+            return;
+        }
+        if !dialog.deleted && !dialog.checked_references {
+            let request = self.next_request_id();
+            self.pending.insert(request, PendingKind::Generic);
+            if let Some(dialog) = &mut self.recreate_test_dialog {
+                dialog.find_references_request = Some(request);
+                dialog.error = None;
+            }
+            self.send_command(Command::FindReferences {
+                target: ReferenceTarget::Test(dialog.target.clone()),
+                request,
+            });
             return;
         }
         let request = self.next_request_id();
@@ -2905,6 +3288,86 @@ impl GuiApp {
         self.send_command(command);
     }
 
+    /// Routes a `FindReferences` reply back to the test Recreate dialog's
+    /// pre-delete check — see
+    /// `apply_recreate_requirement_find_references`'s doc comment;
+    /// identical reasoning.
+    fn apply_recreate_test_find_references(&mut self, request: RequestId, sites: Vec<ReferenceSite>) -> bool {
+        let is_pending = matches!(&self.recreate_test_dialog, Some(d) if d.find_references_request == Some(request));
+        if !is_pending {
+            return false;
+        }
+        let dialog = self.recreate_test_dialog.as_mut().expect("just matched Some above");
+        dialog.find_references_request = None;
+        dialog.checked_references = true;
+        let is_empty = sites.is_empty();
+        dialog.reference_choices = sites.into_iter().map(|site| (site, ReferenceAction::Repair)).collect();
+        if is_empty {
+            self.recreate_test_confirmed();
+        }
+        true
+    }
+
+    /// Sends the test Recreate dialog's final leg — see
+    /// `send_recreate_requirement_repair`'s doc comment; identical
+    /// reasoning.
+    fn send_recreate_test_repair(&mut self) {
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        let Some(dialog) = &mut self.recreate_test_dialog else {
+            return;
+        };
+        dialog.repairing = true;
+        dialog.pending_request = Some(request);
+        dialog.error = None;
+        let old_target = ReferenceTarget::Test(dialog.target.clone());
+        let new_target = ReferenceTarget::Test(LogicalPath {
+            modules: dialog.target.modules.clone(),
+            name: EntryName(dialog.new_name.trim().to_string()),
+        });
+        let actions = dialog.reference_choices.clone();
+        self.send_command(Command::RepairReferences {
+            old_target,
+            new_target: Some(new_target),
+            actions,
+            request,
+        });
+    }
+
+    /// Routes a `RepairReferences` outcome back to the test Recreate
+    /// dialog's final leg — see
+    /// `apply_recreate_requirement_repair_result`'s doc comment; identical
+    /// reasoning.
+    fn apply_recreate_test_repair_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), ReferenceRepairError>,
+    ) -> bool {
+        let is_pending = matches!(&self.recreate_test_dialog, Some(d) if d.pending_request == Some(request) && d.repairing);
+        if !is_pending {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                let dialog = self.recreate_test_dialog.take().expect("just matched Some above");
+                let new_target = LogicalPath {
+                    modules: dialog.target.modules,
+                    name: EntryName(dialog.new_name.trim().to_string()),
+                };
+                self.select(new_target, EntryKind::Test);
+            }
+            Err(err) => {
+                if let Some(dialog) = &mut self.recreate_test_dialog {
+                    dialog.pending_request = None;
+                    dialog.error = Some(format!(
+                        "The test procedure was recreated, but repairing references failed: {err}. Try again, or Cancel to leave them broken."
+                    ));
+                }
+            }
+        }
+        true
+    }
+
     /// Routes a `RemoveTest` outcome back to the test Recreate dialog's
     /// delete leg — see `apply_recreate_delete_result`'s doc comment;
     /// identical reasoning.
@@ -2917,7 +3380,7 @@ impl GuiApp {
             if let Some(dialog) = &mut self.recreate_test_dialog {
                 dialog.pending_request = None;
                 dialog.error = Some(
-                    "Could not delete the existing test — it may have already been removed."
+                    "Could not delete the existing test procedure — it may have already been removed."
                         .to_string(),
                 );
             }
@@ -2959,21 +3422,29 @@ impl GuiApp {
         match result {
             Ok(()) => {
                 self.dirty = true;
-                let dialog = self
+                let has_reference_choices = self
                     .recreate_test_dialog
-                    .take()
-                    .expect("just matched Some above");
-                let new_target = LogicalPath {
-                    modules: dialog.target.modules,
-                    name: EntryName(dialog.new_name.trim().to_string()),
-                };
-                self.select(new_target, EntryKind::Test);
+                    .as_ref()
+                    .is_some_and(|dialog| !dialog.reference_choices.is_empty());
+                if has_reference_choices {
+                    self.send_recreate_test_repair();
+                } else {
+                    let dialog = self
+                        .recreate_test_dialog
+                        .take()
+                        .expect("just matched Some above");
+                    let new_target = LogicalPath {
+                        modules: dialog.target.modules,
+                        name: EntryName(dialog.new_name.trim().to_string()),
+                    };
+                    self.select(new_target, EntryKind::Test);
+                }
             }
             Err(err) => {
                 if let Some(dialog) = &mut self.recreate_test_dialog {
                     dialog.pending_request = None;
                     dialog.error = Some(format!(
-                        "The old test was already deleted, but creating \"{}\" failed: {err}. Enter a different name and try again.",
+                        "The old test procedure was already deleted, but creating \"{}\" failed: {err}. Enter a different name and try again.",
                         dialog.new_name
                     ));
                 }
@@ -3361,6 +3832,7 @@ impl eframe::App for GuiApp {
         self.render_delete_confirm_dialog(ui);
         self.render_recreate_requirement_dialog(ui);
         self.render_recreate_test_dialog(ui);
+        self.render_broken_references_dialog(ui);
         self.render_load_error_dialog(ui);
         self.render_attachments_dialog(ui);
         self.render_commit_all_dialog(ui);
@@ -3486,6 +3958,8 @@ pub(crate) fn leaf_kind_segment(kind: EntryKind) -> &'static str {
 #[cfg(test)]
 mod test {
     use std::time::Duration;
+
+    use gui_core::ReferenceSiteKind;
 
     use super::*;
 
@@ -5332,6 +5806,40 @@ mod test {
         app
     }
 
+    /// Drives a requirement Recreate dialog's `FindReferences` pre-check to
+    /// completion with an empty result, so the caller lands exactly where
+    /// the old (pre-`FindReferences`) `recreate_requirement_confirmed`
+    /// tests expected: the delete leg's `Command::RemoveRequirement`
+    /// already sent and tracked as `pending_request`.
+    fn confirm_requirement_recreate_past_references(app: &mut GuiApp) {
+        app.recreate_requirement_confirmed();
+        let request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open")
+            .find_references_request
+            .expect("FindReferences should have been sent");
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::FindReferences(Vec::new()),
+        });
+    }
+
+    /// Test-flow analogue of `confirm_requirement_recreate_past_references`.
+    fn confirm_test_recreate_past_references(app: &mut GuiApp) {
+        app.recreate_test_confirmed();
+        let request = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog should still be open")
+            .find_references_request
+            .expect("FindReferences should have been sent");
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::FindReferences(Vec::new()),
+        });
+    }
+
     #[test]
     fn editor_create_clicked_on_an_editing_form_sends_an_update_not_an_add() {
         let mut app = app_editing_a_requirement();
@@ -6088,6 +6596,70 @@ mod test {
         assert!(form.dependencies.is_empty());
     }
 
+    /// A path that genuinely has no commit yet — the ordinary state for an
+    /// entry added in this editing session but not yet saved/committed —
+    /// must not surface as `commit_fetch_error`/`test_commit_fetch_error`.
+    /// Regression test: the picker's "pick implies auto" shortcut
+    /// (`path_picker_dialog_selected`) used to turn this into a scary red
+    /// error under the modal for every not-yet-committed entry.
+    #[test]
+    fn a_not_yet_committed_path_clears_pending_state_without_an_error() {
+        let mut app = app_editing_a_requirement();
+
+        app.dependency_commit_auto_clicked(
+            DependencySlot::New,
+            AutoCommitKind::Local(LogicalPath::root(disk_entry_name("discovery"))),
+        );
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        let dep_request = *form.pending_commit_fetches.keys().next().unwrap();
+
+        app.test_ref_commit_auto_clicked(
+            TestRefSlot::New,
+            LogicalPath::root(disk_entry_name("smoke")),
+        );
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        let test_request = *form.pending_test_commit_fetches.keys().next().unwrap();
+
+        app.apply_event(Event::Completed {
+            request: dep_request,
+            outcome: Outcome::ResolveLocalCommit(Err(
+                gui_core::ResolveLocalCommitError::Commit(syscalls::CommitForPathError::NotTracked {
+                    path: "requirements/discovery".into(),
+                }),
+            )),
+        });
+        app.apply_event(Event::Completed {
+            request: test_request,
+            outcome: Outcome::ResolveLocalCommit(Err(
+                gui_core::ResolveLocalCommitError::Commit(syscalls::CommitForPathError::NotTracked {
+                    path: "tests/smoke".into(),
+                }),
+            )),
+        });
+
+        let EditorState::NewRequirement(form) = &app.editor else {
+            unreachable!()
+        };
+        assert_eq!(form.commit_fetch_error, None);
+        assert_eq!(form.test_commit_fetch_error, None);
+        assert!(form.pending_commit_fetches.is_empty());
+        assert!(form.pending_test_commit_fetches.is_empty());
+        // Left blank rather than filled with a bogus value — same as if
+        // the fetch had never been fired at all.
+        assert_eq!(
+            form.new_dependency,
+            DependencyDraft::LocalRequirement {
+                path: String::new(),
+                commit: String::new(),
+            }
+        );
+        assert_eq!(form.new_test_ref.commit, "");
+    }
+
     #[test]
     fn picking_a_path_for_an_existing_dependency_also_auto_fetches_its_commit() {
         let mut app = app_editing_a_requirement();
@@ -6302,6 +6874,11 @@ mod test {
         }
 
         app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(Vec::new()),
+        });
 
         let EditorState::ExistingModule(form) = &app.editor else {
             panic!("expected ExistingModule");
@@ -6321,6 +6898,11 @@ mod test {
             form.new_name = "renamed".to_string();
         }
         app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(Vec::new()),
+        });
         let EditorState::ExistingModule(form) = &app.editor else {
             panic!("expected ExistingModule");
         };
@@ -6350,6 +6932,11 @@ mod test {
             form.new_name = "renamed".to_string();
         }
         app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(Vec::new()),
+        });
         let EditorState::ExistingModule(form) = &app.editor else {
             panic!("expected ExistingModule");
         };
@@ -6366,6 +6953,172 @@ mod test {
         assert!(form.error.is_some());
         assert!(!form.read_only);
         assert!(!app.dirty);
+    }
+
+    fn a_reference_site(name: &str) -> ReferenceSite {
+        ReferenceSite {
+            referrer: LogicalPath {
+                modules: Vec::new(),
+                name: disk_entry_name(name),
+            },
+            kind: gui_core::ReferenceSiteKind::RequirementDependency { index: 0 },
+        }
+    }
+
+    #[test]
+    fn a_non_empty_find_references_reply_opens_the_broken_references_dialog_with_repair_defaulted() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+        app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+
+        let site_a = a_reference_site("referrer_a");
+        let site_b = a_reference_site("referrer_b");
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(vec![site_a.clone(), site_b.clone()]),
+        });
+
+        let dialog = app.broken_references_dialog.as_ref().expect("dialog should be open");
+        assert_eq!(dialog.new_name, "renamed");
+        assert_eq!(
+            dialog.choices,
+            vec![
+                (site_a, ReferenceAction::Repair),
+                (site_b, ReferenceAction::Repair),
+            ]
+        );
+        // The rename itself must not have been sent yet — it's gated on
+        // the modal's Confirm.
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.pending_request.is_none());
+    }
+
+    #[test]
+    fn broken_references_cancelled_closes_the_dialog_without_renaming() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+        app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(vec![a_reference_site("referrer")]),
+        });
+        assert!(app.broken_references_dialog.is_some());
+
+        app.broken_references_cancelled();
+
+        assert!(app.broken_references_dialog.is_none());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(!form.read_only);
+        assert_eq!(form.path, vec![disk_entry_name("setup")]);
+    }
+
+    #[test]
+    fn broken_references_confirmed_sends_rename_module_with_the_chosen_actions() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+        app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+        let site = a_reference_site("referrer");
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(vec![site.clone()]),
+        });
+        if let Some(dialog) = &mut app.broken_references_dialog {
+            dialog.choices = vec![(site.clone(), ReferenceAction::Remove)];
+        }
+
+        app.broken_references_confirmed();
+
+        let dialog = app.broken_references_dialog.as_ref().expect("dialog stays open while pending");
+        let request = dialog.pending_request.expect("confirm should track a pending request");
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RenameModule(Ok(())),
+        });
+
+        assert!(app.broken_references_dialog.is_none());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert_eq!(form.path, vec![disk_entry_name("renamed")]);
+        assert!(form.read_only);
+        assert_eq!(app.selected_module, vec![disk_entry_name("renamed")]);
+    }
+
+    #[test]
+    fn a_failed_rename_after_confirm_keeps_the_broken_references_dialog_open() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+        app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(vec![a_reference_site("referrer")]),
+        });
+
+        app.broken_references_confirmed();
+        let request = app
+            .broken_references_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RenameModule(Err(gui_core::RenameModuleError::NotFound)),
+        });
+
+        let dialog = app.broken_references_dialog.as_ref().expect("dialog should stay open on failure");
+        assert!(dialog.error.is_some());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert_eq!(form.path, vec![disk_entry_name("setup")]);
+    }
+
+    #[test]
+    fn a_module_rename_with_no_references_skips_the_broken_references_dialog() {
+        let mut app = test_app();
+        app.select_module(vec![disk_entry_name("setup")]);
+        app.editor_edit_clicked();
+        if let EditorState::ExistingModule(form) = &mut app.editor {
+            form.new_name = "renamed".to_string();
+        }
+        app.editor_create_clicked();
+        let find_request = app.module_rename_find_references_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(Vec::new()),
+        });
+
+        assert!(app.broken_references_dialog.is_none());
+        let EditorState::ExistingModule(form) = &app.editor else {
+            panic!("expected ExistingModule");
+        };
+        assert!(form.pending_request.is_some());
     }
 
     #[test]
@@ -6671,7 +7424,7 @@ mod test {
             dialog.new_name = "renamed".to_string();
         }
 
-        app.recreate_requirement_confirmed();
+        confirm_requirement_recreate_past_references(&mut app);
 
         let dialog = app
             .recreate_requirement_dialog
@@ -6683,13 +7436,67 @@ mod test {
     }
 
     #[test]
-    fn a_successful_delete_leg_immediately_chains_into_the_create_leg() {
+    fn recreate_requirement_confirmed_first_sends_find_references() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+
+        app.recreate_requirement_confirmed();
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert!(dialog.find_references_request.is_some());
+        assert!(dialog.pending_request.is_none());
+        assert!(!dialog.deleted);
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_non_empty_find_references_result_populates_choices_and_waits() {
         let mut app = app_editing_a_requirement();
         app.recreate_requirement_clicked();
         if let Some(dialog) = &mut app.recreate_requirement_dialog {
             dialog.new_name = "renamed".to_string();
         }
         app.recreate_requirement_confirmed();
+        let request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .find_references_request
+            .unwrap();
+        let site = ReferenceSite {
+            referrer: LogicalPath::root(disk_entry_name("other")),
+            kind: ReferenceSiteKind::RequirementDependency { index: 0 },
+        };
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::FindReferences(vec![site.clone()]),
+        });
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open for review");
+        assert!(dialog.checked_references);
+        assert!(dialog.pending_request.is_none());
+        assert_eq!(dialog.reference_choices, vec![(site, ReferenceAction::Repair)]);
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn a_successful_delete_leg_immediately_chains_into_the_create_leg() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        confirm_requirement_recreate_past_references(&mut app);
         let delete_request = app
             .recreate_requirement_dialog
             .as_ref()
@@ -6721,7 +7528,7 @@ mod test {
         if let Some(dialog) = &mut app.recreate_requirement_dialog {
             dialog.new_name = "renamed".to_string();
         }
-        app.recreate_requirement_confirmed();
+        confirm_requirement_recreate_past_references(&mut app);
         let request = app
             .recreate_requirement_dialog
             .as_ref()
@@ -6751,7 +7558,7 @@ mod test {
         if let Some(dialog) = &mut app.recreate_requirement_dialog {
             dialog.new_name = "renamed".to_string();
         }
-        app.recreate_requirement_confirmed();
+        confirm_requirement_recreate_past_references(&mut app);
         let delete_request = app
             .recreate_requirement_dialog
             .as_ref()
@@ -6783,13 +7590,189 @@ mod test {
     }
 
     #[test]
-    fn a_failed_create_leg_leaves_the_dialog_open_for_a_retry() {
+    fn a_successful_create_with_reference_choices_sends_repair_references_next() {
         let mut app = app_editing_a_requirement();
         app.recreate_requirement_clicked();
         if let Some(dialog) = &mut app.recreate_requirement_dialog {
             dialog.new_name = "renamed".to_string();
         }
         app.recreate_requirement_confirmed();
+        let find_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .find_references_request
+            .unwrap();
+        let site = ReferenceSite {
+            referrer: LogicalPath::root(disk_entry_name("other")),
+            kind: ReferenceSiteKind::RequirementDependency { index: 0 },
+        };
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(vec![site]),
+        });
+        // Second click proceeds past the (now-reviewed) reference choices.
+        app.recreate_requirement_confirmed();
+        let delete_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+        let create_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddRequirement(Ok(())),
+        });
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open for the repair leg");
+        assert!(dialog.repairing);
+        assert!(dialog.pending_request.is_some());
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("definition")))
+        );
+    }
+
+    #[test]
+    fn a_successful_repair_references_closes_the_dialog_and_navigates() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+            dialog.checked_references = true;
+            dialog.reference_choices = vec![(
+                ReferenceSite {
+                    referrer: LogicalPath::root(disk_entry_name("other")),
+                    kind: ReferenceSiteKind::RequirementDependency { index: 0 },
+                },
+                ReferenceAction::Repair,
+            )];
+        }
+        app.recreate_requirement_confirmed();
+        let delete_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+        let create_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddRequirement(Ok(())),
+        });
+        let repair_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: repair_request,
+            outcome: Outcome::RepairReferences(Ok(())),
+        });
+
+        assert!(app.recreate_requirement_dialog.is_none());
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("renamed")))
+        );
+    }
+
+    #[test]
+    fn a_failed_repair_references_leaves_the_dialog_open_for_a_retry() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+            dialog.checked_references = true;
+            dialog.reference_choices = vec![(
+                ReferenceSite {
+                    referrer: LogicalPath::root(disk_entry_name("other")),
+                    kind: ReferenceSiteKind::RequirementDependency { index: 0 },
+                },
+                ReferenceAction::Repair,
+            )];
+        }
+        app.recreate_requirement_confirmed();
+        let delete_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveRequirement(true),
+        });
+        let create_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddRequirement(Ok(())),
+        });
+        let repair_request = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: repair_request,
+            outcome: Outcome::RepairReferences(Err(ReferenceRepairError::RepairWithoutNewTarget)),
+        });
+
+        let dialog = app
+            .recreate_requirement_dialog
+            .as_ref()
+            .expect("dialog stays open so the user can retry the repair");
+        assert!(dialog.repairing);
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+
+        // Retrying only resends the repair, not the delete/create legs.
+        app.recreate_requirement_confirmed();
+        let dialog = app.recreate_requirement_dialog.as_ref().unwrap();
+        assert!(dialog.pending_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_create_leg_leaves_the_dialog_open_for_a_retry() {
+        let mut app = app_editing_a_requirement();
+        app.recreate_requirement_clicked();
+        if let Some(dialog) = &mut app.recreate_requirement_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        confirm_requirement_recreate_past_references(&mut app);
         let delete_request = app
             .recreate_requirement_dialog
             .as_ref()
@@ -6947,7 +7930,7 @@ mod test {
             dialog.new_name = "renamed".to_string();
         }
 
-        app.recreate_test_confirmed();
+        confirm_test_recreate_past_references(&mut app);
 
         let dialog = app
             .recreate_test_dialog
@@ -6959,13 +7942,33 @@ mod test {
     }
 
     #[test]
+    fn recreate_test_confirmed_first_sends_find_references() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+
+        app.recreate_test_confirmed();
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog should still be open while pending");
+        assert!(dialog.find_references_request.is_some());
+        assert!(dialog.pending_request.is_none());
+        assert!(!dialog.deleted);
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
     fn a_successful_test_delete_leg_immediately_chains_into_the_create_leg() {
         let mut app = app_editing_a_test();
         app.recreate_test_clicked();
         if let Some(dialog) = &mut app.recreate_test_dialog {
             dialog.new_name = "renamed".to_string();
         }
-        app.recreate_test_confirmed();
+        confirm_test_recreate_past_references(&mut app);
         let delete_request = app
             .recreate_test_dialog
             .as_ref()
@@ -6997,7 +8000,7 @@ mod test {
         if let Some(dialog) = &mut app.recreate_test_dialog {
             dialog.new_name = "renamed".to_string();
         }
-        app.recreate_test_confirmed();
+        confirm_test_recreate_past_references(&mut app);
         let request = app
             .recreate_test_dialog
             .as_ref()
@@ -7027,7 +8030,7 @@ mod test {
         if let Some(dialog) = &mut app.recreate_test_dialog {
             dialog.new_name = "renamed".to_string();
         }
-        app.recreate_test_confirmed();
+        confirm_test_recreate_past_references(&mut app);
         let delete_request = app
             .recreate_test_dialog
             .as_ref()
@@ -7059,13 +8062,189 @@ mod test {
     }
 
     #[test]
-    fn a_failed_test_create_leg_leaves_the_dialog_open_for_a_retry() {
+    fn a_successful_test_create_with_reference_choices_sends_repair_references_next() {
         let mut app = app_editing_a_test();
         app.recreate_test_clicked();
         if let Some(dialog) = &mut app.recreate_test_dialog {
             dialog.new_name = "renamed".to_string();
         }
         app.recreate_test_confirmed();
+        let find_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .find_references_request
+            .unwrap();
+        let site = ReferenceSite {
+            referrer: LogicalPath::root(disk_entry_name("other")),
+            kind: ReferenceSiteKind::RequirementTestReference { index: 0 },
+        };
+        app.apply_event(Event::Completed {
+            request: find_request,
+            outcome: Outcome::FindReferences(vec![site]),
+        });
+        // Second click proceeds past the (now-reviewed) reference choices.
+        app.recreate_test_confirmed();
+        let delete_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveTest(true),
+        });
+        let create_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddTest(Ok(())),
+        });
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog stays open for the repair leg");
+        assert!(dialog.repairing);
+        assert!(dialog.pending_request.is_some());
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("smoke")))
+        );
+    }
+
+    #[test]
+    fn a_successful_test_repair_references_closes_the_dialog_and_navigates() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+            dialog.checked_references = true;
+            dialog.reference_choices = vec![(
+                ReferenceSite {
+                    referrer: LogicalPath::root(disk_entry_name("other")),
+                    kind: ReferenceSiteKind::RequirementTestReference { index: 0 },
+                },
+                ReferenceAction::Repair,
+            )];
+        }
+        app.recreate_test_confirmed();
+        let delete_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveTest(true),
+        });
+        let create_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddTest(Ok(())),
+        });
+        let repair_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: repair_request,
+            outcome: Outcome::RepairReferences(Ok(())),
+        });
+
+        assert!(app.recreate_test_dialog.is_none());
+        assert_eq!(
+            app.selection,
+            Some(LogicalPath::root(disk_entry_name("renamed")))
+        );
+    }
+
+    #[test]
+    fn a_failed_test_repair_references_leaves_the_dialog_open_for_a_retry() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+            dialog.checked_references = true;
+            dialog.reference_choices = vec![(
+                ReferenceSite {
+                    referrer: LogicalPath::root(disk_entry_name("other")),
+                    kind: ReferenceSiteKind::RequirementTestReference { index: 0 },
+                },
+                ReferenceAction::Repair,
+            )];
+        }
+        app.recreate_test_confirmed();
+        let delete_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: delete_request,
+            outcome: Outcome::RemoveTest(true),
+        });
+        let create_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+        app.apply_event(Event::Completed {
+            request: create_request,
+            outcome: Outcome::AddTest(Ok(())),
+        });
+        let repair_request = app
+            .recreate_test_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
+
+        app.apply_event(Event::Completed {
+            request: repair_request,
+            outcome: Outcome::RepairReferences(Err(ReferenceRepairError::RepairWithoutNewTarget)),
+        });
+
+        let dialog = app
+            .recreate_test_dialog
+            .as_ref()
+            .expect("dialog stays open so the user can retry the repair");
+        assert!(dialog.repairing);
+        assert!(dialog.error.is_some());
+        assert!(dialog.pending_request.is_none());
+
+        // Retrying only resends the repair, not the delete/create legs.
+        app.recreate_test_confirmed();
+        let dialog = app.recreate_test_dialog.as_ref().unwrap();
+        assert!(dialog.pending_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_test_create_leg_leaves_the_dialog_open_for_a_retry() {
+        let mut app = app_editing_a_test();
+        app.recreate_test_clicked();
+        if let Some(dialog) = &mut app.recreate_test_dialog {
+            dialog.new_name = "renamed".to_string();
+        }
+        confirm_test_recreate_past_references(&mut app);
         let delete_request = app
             .recreate_test_dialog
             .as_ref()

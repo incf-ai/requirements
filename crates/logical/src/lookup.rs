@@ -14,6 +14,19 @@ pub(crate) fn get_module<'a>(root: &'a ModuleDraft, path: &[EntryName]) -> Optio
     Some(current)
 }
 
+/// Mutable counterpart to `get_module`, for `reference_repair`'s in-place
+/// edits.
+pub(crate) fn get_module_mut<'a>(
+    root: &'a mut ModuleDraft,
+    path: &[EntryName],
+) -> Option<&'a mut ModuleDraft> {
+    let mut current = root;
+    for name in path {
+        current = current.modules.get_mut(name)?;
+    }
+    Some(current)
+}
+
 pub(crate) fn get_requirement<'a>(
     root: &'a ModuleDraft,
     target: &LogicalPath,
@@ -76,6 +89,18 @@ mod test {
     fn returns_none_for_a_missing_module() {
         let root = sample_tree();
         assert!(get_module(&root, &[EntryName("nonexistent".to_string())]).is_none());
+    }
+
+    #[test]
+    fn finds_a_nested_module_mutably() {
+        let mut root = sample_tree();
+        assert!(get_module_mut(&mut root, &[EntryName("embeddings".to_string())]).is_some());
+    }
+
+    #[test]
+    fn returns_none_mutably_for_a_missing_module() {
+        let mut root = sample_tree();
+        assert!(get_module_mut(&mut root, &[EntryName("nonexistent".to_string())]).is_none());
     }
 
     #[test]

@@ -259,6 +259,16 @@ pub enum CommitForPathError {
     NotTracked { path: PathBuf },
 }
 
+impl CommitForPathError {
+    /// True when `path` simply has no commit in history yet (rather than a
+    /// genuine git failure) — the ordinary state for an entry that's been
+    /// added in this editing session but not yet saved/committed, not
+    /// something worth surfacing as an error.
+    pub fn is_not_tracked(&self) -> bool {
+        matches!(self, CommitForPathError::NotTracked { .. })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum InitRepositoryError {
     #[error("failed to run git init: {source}")]
@@ -525,6 +535,14 @@ pub enum CommitForRemoteError {
     Empty { url: String },
     #[error("no commit touches {path} in {url}")]
     NotTracked { url: String, path: PathBuf },
+}
+
+impl CommitForRemoteError {
+    /// Same "not an error, just not committed yet" case as
+    /// `CommitForPathError::is_not_tracked`.
+    pub fn is_not_tracked(&self) -> bool {
+        matches!(self, CommitForRemoteError::NotTracked { .. })
+    }
 }
 
 impl RemoteGit for SystemGit {
