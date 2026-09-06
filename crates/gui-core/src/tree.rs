@@ -7,8 +7,8 @@ use logical::LogicalPath;
 use logical::draft::{ModuleDraft, ProjectDraft};
 
 use crate::{
-    EntryDetail, EntryKind, EntryStatus, ModulePools, ModuleSummary, Outcome, ProjectState, RequirementMetStatus,
-    StatusV1, TreeNode, TreeSnapshot,
+    EntryDetail, EntryKind, EntryPath, EntryStatus, ModulePools, ModuleSummary, Outcome, ProjectState,
+    RequirementMetStatus, StatusV1, TreeNode, TreeSnapshot,
 };
 
 fn draft_ref(state: &ProjectState) -> &ProjectDraft {
@@ -83,7 +83,7 @@ fn build_tree_node(
         ));
     }
 
-    for req_name in module.requirements.keys() {
+    for (req_name, requirement) in &module.requirements {
         let status = match validated {
             None => EntryStatus::Unvalidated,
             Some(validated) => {
@@ -98,30 +98,34 @@ fn build_tree_node(
                 }
             }
         };
+        // A result's place in the tree follows its place on disk now —
+        // nested under its owning requirement — rather than flat
+        // alongside it. Results don't have a "met" concept of their own
+        // any more than tests do (see README's "Requirement-met
+        // semantics" in `logical`'s README): that's a property of the
+        // requirement, computed from its tests and their results.
+        let result_children = requirement
+            .results
+            .keys()
+            .map(|result_name| TreeNode {
+                name: result_name.clone(),
+                kind: EntryKind::Result,
+                status: EntryStatus::Unvalidated,
+                children: Vec::new(),
+            })
+            .collect();
         children.push(TreeNode {
             name: req_name.clone(),
             kind: EntryKind::Requirement,
             status,
-            children: Vec::new(),
+            children: result_children,
         });
     }
 
-    // Tests/results don't have a "met" concept of their own — see
-    // README's "Requirement-met semantics" (in `logical`'s README):
-    // "met" is a property of a requirement, computed from its tests and
-    // their results, not a status a test or result carries itself.
     for test_name in module.tests.keys() {
         children.push(TreeNode {
             name: test_name.clone(),
             kind: EntryKind::Test,
-            status: EntryStatus::Unvalidated,
-            children: Vec::new(),
-        });
-    }
-    for result_name in module.results.keys() {
-        children.push(TreeNode {
-            name: result_name.clone(),
-            kind: EntryKind::Result,
             status: EntryStatus::Unvalidated,
             children: Vec::new(),
         });
@@ -135,46 +139,45 @@ fn build_tree_node(
     }
 }
 
-pub(crate) fn get_entry_detail(state: &ProjectState, target: &LogicalPath, kind: EntryKind) -> Outcome {
+pub(crate) fn get_entry_detail(state: &ProjectState, target: &EntryPath) -> Outcome {
     let draft = draft_ref(state);
-    let Some(module) = resolve_module(&draft.tree, &target.modules) else {
-        return Outcome::EntryDetail(None);
-    };
 
-    // Resolve against the pool matching `kind` only — a requirement,
-    // test, and result can share a name within the same module, so
-    // trying each pool in turn and returning the first hit (the previous
-    // behavior) silently returned the wrong entry whenever that happened.
-    let detail = match kind {
-        EntryKind::Requirement => module.requirements.get(&target.name).map(|requirement| EntryDetail::Requirement {
-            title: requirement.title.clone(),
-            requirement_text: requirement.requirement_text.clone(),
-            requirement_guidance: requirement.requirement_guidance.clone(),
-            test_guidance: requirement.test_guidance.clone(),
-            dependencies: requirement.dependencies.clone(),
-            attachments: requirement.attachments.iter().cloned().collect(),
-            met_status: requirement_met_status(state, target),
-            results: logical::results_for_requirement(&draft.tree, target),
-            original: Box::new(requirement.clone()),
-        }),
-        EntryKind::Test => module.tests.get(&target.name).map(|test| EntryDetail::Test {
-            title: test.title.clone(),
-            test_text: test.test_text.clone(),
-            result_kind: test.result_kind.clone(),
-            attachments: test.attachments.iter().cloned().collect(),
-            template_files: test.template.iter().cloned().collect(),
-            original: Box::new(test.clone()),
-        }),
-        EntryKind::Result => module.results.get(&target.name).map(|result| EntryDetail::Result {
-            title: result.title.clone(),
-            requirement_path: result.requirement_path.0.clone(),
-            requirement_commit: result.requirement_commit.clone(),
-            test_path: result.test_path.0.clone(),
-            test_commit: result.test_commit.clone(),
-            attachments: result.attachments.iter().cloned().collect(),
-            original: Box::new(result.clone()),
-        }),
-        EntryKind::Module => None,
+    let detail = match target {
+        EntryPath::Requirement(target) => resolve_module(&draft.tree, &target.modules)
+            .and_then(|module| module.requirements.get(&target.name))
+            .map(|requirement| EntryDetail::Requirement {
+                title: requirement.title.clone(),
+                requirement_text: requirement.requirement_text.clone(),
+                requirement_guidance: requirement.requirement_guidance.clone(),
+                test_guidance: requirement.test_guidance.clone(),
+                dependencies: requirement.dependencies.clone(),
+                attachments: requirement.attachments.iter().cloned().collect(),
+                met_status: requirement_met_status(state, target),
+                results: logical::results_for_requirement(&draft.tree, target),
+                original: Box::new(requirement.clone()),
+            }),
+        EntryPath::Test(target) => resolve_module(&draft.tree, &target.modules)
+            .and_then(|module| module.tests.get(&target.name))
+            .map(|test| EntryDetail::Test {
+                title: test.title.clone(),
+                test_text: test.test_text.clone(),
+                result_kind: test.result_kind.clone(),
+                attachments: test.attachments.iter().cloned().collect(),
+                template_files: test.template.iter().cloned().collect(),
+                original: Box::new(test.clone()),
+            }),
+        EntryPath::Result(target) => resolve_module(&draft.tree, &target.requirement.modules)
+            .and_then(|module| module.requirements.get(&target.requirement.name))
+            .and_then(|requirement| requirement.results.get(&target.name))
+            .map(|result| EntryDetail::Result {
+                title: result.title.clone(),
+                requirement: target.requirement.clone(),
+                requirement_commit: result.requirement_commit.clone(),
+                test_path: result.test_path.0.clone(),
+                test_commit: result.test_commit.clone(),
+                attachments: result.attachments.iter().cloned().collect(),
+                original: Box::new(result.clone()),
+            }),
     };
     Outcome::EntryDetail(detail)
 }
@@ -245,9 +248,9 @@ fn accumulate_module_summary(
     summary.submodule_count += module.modules.len();
     summary.requirement_count += module.requirements.len();
     summary.test_count += module.tests.len();
-    summary.result_count += module.results.len();
+    summary.result_count += module.requirements.values().map(|r| r.results.len()).sum::<usize>();
 
-    for req_name in module.requirements.keys() {
+    for (req_name, requirement) in &module.requirements {
         let target = LogicalPath {
             modules: path_modules.to_vec(),
             name: req_name.clone(),
@@ -257,12 +260,12 @@ fn accumulate_module_summary(
             RequirementMetStatus::Unmet(_) => summary.requirements_unmet += 1,
             RequirementMetStatus::Unvalidated => {}
         }
-    }
-    for result in module.results.values() {
-        match result.status {
-            StatusV1::Pass => summary.results_pass += 1,
-            StatusV1::Fail => summary.results_fail += 1,
-            StatusV1::Incomplete => summary.results_incomplete += 1,
+        for result in requirement.results.values() {
+            match result.status {
+                StatusV1::Pass => summary.results_pass += 1,
+                StatusV1::Fail => summary.results_fail += 1,
+                StatusV1::Incomplete => summary.results_incomplete += 1,
+            }
         }
     }
 

@@ -29,7 +29,6 @@ fn import_module_tree(tree: ModuleTree) -> ModuleDraft {
             (r.name.clone(), import_requirement(r))
         }),
         tests: named_map(tree.tests, |t| (t.name.clone(), import_test(t))),
-        results: named_map(tree.results, |r| (r.name.clone(), import_result(r))),
         modules: named_map(tree.modules, |m| (m.name.clone(), import_submodule(m))),
     }
 }
@@ -76,6 +75,7 @@ fn import_requirement(requirement: RequirementOnDisk) -> RequirementDraft {
         attachments: attachment_paths(requirement.attachments),
         attachment_refs,
         include_attachments_in_commit: definition.include_attachments_in_commit,
+        results: named_map(requirement.results, |r| (r.name.clone(), import_result(r))),
         commit: requirement.commit,
     }
 }
@@ -120,7 +120,6 @@ fn import_result(result: ResultOnDisk) -> ResultDraft {
 
     ResultDraft {
         title: definition.title,
-        requirement_path: definition.requirement_path,
         requirement_commit: definition.requirement_commit,
         test_path: definition.test_path,
         test_commit: definition.test_commit,
@@ -188,6 +187,7 @@ mod test {
             requirement_guidance: None,
             test_guidance: None,
             attachments: Vec::new(),
+            results: Vec::new(),
             commit: Some("c1".to_string()),
         };
 
@@ -241,8 +241,16 @@ mod test {
         assert_eq!(draft.definition.name, "Test Project");
         assert_eq!(draft.tree.requirements.len(), 3);
         assert_eq!(draft.tree.tests.len(), 3);
-        assert_eq!(draft.tree.results.len(), 3);
         assert_eq!(draft.tree.modules.len(), 2);
+        assert_eq!(
+            draft
+                .tree
+                .requirements
+                .values()
+                .map(|r| r.results.len())
+                .sum::<usize>(),
+            3
+        );
     }
 
     #[test]
@@ -298,17 +306,20 @@ mod test {
     }
 
     #[test]
-    fn imports_a_result_with_requirement_and_test_commit_pairs() {
+    fn imports_a_result_nested_under_its_requirement_with_a_test_commit_pair() {
         let on_disk = disk::load_project(&StdFilesystem, &FixedGit, &test_project_dir()).unwrap();
         let draft = import_project(on_disk);
 
-        let design = draft
+        let design_requirement = draft
             .tree
+            .requirements
+            .get(&disk::EntryName("design".to_string()))
+            .unwrap();
+        let design_result = design_requirement
             .results
             .get(&disk::EntryName("design".to_string()))
             .unwrap();
-        assert_eq!(design.requirement_path.0, "requirements/design");
-        assert_eq!(design.test_path.0, "tests/smoke");
+        assert_eq!(design_result.test_path.0, "tests/smoke");
     }
 
     #[test]

@@ -5,21 +5,21 @@ use disk::EntryName;
 use thiserror::Error;
 
 use crate::draft::requirement::RequirementDraft;
-use crate::draft::result::ResultDraft;
 use crate::draft::test::TestDraft;
 use crate::pool::{AddPoolFileError, add_pool_file};
 use crate::sanitize::{InvalidNameError, sanitize_entry_name};
 
-/// The `attachments/`, `templates/`, `requirements/`, `tests/`, `results/`,
-/// and `modules/` children shared by both the project root and every
-/// submodule — see `crates/logical/README.md`'s data model section.
+/// The `attachments/`, `templates/`, `requirements/`, `tests/`, and
+/// `modules/` children shared by both the project root and every submodule —
+/// see `crates/logical/README.md`'s data model section. Results are not a
+/// direct child here — each lives nested under its owning
+/// `RequirementDraft.results`.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleDraft {
     pub attachments: BTreeSet<PathBuf>,
     pub templates: BTreeSet<PathBuf>,
     pub requirements: BTreeMap<EntryName, RequirementDraft>,
     pub tests: BTreeMap<EntryName, TestDraft>,
-    pub results: BTreeMap<EntryName, ResultDraft>,
     pub modules: BTreeMap<EntryName, ModuleDraft>,
 }
 
@@ -70,7 +70,7 @@ pub fn title_case_from_name(name: &str) -> String {
         .join(" ")
 }
 
-fn add_named<T>(
+pub(crate) fn add_named<T>(
     map: &mut BTreeMap<EntryName, T>,
     name: &str,
     value: T,
@@ -169,18 +169,6 @@ impl ModuleDraft {
             }
             std::collections::btree_map::Entry::Vacant(_) => Err(UpdateNamedChildError::NotFound),
         }
-    }
-
-    pub fn add_result(
-        &mut self,
-        name: &str,
-        result: ResultDraft,
-    ) -> Result<(), AddNamedChildError> {
-        add_named(&mut self.results, name, result)
-    }
-
-    pub fn remove_result(&mut self, name: &str) -> Option<ResultDraft> {
-        self.results.remove(&EntryName(name.to_string()))
     }
 
     pub fn add_attachment(&mut self, path: &Path) -> Result<(), AddPoolFileError> {
@@ -325,30 +313,6 @@ mod test {
     }
 
     #[test]
-    fn add_result_then_remove_round_trips() {
-        let mut module = ModuleDraft::default();
-        let result = crate::draft::result::ResultDraft::new(
-            "Definition",
-            disk::ReferencePath("requirements/definition".to_string()),
-            "abc",
-            disk::ReferencePath("tests/generic_test".to_string()),
-            "def",
-        );
-        module.add_result("definition", result).unwrap();
-        assert!(module.remove_result("definition").is_some());
-    }
-
-    fn minimal_result_draft() -> crate::draft::result::ResultDraft {
-        crate::draft::result::ResultDraft::new(
-            "Definition",
-            disk::ReferencePath("requirements/definition".to_string()),
-            "abc",
-            disk::ReferencePath("tests/generic_test".to_string()),
-            "def",
-        )
-    }
-
-    #[test]
     fn add_requirement_rejects_a_duplicate_name() {
         let mut module = ModuleDraft::default();
         module
@@ -368,18 +332,6 @@ mod test {
             .unwrap();
         let err = module
             .add_test("generic_test", test_draft("Generic Test"))
-            .unwrap_err();
-        assert!(matches!(err, AddNamedChildError::AlreadyExists(_)));
-    }
-
-    #[test]
-    fn add_result_rejects_a_duplicate_name() {
-        let mut module = ModuleDraft::default();
-        module
-            .add_result("definition", minimal_result_draft())
-            .unwrap();
-        let err = module
-            .add_result("definition", minimal_result_draft())
             .unwrap_err();
         assert!(matches!(err, AddNamedChildError::AlreadyExists(_)));
     }

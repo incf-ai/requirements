@@ -29,7 +29,6 @@ mod test {
         assert_eq!(project.definition.name, "Capstone");
         assert!(project.tree.requirements.is_empty());
         assert!(project.tree.tests.is_empty());
-        assert!(project.tree.results.is_empty());
         assert!(project.tree.modules.is_empty());
         assert!(project.tree.attachments.is_empty());
         assert!(project.tree.templates.is_empty());

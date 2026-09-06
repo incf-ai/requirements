@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use gui_core::{
     Command, DependencyReferenceKind, EntryName, LocalGitReference, LogicalPath, ReferencePath,
-    RemoteGitReference, RequestId, RequirementDraft, ResultDraft, ResultKindV1, StatusV1,
+    RemoteGitReference, RequestId, RequirementDraft, ResultDraft, ResultKindV1, ResultPath, StatusV1,
     TestDraft, TestReferenceKind,
 };
 
@@ -482,16 +482,24 @@ impl TestFormState {
     }
 }
 
-/// `requirement_path`/`test_path`/their commits are typed as plain text
-/// here — there's no reference-picker UI yet (that needs the tree to
-/// support "pick an entry" selection mode, not just click-to-view). A
-/// user has to know the reference path/commit to type in by hand, same as
-/// hand-authoring the RON directly would require.
+/// `requirement` is picked structurally (via the shared path-picker modal)
+/// rather than typed as text — a result's owning requirement is where it's
+/// physically nested on disk now, not a free-form reference string, and
+/// (unlike `test_path`, which stays a genuine cross-tree reference) it's
+/// fixed once the result is created: `editing_target: Some(_)` means it's
+/// already known and no longer editable at all, only `None` (create mode)
+/// lets the picker set it. `test_path`/its commit are still typed as plain
+/// text — there's no reference-picker requirement for those beyond the
+/// existing "Pick…" button.
 #[derive(Debug)]
 pub struct ResultFormState {
     pub name: String,
     pub title: String,
-    pub requirement_path: String,
+    /// `None` only in create mode before a requirement has been picked —
+    /// `build_command`'s `AddResult` branch is only ever reached once the
+    /// UI has required this to be `Some` (see `render_result_form`'s Create
+    /// button gating).
+    pub requirement: Option<LogicalPath>,
     pub requirement_commit: String,
     pub test_path: String,
     pub test_commit: String,
@@ -500,7 +508,7 @@ pub struct ResultFormState {
     /// reasoning, preserving `attachment_refs` (there's no UI to edit that
     /// at all today).
     pub original: Box<ResultDraft>,
-    pub editing_target: Option<LogicalPath>,
+    pub editing_target: Option<ResultPath>,
     /// See `RequirementFormState::read_only`'s doc comment — same idea.
     pub read_only: bool,
     /// See `RequirementFormState::edited`'s doc comment — same idea.
@@ -518,14 +526,13 @@ impl Default for ResultFormState {
         ResultFormState {
             name: String::new(),
             title: String::new(),
-            requirement_path: String::new(),
+            requirement: None,
             requirement_commit: String::new(),
             test_path: String::new(),
             test_commit: String::new(),
             status: StatusV1::default(),
             original: Box::new(ResultDraft::new(
                 String::new(),
-                ReferencePath(String::new()),
                 String::new(),
                 ReferencePath(String::new()),
                 String::new(),
@@ -543,10 +550,13 @@ impl Default for ResultFormState {
 }
 
 impl ResultFormState {
-    pub fn build_command(&self, module: Vec<EntryName>, request: RequestId) -> Command {
+    /// `module` is unused for a result's own creation — its create-target
+    /// is `self.requirement`, not the ambient "current module" every other
+    /// `Add*` command takes — kept in the signature only so
+    /// `GuiApp::editor_create_clicked` can dispatch to every form uniformly.
+    pub fn build_command(&self, _module: Vec<EntryName>, request: RequestId) -> Command {
         let mut result = (*self.original).clone();
         result.title = self.title.clone();
-        result.requirement_path = gui_core::ReferencePath(self.requirement_path.clone());
         result.requirement_commit = self.requirement_commit.clone();
         result.test_path = gui_core::ReferencePath(self.test_path.clone());
         result.test_commit = self.test_commit.clone();
@@ -559,7 +569,10 @@ impl ResultFormState {
                 request,
             },
             None => Command::AddResult {
-                module,
+                requirement: self
+                    .requirement
+                    .clone()
+                    .expect("Create is disabled until a requirement is picked"),
                 name: EntryName(self.name.clone()),
                 result: Box::new(result),
                 request,
@@ -915,7 +928,6 @@ mod test {
     fn result_form_build_command_uses_the_forms_own_status_not_originals() {
         let original = ResultDraft::new(
             "Old Title",
-            ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("tests/generic_test".to_string()),
             "t1",
@@ -924,7 +936,10 @@ mod test {
 
         let form = ResultFormState {
             title: "New Title".to_string(),
-            editing_target: Some(LogicalPath::root(EntryName("definition".to_string()))),
+            editing_target: Some(ResultPath {
+                requirement: LogicalPath::root(EntryName("definition".to_string())),
+                name: EntryName("result".to_string()),
+            }),
             original: Box::new(original),
             status: StatusV1::Pass,
             ..Default::default()

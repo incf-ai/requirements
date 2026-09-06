@@ -89,6 +89,13 @@ impl<'a> Context<'a> {
             };
             self.dependency_edges.entry(path.clone()).or_default();
             self.check_requirement(&path, requirement, remote_git);
+            // A result's identity is nested under its requirement, not a
+            // standalone `LogicalPath` of its own — validation errors
+            // attributed to a result (attachment pool mismatches, template
+            // coverage) are reported against the owning requirement's path.
+            for result in requirement.results.values() {
+                self.check_result(&path, result);
+            }
         }
         for (name, test) in &module.tests {
             let path = LogicalPath {
@@ -96,13 +103,6 @@ impl<'a> Context<'a> {
                 name: name.clone(),
             };
             self.check_test(&path, test);
-        }
-        for (name, result) in &module.results {
-            let path = LogicalPath {
-                modules: prefix.to_vec(),
-                name: name.clone(),
-            };
-            self.check_result(&path, result);
         }
         for (name, submodule) in &module.modules {
             let mut child_prefix = prefix.to_vec();
@@ -405,6 +405,21 @@ mod test {
         StatusV1, TestReferenceKind,
     };
     use syscalls::{CommitForRemoteError, StdFilesystem};
+
+    /// Adds `result` under `requirement_name`'s own `results` map — the
+    /// only way to add a result now that ownership is structural.
+    fn add_result_to(
+        tree: &mut ModuleDraft,
+        requirement_name: &str,
+        result_name: &str,
+        result: ResultDraft,
+    ) {
+        tree.requirements
+            .get_mut(&EntryName(requirement_name.to_string()))
+            .unwrap()
+            .add_result(result_name, result)
+            .unwrap();
+    }
 
     /// A minimal, fully-resolving project: requirement "definition" ->
     /// test "generic_test" (both at commit "c1"), no dependencies, no
@@ -924,7 +939,6 @@ mod test {
         let mut project = project_with_template_test();
         let mut result = ResultDraft::new(
             "Definition",
-            ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("/tests/generic_test".to_string()),
             "t1",
@@ -932,7 +946,7 @@ mod test {
         result.status = StatusV1::Pass;
         // Attachment file name doesn't match the test's "spec.typ" template.
         result.add_attachment(Path::new("wrong.typ")).unwrap();
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         let errors = validate(project, &FixedRemoteGit).unwrap_err();
         assert!(
@@ -947,7 +961,6 @@ mod test {
         let mut project = project_with_template_test();
         let mut result = ResultDraft::new(
             "Definition",
-            ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("/tests/generic_test".to_string()),
             "t1",
@@ -969,7 +982,7 @@ mod test {
                 name: EntryName("shared".to_string()),
                 path: PathBuf::from("shared.typ"),
             });
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         assert!(validate(project, &FixedRemoteGit).is_ok());
     }
@@ -979,12 +992,11 @@ mod test {
         let mut project = minimal_project();
         let result = ResultDraft::new(
             "Definition",
-            ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("/tests/generic_test".to_string()),
             "t1",
         );
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         assert!(validate(project, &FixedRemoteGit).is_ok());
     }
@@ -994,12 +1006,11 @@ mod test {
         let mut project = minimal_project();
         let result = ResultDraft::new(
             "Definition",
-            ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("/tests/nonexistent".to_string()),
             "t1",
         );
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         let errors = validate(project, &FixedRemoteGit).unwrap_err();
         assert_eq!(errors.len(), 1);

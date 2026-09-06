@@ -12,6 +12,8 @@ use logical::{LogicalPath, convert, validate};
 use syscalls::{Filesystem, Git, RemoteGit};
 use thiserror::Error;
 
+mod upgrade;
+
 /// See `crates/cli/README.md`, "Architecture": `main()` is a thin shim
 /// around this. Everything is a plain function call — no subprocess, no
 /// argv/stdout plumbing — so it's coverage-instrumented like any other
@@ -65,12 +67,16 @@ enum Command {
     AddResult {
         #[arg(long, default_value = "")]
         module: String,
+        /// The requirement (within `--module`) this result belongs to —
+        /// mirrors `LinkTest`'s `--requirement`: a result's owning
+        /// requirement is structural (it's saved nested under it), not a
+        /// reference-path field.
+        #[arg(long)]
+        requirement: String,
         #[arg(long)]
         name: String,
         #[arg(long)]
         title: String,
-        #[arg(long)]
-        requirement_path: String,
         #[arg(long)]
         requirement_commit: String,
         #[arg(long)]
@@ -127,6 +133,13 @@ enum Command {
         #[arg(long, default_value = "")]
         module: String,
     },
+    /// One-shot migration of a project still using the old flat
+    /// `results/<name>/` layout (a sibling of `requirements/`/`tests/` at
+    /// each module level) to the current nested
+    /// `requirements/<name>/results/<name>/` layout. See
+    /// `crates/cli/src/upgrade.rs`. Safe to run against an
+    /// already-migrated project (reports zero results migrated).
+    UpgradeResultsLayout,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -177,6 +190,8 @@ enum ErrorKind {
     AddNamedChild(#[from] logical::draft::AddNamedChildError),
     #[error("validation failed:\n{}", format_validation_errors(.0))]
     Validation(Vec<validate::ValidationError>),
+    #[error("failed to upgrade results layout: {0}")]
+    UpgradeResultsLayout(#[from] upgrade::Error),
 }
 
 fn format_validation_errors(errors: &[validate::ValidationError]) -> String {
@@ -267,9 +282,9 @@ fn run_command(
         }
         Command::AddResult {
             module,
+            requirement,
             name,
             title,
-            requirement_path,
             requirement_commit,
             test_path,
             test_commit,
@@ -278,15 +293,14 @@ fn run_command(
             mutate(fs, git, dir, |draft| {
                 let target = find_module_mut(&mut draft.tree, &module)
                     .ok_or_else(|| ErrorKind::ModuleNotFound(module.clone()))?;
-                let mut result = ResultDraft::new(
-                    title,
-                    ReferencePath(requirement_path),
-                    requirement_commit,
-                    ReferencePath(test_path),
-                    test_commit,
-                );
+                let requirement = target
+                    .requirements
+                    .get_mut(&EntryName(requirement.clone()))
+                    .ok_or(ErrorKind::RequirementNotFound(requirement))?;
+                let mut result =
+                    ResultDraft::new(title, requirement_commit, ReferencePath(test_path), test_commit);
                 result.status = status.into();
-                target.add_result(&name, result)?;
+                requirement.add_result(&name, result)?;
                 Ok(())
             })?;
             Ok("added".to_string())
@@ -385,6 +399,10 @@ fn run_command(
                     "incomplete".to_string()
                 },
             )
+        }
+        Command::UpgradeResultsLayout => {
+            let summary = upgrade::upgrade_results_layout(fs, dir)?;
+            Ok(format!("migrated {} result(s)", summary.migrated))
         }
     }
 }
@@ -615,8 +633,8 @@ mod test {
                     "definition",
                     "--title",
                     "Definition",
-                    "--requirement-path",
-                    "/requirements/definition",
+                    "--requirement",
+                    "definition",
                     "--requirement-commit",
                     "deadbeef",
                     "--test-path",
@@ -686,8 +704,8 @@ mod test {
                         name,
                         "--title",
                         "Title",
-                        "--requirement-path",
-                        "/requirements/definition",
+                        "--requirement",
+                        "definition",
                         "--requirement-commit",
                         "deadbeef",
                         "--test-path",
@@ -801,8 +819,8 @@ mod test {
                 "x",
                 "--title",
                 "X",
-                "--requirement-path",
-                "/requirements/x",
+                "--requirement",
+                "x",
                 "--requirement-commit",
                 "deadbeef",
                 "--test-path",
@@ -1178,14 +1196,26 @@ mod test {
     fn add_result_with_a_duplicate_name_is_an_error() {
         let dir = fresh_temp_dir("dup-result");
         run_ok(&dir, &["create-project", "--name", "Demo"]);
+        run_ok(
+            &dir,
+            &[
+                "add-requirement",
+                "--name",
+                "definition",
+                "--text",
+                "Text",
+                "--title",
+                "Definition",
+            ],
+        );
         let add_result_args = [
             "add-result",
             "--name",
             "definition",
             "--title",
             "Definition",
-            "--requirement-path",
-            "/requirements/definition",
+            "--requirement",
+            "definition",
             "--requirement-commit",
             "deadbeef",
             "--test-path",

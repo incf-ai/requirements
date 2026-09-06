@@ -242,11 +242,11 @@ where
             Command::UpdateTest { target, test, request } => self.update_test(target, test, request),
             Command::RemoveTest { target, request } => self.remove_test(target, request),
             Command::AddResult {
-                module,
+                requirement,
                 name,
                 result,
                 request,
-            } => self.add_result(module, name, result, request),
+            } => self.add_result(requirement, name, result, request),
             Command::UpdateResult { target, result, request } => self.update_result(target, result, request),
             Command::RemoveResult { target, request } => self.remove_result(target, request),
             Command::AddModule { module, name, request } => self.add_module(module, name, request),
@@ -284,8 +284,8 @@ where
             Command::RemoveResultAttachment { target, path, request } => {
                 self.remove_result_attachment(target, path, request)
             }
-            Command::GetEntryDetail { target, kind, request } => {
-                self.spawn_read(request, move |state| get_entry_detail(&state, &target, kind))
+            Command::GetEntryDetail { target, request } => {
+                self.spawn_read(request, move |state| get_entry_detail(&state, &target))
             }
             Command::GetRequirementMetStatus { target, request } => {
                 self.spawn_read(request, move |state| get_requirement_met_status(&state, &target))
@@ -695,18 +695,22 @@ where
 
     fn add_result(
         &mut self,
-        module: Vec<disk::EntryName>,
+        requirement: logical::LogicalPath,
         name: disk::EntryName,
         result: Box<logical::draft::ResultDraft>,
         request: RequestId,
     ) {
+        let logical::LogicalPath { modules, name: requirement_name } = requirement;
         self.mutate_module(
             request,
-            &module,
+            &modules,
             || Outcome::AddResult(Err(AddChildError::ModuleNotFound)),
             move |target_module| {
+                let Some(requirement) = target_module.requirements.get_mut(&requirement_name) else {
+                    return Outcome::AddResult(Err(AddChildError::RequirementNotFound));
+                };
                 Outcome::AddResult(
-                    target_module
+                    requirement
                         .add_result(name.as_str(), *result)
                         .map_err(AddChildError::Add),
                 )
@@ -716,16 +720,20 @@ where
 
     fn update_result(
         &mut self,
-        target: logical::LogicalPath,
+        target: logical::ResultPath,
         result: Box<logical::draft::ResultDraft>,
         request: RequestId,
     ) {
-        let logical::LogicalPath { modules, name } = target;
+        let logical::ResultPath { requirement, name } = target;
+        let logical::LogicalPath { modules, name: requirement_name } = requirement;
         self.update_in_module(
             request,
             &modules,
             move |module| {
-                if let std::collections::btree_map::Entry::Occupied(mut e) = module.results.entry(name) {
+                let Some(requirement) = module.requirements.get_mut(&requirement_name) else {
+                    return Err(UpdateChildError::NotFound);
+                };
+                if let std::collections::btree_map::Entry::Occupied(mut e) = requirement.results.entry(name) {
                     e.insert(*result);
                     Ok(())
                 } else {
@@ -736,12 +744,19 @@ where
         );
     }
 
-    fn remove_result(&mut self, target: logical::LogicalPath, request: RequestId) {
-        let logical::LogicalPath { modules, name } = target;
+    fn remove_result(&mut self, target: logical::ResultPath, request: RequestId) {
+        let logical::ResultPath { requirement, name } = target;
+        let logical::LogicalPath { modules, name: requirement_name } = requirement;
         self.remove_from_module(
             request,
             &modules,
-            move |module| module.remove_result(name.as_str()).is_some(),
+            move |module| {
+                module
+                    .requirements
+                    .get_mut(&requirement_name)
+                    .map(|requirement| requirement.remove_result(name.as_str()).is_some())
+                    .unwrap_or(false)
+            },
             Outcome::RemoveResult,
         );
     }
@@ -944,12 +959,16 @@ where
     /// result's local attachments): resolve the target's module, look up
     /// the target entry itself within it (`get_entry` — the extra step
     /// `mutate_module` doesn't need, since a local pool belongs to one
-    /// entry, not the module as a whole), then apply `f`.
+    /// entry, not the module as a whole), then apply `f`. `get_entry`
+    /// takes the whole resolved module rather than a fixed `(module,
+    /// name)` pair so a result's caller can chain one extra hop (module ->
+    /// requirement -> its nested `results`) that a requirement/test's
+    /// single-hop lookup doesn't need.
     fn add_local_pool<T>(
         &mut self,
         request: RequestId,
-        target: logical::LogicalPath,
-        get_entry: impl for<'a> FnOnce(&'a mut logical::draft::ModuleDraft, &disk::EntryName) -> Option<&'a mut T>,
+        module: &[disk::EntryName],
+        get_entry: impl for<'a> FnOnce(&'a mut logical::draft::ModuleDraft) -> Option<&'a mut T>,
         f: impl FnOnce(&mut T) -> Result<(), AddPoolFileError>,
         outcome: impl FnOnce(Result<(), AddLocalPoolError>) -> Outcome,
     ) {
@@ -962,9 +981,9 @@ where
         let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
             unreachable!("ensure_draft leaves state as Draft")
         };
-        let result = match resolve_module_mut(&mut draft.tree, &target.modules) {
+        let result = match resolve_module_mut(&mut draft.tree, module) {
             None => Err(AddLocalPoolError::ModuleNotFound),
-            Some(module) => match get_entry(module, &target.name) {
+            Some(module) => match get_entry(module) {
                 None => Err(AddLocalPoolError::EntryNotFound),
                 Some(entry) => f(entry).map_err(AddLocalPoolError::Add),
             },
@@ -986,8 +1005,8 @@ where
     fn remove_local_pool<T>(
         &mut self,
         request: RequestId,
-        target: logical::LogicalPath,
-        get_entry: impl for<'a> FnOnce(&'a mut logical::draft::ModuleDraft, &disk::EntryName) -> Option<&'a mut T>,
+        module: &[disk::EntryName],
+        get_entry: impl for<'a> FnOnce(&'a mut logical::draft::ModuleDraft) -> Option<&'a mut T>,
         f: impl FnOnce(&mut T) -> bool,
         outcome: impl FnOnce(bool) -> Outcome,
     ) {
@@ -1000,9 +1019,9 @@ where
         let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
             unreachable!("ensure_draft leaves state as Draft")
         };
-        let removed = match resolve_module_mut(&mut draft.tree, &target.modules) {
+        let removed = match resolve_module_mut(&mut draft.tree, module) {
             None => false,
-            Some(module) => match get_entry(module, &target.name) {
+            Some(module) => match get_entry(module) {
                 None => false,
                 Some(entry) => f(entry),
             },
@@ -1019,8 +1038,8 @@ where
     fn add_requirement_attachment(&mut self, target: logical::LogicalPath, path: std::path::PathBuf, request: RequestId) {
         self.add_local_pool(
             request,
-            target,
-            |module, name| module.requirements.get_mut(name),
+            &target.modules,
+            move |module| module.requirements.get_mut(&target.name),
             move |requirement: &mut logical::draft::RequirementDraft| requirement.add_attachment(&path),
             Outcome::AddRequirementAttachment,
         );
@@ -1034,8 +1053,8 @@ where
     ) {
         self.remove_local_pool(
             request,
-            target,
-            |module, name| module.requirements.get_mut(name),
+            &target.modules,
+            move |module| module.requirements.get_mut(&target.name),
             move |requirement: &mut logical::draft::RequirementDraft| requirement.remove_attachment(&path),
             Outcome::RemoveRequirementAttachment,
         );
@@ -1044,8 +1063,8 @@ where
     fn add_test_attachment(&mut self, target: logical::LogicalPath, path: std::path::PathBuf, request: RequestId) {
         self.add_local_pool(
             request,
-            target,
-            |module, name| module.tests.get_mut(name),
+            &target.modules,
+            move |module| module.tests.get_mut(&target.name),
             move |test: &mut logical::draft::TestDraft| test.add_attachment(&path),
             Outcome::AddTestAttachment,
         );
@@ -1054,8 +1073,8 @@ where
     fn remove_test_attachment(&mut self, target: logical::LogicalPath, path: std::path::PathBuf, request: RequestId) {
         self.remove_local_pool(
             request,
-            target,
-            |module, name| module.tests.get_mut(name),
+            &target.modules,
+            move |module| module.tests.get_mut(&target.name),
             move |test: &mut logical::draft::TestDraft| test.remove_attachment(&path),
             Outcome::RemoveTestAttachment,
         );
@@ -1064,8 +1083,8 @@ where
     fn add_test_template_file(&mut self, target: logical::LogicalPath, path: std::path::PathBuf, request: RequestId) {
         self.add_local_pool(
             request,
-            target,
-            |module, name| module.tests.get_mut(name),
+            &target.modules,
+            move |module| module.tests.get_mut(&target.name),
             move |test: &mut logical::draft::TestDraft| test.add_template_file(&path),
             Outcome::AddTestTemplateFile,
         );
@@ -1079,18 +1098,24 @@ where
     ) {
         self.remove_local_pool(
             request,
-            target,
-            |module, name| module.tests.get_mut(name),
+            &target.modules,
+            move |module| module.tests.get_mut(&target.name),
             move |test: &mut logical::draft::TestDraft| test.remove_template_file(&path),
             Outcome::RemoveTestTemplateFile,
         );
     }
 
-    fn add_result_attachment(&mut self, target: logical::LogicalPath, path: std::path::PathBuf, request: RequestId) {
+    fn add_result_attachment(&mut self, target: logical::ResultPath, path: std::path::PathBuf, request: RequestId) {
         self.add_local_pool(
             request,
-            target,
-            |module, name| module.results.get_mut(name),
+            &target.requirement.modules,
+            move |module| {
+                module
+                    .requirements
+                    .get_mut(&target.requirement.name)?
+                    .results
+                    .get_mut(&target.name)
+            },
             move |result: &mut logical::draft::ResultDraft| result.add_attachment(&path),
             Outcome::AddResultAttachment,
         );
@@ -1098,14 +1123,20 @@ where
 
     fn remove_result_attachment(
         &mut self,
-        target: logical::LogicalPath,
+        target: logical::ResultPath,
         path: std::path::PathBuf,
         request: RequestId,
     ) {
         self.remove_local_pool(
             request,
-            target,
-            |module, name| module.results.get_mut(name),
+            &target.requirement.modules,
+            move |module| {
+                module
+                    .requirements
+                    .get_mut(&target.requirement.name)?
+                    .results
+                    .get_mut(&target.name)
+            },
             move |result: &mut logical::draft::ResultDraft| result.remove_attachment(&path),
             Outcome::RemoveResultAttachment,
         );
@@ -1398,6 +1429,13 @@ where
 /// — every other place gui-core touches disk paths goes through `disk`
 /// itself instead of reimplementing its layout, but there's no existing
 /// `disk`-level "path for this entry" function to call into here.
+///
+/// `kind` is only ever `Requirement`/`Test` in practice — nothing
+/// references a result by path (a `LocalGitReference`/dependency only ever
+/// names a requirement or test), so `ResolveLocalCommit` never requests a
+/// result's directory, and a result couldn't be addressed by a bare
+/// `LogicalPath` here anyway (its own directory nests under its
+/// requirement's — see `logical::ResultPath`).
 fn entry_directory(project_path: &Path, target: &LogicalPath, kind: EntryKind) -> PathBuf {
     let mut dir = project_path.to_path_buf();
     for module in &target.modules {
@@ -1407,7 +1445,7 @@ fn entry_directory(project_path: &Path, target: &LogicalPath, kind: EntryKind) -
     dir.push(match kind {
         EntryKind::Requirement => "requirements",
         EntryKind::Test => "tests",
-        EntryKind::Result => "results",
+        EntryKind::Result => unreachable!("ResolveLocalCommit is never requested for a result"),
         EntryKind::Module => unreachable!("a module has no leaf directory of its own"),
     });
     dir.push(target.name.as_str());
@@ -1426,8 +1464,8 @@ mod test {
     use logical::draft::AddNamedChildError;
 
     use crate::{
-        AddPoolFileError, EntryDetail, EntryKind, GetChangedFilesError, GetDiffError, RefreshStaleTestReferencesError,
-        RequirementMetStatus, TestUnmetReason, TreeSnapshot, UnmetReason,
+        AddPoolFileError, EntryDetail, EntryKind, EntryPath, GetChangedFilesError, GetDiffError,
+        RefreshStaleTestReferencesError, RequirementMetStatus, TestUnmetReason, TreeSnapshot, UnmetReason,
     };
 
     use super::*;
@@ -1587,8 +1625,7 @@ mod test {
         let (commands, mut events) = spawn_test_actor();
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("design")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
                 request: 1,
             })
             .unwrap();
@@ -1614,8 +1651,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("scratch"))),
                 request: 3,
             })
             .unwrap();
@@ -1647,8 +1683,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("design")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
                 request: 3,
             })
             .unwrap();
@@ -1741,8 +1776,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("scratch"))),
                 request: 3,
             })
             .unwrap();
@@ -1849,8 +1883,7 @@ mod test {
             .unwrap();
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("after_validate")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("after_validate"))),
                 request: 4,
             })
             .unwrap();
@@ -1907,8 +1940,7 @@ mod test {
         // not lost, and the project wasn't left stuck as `Validated`.
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("broken")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("broken"))),
                 request: 4,
             })
             .unwrap();
@@ -2037,8 +2069,7 @@ mod test {
         // really replaced the state, not merged into it.
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("design")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
                 request: 3,
             })
             .unwrap();
@@ -2108,8 +2139,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("scratch"))),
                 request: 3,
             })
             .unwrap();
@@ -2120,8 +2150,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("scratch"))),
                 request: 5,
             })
             .unwrap();
@@ -2132,8 +2161,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("scratch"))),
                 request: 7,
             })
             .unwrap();
@@ -2513,14 +2541,13 @@ mod test {
 
         let result = logical::draft::ResultDraft::new(
             "Scratch Result",
-            ReferencePath("/requirements/design".to_string()),
             "deadbeef",
             ReferencePath("/tests/generic_test".to_string()),
             "deadbeef",
         );
         commands
             .send(Command::AddResult {
-                module: vec![],
+                requirement: LogicalPath::root(entry_name("design")),
                 name: entry_name("scratch_result"),
                 result: Box::new(result),
                 request: 2,
@@ -2530,7 +2557,10 @@ mod test {
 
         commands
             .send(Command::RemoveResult {
-                target: LogicalPath::root(entry_name("scratch_result")),
+                target: logical::ResultPath {
+                    requirement: LogicalPath::root(entry_name("design")),
+                    name: entry_name("scratch_result"),
+                },
                 request: 3,
             })
             .unwrap();
@@ -2593,8 +2623,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("scratch"))),
                 request: 4,
             })
             .unwrap();
@@ -2803,8 +2832,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch_test")),
-                kind: EntryKind::Test,
+                target: EntryPath::Test(LogicalPath::root(entry_name("scratch_test"))),
                 request: 4,
             })
             .unwrap();
@@ -2831,14 +2859,13 @@ mod test {
 
         let original = logical::draft::ResultDraft::new(
             "Original",
-            ReferencePath("/requirements/design".to_string()),
             "deadbeef",
             ReferencePath("/tests/generic_test".to_string()),
             "deadbeef",
         );
         commands
             .send(Command::AddResult {
-                module: vec![],
+                requirement: LogicalPath::root(entry_name("design")),
                 name: entry_name("scratch_result"),
                 result: Box::new(original),
                 request: 2,
@@ -2848,14 +2875,17 @@ mod test {
 
         let updated = logical::draft::ResultDraft::new(
             "Updated",
-            ReferencePath("/requirements/design".to_string()),
             "cafef00d",
             ReferencePath("/tests/generic_test".to_string()),
             "cafef00d",
         );
+        let result_path = logical::ResultPath {
+            requirement: LogicalPath::root(entry_name("design")),
+            name: entry_name("scratch_result"),
+        };
         commands
             .send(Command::UpdateResult {
-                target: LogicalPath::root(entry_name("scratch_result")),
+                target: result_path.clone(),
                 result: Box::new(updated),
                 request: 3,
             })
@@ -2864,15 +2894,14 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("scratch_result")),
-                kind: EntryKind::Result,
+                target: EntryPath::Result(result_path),
                 request: 4,
             })
             .unwrap();
         match recv_completed(&mut events, 4).await {
-            Outcome::EntryDetail(Some(EntryDetail::Result { title, requirement_path, .. })) => {
+            Outcome::EntryDetail(Some(EntryDetail::Result { title, requirement, .. })) => {
                 assert_eq!(title, "Updated");
-                assert_eq!(requirement_path, "/requirements/design");
+                assert_eq!(requirement, LogicalPath::root(entry_name("design")));
             }
             other => panic!("expected EntryDetail(Some(Result)), got {other:?}"),
         }
@@ -3097,8 +3126,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: target.clone(),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(target.clone()),
                 request: 4,
             })
             .unwrap();
@@ -3260,7 +3288,10 @@ mod test {
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
 
-        let target = LogicalPath::root(entry_name("design"));
+        let target = logical::ResultPath {
+            requirement: LogicalPath::root(entry_name("design")),
+            name: entry_name("design"),
+        };
         commands
             .send(Command::AddResultAttachment {
                 target: target.clone(),
@@ -3328,11 +3359,10 @@ mod test {
         // ...and the new name has the module's original content.
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath {
+                target: EntryPath::Requirement(LogicalPath {
                     modules: vec![entry_name("renamed_setup")],
                     name: entry_name("marker"),
-                },
-                kind: EntryKind::Requirement,
+                }),
                 request: 5,
             })
             .unwrap();
@@ -3496,8 +3526,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("outer")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("outer"))),
                 request: 6,
             })
             .unwrap();
@@ -3680,8 +3709,7 @@ mod test {
 
         commands
             .send(Command::GetEntryDetail {
-                target: LogicalPath::root(entry_name("dependent")),
-                kind: EntryKind::Requirement,
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("dependent"))),
                 request: 7,
             })
             .unwrap();
@@ -3985,14 +4013,13 @@ mod test {
 
         let result = logical::draft::ResultDraft::new(
             "Res1",
-            ReferencePath("/requirements/r1".to_string()),
             "deadbeef",
             ReferencePath("/tests/does_not_exist".to_string()),
             "deadbeef",
         );
         commands
             .send(Command::AddResult {
-                module: vec![],
+                requirement: LogicalPath::root(entry_name("r1")),
                 name: entry_name("res1"),
                 result: Box::new(result),
                 request: 5,

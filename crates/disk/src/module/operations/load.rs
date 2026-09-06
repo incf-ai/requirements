@@ -60,7 +60,6 @@ mod test {
         assert_eq!(submodule.definition.name, "Beta");
         assert!(submodule.tree.requirements.is_empty());
         assert!(submodule.tree.tests.is_empty());
-        assert!(submodule.tree.results.is_empty());
         assert!(submodule.tree.modules.is_empty());
 
         Ok(())
@@ -75,7 +74,6 @@ mod test {
         ));
         std::fs::create_dir_all(dir.join("requirements")).unwrap();
         std::fs::create_dir_all(dir.join("tests")).unwrap();
-        std::fs::create_dir_all(dir.join("results")).unwrap();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
         std::fs::write(dir.join("submodule.ron"), "SubmoduleV1(name: \"Name\")").unwrap();
         dir

@@ -134,6 +134,23 @@ mod test {
                     .join(requirement.name.as_str())
                     .join("attachments"),
             );
+            for result in &requirement.results {
+                copy_attachment_files(
+                    &result.attachments,
+                    &src_dir
+                        .join("requirements")
+                        .join(requirement.name.as_str())
+                        .join("results")
+                        .join(result.name.as_str())
+                        .join("attachments"),
+                    &dest_dir
+                        .join("requirements")
+                        .join(requirement.name.as_str())
+                        .join("results")
+                        .join(result.name.as_str())
+                        .join("attachments"),
+                );
+            }
         }
         for test in &tree.tests {
             copy_attachment_files(
@@ -154,19 +171,6 @@ mod test {
                     .join("tests")
                     .join(test.name.as_str())
                     .join("template"),
-            );
-        }
-        for result in &tree.results {
-            copy_attachment_files(
-                &result.attachments,
-                &src_dir
-                    .join("results")
-                    .join(result.name.as_str())
-                    .join("attachments"),
-                &dest_dir
-                    .join("results")
-                    .join(result.name.as_str())
-                    .join("attachments"),
             );
         }
         for module in &tree.modules {
@@ -198,8 +202,21 @@ mod test {
             original.tree.requirements.len()
         );
         assert_eq!(reloaded.tree.tests.len(), original.tree.tests.len());
-        assert_eq!(reloaded.tree.results.len(), original.tree.results.len());
         assert_eq!(reloaded.tree.modules.len(), original.tree.modules.len());
+        assert_eq!(
+            reloaded
+                .tree
+                .requirements
+                .iter()
+                .map(|r| r.results.len())
+                .sum::<usize>(),
+            original
+                .tree
+                .requirements
+                .iter()
+                .map(|r| r.results.len())
+                .sum::<usize>()
+        );
 
         std::fs::remove_dir_all(&tempdir).ok();
         Ok(())

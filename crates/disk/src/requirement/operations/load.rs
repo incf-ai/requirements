@@ -7,9 +7,10 @@ use crate::attachments::{ReadAttachmentsError, read_attachments};
 use crate::requirement::types::{
     RequirementDefinition, RequirementOnDisk, ValidateRequirementDefinitionError,
 };
+use crate::result::operations::load::Error as LoadResultError;
 use crate::util::{
-    EntryName, LoadRonError, ReadOptionalTextError, ReadRequiredTextError, load_ron,
-    read_optional_text, read_required_text,
+    EntryName, LoadNamedChildrenError, LoadRonError, ReadOptionalTextError, ReadRequiredTextError,
+    load_named_children, load_ron, read_optional_text, read_required_text,
 };
 
 #[derive(Debug, Error)]
@@ -30,6 +31,8 @@ enum ErrorKind {
     TestGuidance { source: ReadOptionalTextError },
     #[error("failed to load attachments: {0}")]
     Attachments(#[from] ReadAttachmentsError),
+    #[error("failed to load results: {0}")]
+    Results(#[from] LoadNamedChildrenError<LoadResultError>),
     #[error("failed to look up newest commit for {path}: {source}")]
     Commit {
         path: PathBuf,
@@ -68,13 +71,19 @@ fn load_requirement_stage_inner(
     let test_guidance = read_optional_text(fs, &dir.join("test_guidance.typ"))
         .map_err(|source| ErrorKind::TestGuidance { source })?;
     let attachments = read_attachments(fs, git, &dir.join("attachments"))?;
+    let results = load_named_children(
+        fs,
+        git,
+        &dir.join("results"),
+        crate::result::operations::load_result,
+    )?;
 
     let attachments_dir = dir.join("attachments");
-    let excludes: Vec<&Path> = if definition.include_attachments_in_commit {
-        Vec::new()
-    } else {
-        vec![attachments_dir.as_path()]
-    };
+    let results_dir = dir.join("results");
+    let mut excludes: Vec<&Path> = vec![results_dir.as_path()];
+    if !definition.include_attachments_in_commit {
+        excludes.push(attachments_dir.as_path());
+    }
     let commit = match git.commit_for_path_excluding(dir, &excludes) {
         Ok(commit) => Some(commit),
         Err(CommitForPathError::NotTracked { .. }) => None,
@@ -93,6 +102,7 @@ fn load_requirement_stage_inner(
         requirement_guidance,
         test_guidance,
         attachments,
+        results,
         commit,
     })
 }
@@ -117,6 +127,7 @@ mod test {
             line!()
         ));
         std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(dir.join("results")).unwrap();
         std::fs::write(
             dir.join("requirement.ron"),
             "RequirementDefinitionV1(title: \"Title\")",
@@ -270,6 +281,7 @@ mod test {
         ));
         init_scratch_git_repo(&dir);
         std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(dir.join("results")).unwrap();
         std::fs::write(
             dir.join("requirement.ron"),
             "RequirementDefinitionV1(title: \"Title\")",
@@ -292,6 +304,7 @@ mod test {
         ));
         init_scratch_git_repo(&dir);
         std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(dir.join("results")).unwrap();
         std::fs::write(
             dir.join("requirement.ron"),
             "RequirementDefinitionV1(title: \"Title\", include_attachments_in_commit: false)",
@@ -318,6 +331,7 @@ mod test {
         ));
         init_scratch_git_repo(&dir);
         std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(dir.join("results")).unwrap();
         std::fs::write(
             dir.join("requirement.ron"),
             "RequirementDefinitionV1(title: \"Title\")",
@@ -332,6 +346,57 @@ mod test {
         let requirement = load_requirement_stage(&StdFilesystem, &SystemGit, &dir).unwrap();
         assert_ne!(requirement.commit, Some(base_commit));
         assert_eq!(requirement.commit, Some(latest_commit));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A brand-new result being added under this requirement (a valid
+    /// `results/<name>/result.ron`, since `results/` is otherwise
+    /// unconditionally excluded regardless of `include_attachments_in_commit`)
+    /// must never advance the requirement's own `commit` — otherwise saving
+    /// a new result would retroactively invalidate every other existing
+    /// result for this requirement, whose `requirement_commit` was pinned
+    /// against the *old* commit.
+    #[test]
+    fn results_are_always_excluded_from_the_commit_regardless_of_attachments_setting() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-load-exclude-results-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        init_scratch_git_repo(&dir);
+        std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(dir.join("results")).unwrap();
+        std::fs::write(
+            dir.join("requirement.ron"),
+            "RequirementDefinitionV1(title: \"Title\")",
+        )
+        .unwrap();
+        std::fs::write(dir.join("requirement.typ"), "").unwrap();
+        let base_commit = git_commit_all(&dir, "initial");
+
+        std::fs::create_dir_all(dir.join("results/definition/attachments")).unwrap();
+        std::fs::write(
+            dir.join("results/definition/result.ron"),
+            "ResultsV1(title: \"Title\", requirement_commit: \"abc\", test_path: \"/tests/generic_test\", test_commit: \"abc\")",
+        )
+        .unwrap();
+        git_commit_all(&dir, "add a result");
+
+        let requirement = load_requirement_stage(&StdFilesystem, &SystemGit, &dir).unwrap();
+        assert_eq!(requirement.commit, Some(base_commit));
+        assert_eq!(requirement.results.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_results_dir_is_reported() {
+        let dir = valid_stage_dir("missing-results");
+        std::fs::remove_dir(dir.join("results")).unwrap();
+
+        let err = load_requirement_stage(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Results(_)));
 
         std::fs::remove_dir_all(&dir).ok();
     }

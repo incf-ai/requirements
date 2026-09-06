@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::attachments::{AttachmentFile, AttachmentReferenceKind};
+use crate::result::types::ResultOnDisk;
 use crate::util::{EntryName, default_true};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -113,7 +114,9 @@ pub enum DependencyReferenceKind {
 }
 
 /// A fully loaded `requirements/<stage>/` folder: the parsed `requirement.ron`
-/// plus its sibling typst files and attachments.
+/// plus its sibling typst files, attachments, and the results nested under
+/// it (`requirements/<stage>/results/<name>/` — a result's owning
+/// requirement is structural, not a field on the result itself).
 #[derive(Debug, Clone)]
 pub struct RequirementOnDisk {
     /// This stage's directory name (e.g. `definition`), not to be confused
@@ -124,12 +127,16 @@ pub struct RequirementOnDisk {
     pub requirement_guidance: Option<String>,
     pub test_guidance: Option<String>,
     pub attachments: Vec<AttachmentFile>,
+    pub results: Vec<ResultOnDisk>,
     /// The newest git commit touching any file in this stage's folder or its
     /// subfolders, resolved via `syscalls::Git::commit_for_path_excluding` at
     /// load time — not persisted in `requirement.ron`. Excludes
     /// `attachments/` when `definition.include_attachments_in_commit` is
-    /// `false`. `None` if the folder has never been committed (e.g. just
-    /// saved by the GUI and not yet committed).
+    /// `false`, and always excludes `results/` (a result's own commit is
+    /// unrelated to what the requirement itself looked like when produced,
+    /// and adding a result must never retroactively change the commit an
+    /// existing result was checked against). `None` if the folder has never
+    /// been committed (e.g. just saved by the GUI and not yet committed).
     pub commit: Option<String>,
 }
 

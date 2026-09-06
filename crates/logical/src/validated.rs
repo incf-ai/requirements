@@ -125,8 +125,6 @@ impl ValidatedProject {
             return Some(UnmetReason::NotYetSaved);
         };
 
-        let all_results = collect_results(&self.0.tree, &[]);
-
         let unsatisfied: Vec<UnsatisfiedTest> = req
             .tests
             .iter()
@@ -160,15 +158,8 @@ impl ValidatedProject {
                     });
                 }
 
-                let satisfied = all_results.iter().any(|(result_path, result)| {
-                    result_satisfies(
-                        result,
-                        &result_path.modules,
-                        requirement,
-                        req_commit,
-                        &target,
-                        test_commit,
-                    )
+                let satisfied = req.results.values().any(|result| {
+                    result_satisfies(result, req_commit, &requirement.modules, &target, test_commit)
                 });
                 if satisfied {
                     None
@@ -293,51 +284,52 @@ impl ValidatedProject {
     }
 }
 
-/// One result whose `requirement_path` resolves to a given requirement —
-/// backs the read-only requirement viewer's own "Results" list. Unlike
-/// `requirement_unmet_reason`'s `NoPassingResult` check, this doesn't
-/// filter on currency or `status`: every result referencing the
-/// requirement is included, current or historical, passing or not, so the
-/// viewer can show the requirement's full result history rather than just
-/// today's verdict.
+/// One of a requirement's results — backs the read-only requirement
+/// viewer's own "Results" list. Unlike `requirement_unmet_reason`'s
+/// `NoPassingResult` check, this doesn't filter on currency or `status`:
+/// every result nested under the requirement is included, current or
+/// historical, passing or not, so the viewer can show the requirement's
+/// full result history rather than just today's verdict.
 #[derive(Debug, Clone)]
 pub struct RequirementResult {
-    pub path: LogicalPath,
+    pub name: disk::EntryName,
     pub title: String,
     pub status: StatusV1,
 }
 
-/// Every result anywhere in `tree` whose `requirement_path` resolves
-/// (relative to that result's own module) to `requirement`. A free
-/// function over the raw `ModuleDraft` tree, not a `ValidatedProject`
-/// method — listing existing results doesn't depend on the currency
-/// checks validation exists for, only on `parse_reference_path`, which is
-/// private to this crate and so must be called from here.
+/// Every result nested under `requirement`. A free function over the raw
+/// `ModuleDraft` tree, not a `ValidatedProject` method — listing existing
+/// results doesn't depend on the currency checks validation exists for.
+/// `requirement`'s owning module/requirement is looked up structurally
+/// (`get_requirement`) rather than by matching a reference string, since a
+/// result's requirement is no longer a field to resolve.
 pub fn results_for_requirement(tree: &ModuleDraft, requirement: &LogicalPath) -> Vec<RequirementResult> {
-    collect_results(tree, &[])
-        .into_iter()
-        .filter_map(|(result_path, result)| {
-            let resolved =
-                parse_reference_path(&result.requirement_path, &result_path.modules, "requirements").ok()?;
-            if &resolved == requirement {
-                Some(RequirementResult {
-                    path: result_path,
-                    title: result.title.clone(),
-                    status: result.status.clone(),
-                })
-            } else {
-                None
-            }
+    let Some(req) = get_requirement(tree, requirement) else {
+        return Vec::new();
+    };
+    req.results
+        .iter()
+        .map(|(name, result)| RequirementResult {
+            name: name.clone(),
+            title: result.title.clone(),
+            status: result.status.clone(),
         })
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Whether `result` (known to be nested under `requirement`, at
+/// `requirement_commit`) counts as a passing, current result for `test`.
+/// Ownership is no longer something to check here — a result nested under
+/// a requirement's `results` map *is* that requirement's result,
+/// structurally — only status, commit currency, and the result's own
+/// `test_path` reference need checking. `result_module` is the module
+/// `test_path` resolves relative to: the owning requirement's own module,
+/// since nesting a result under a requirement doesn't change which module
+/// it logically belongs to.
 fn result_satisfies(
     result: &ResultDraft,
-    result_module: &[disk::EntryName],
-    requirement: &LogicalPath,
     requirement_commit: &str,
+    result_module: &[disk::EntryName],
     test: &LogicalPath,
     test_commit: &str,
 ) -> bool {
@@ -347,48 +339,10 @@ fn result_satisfies(
     if result.requirement_commit != requirement_commit || result.test_commit != test_commit {
         return false;
     }
-    let Ok(result_requirement) =
-        parse_reference_path(&result.requirement_path, result_module, "requirements")
-    else {
-        return false;
-    };
-    if &result_requirement != requirement {
-        return false;
-    }
     let Ok(result_test) = parse_reference_path(&result.test_path, result_module, "tests") else {
         return false;
     };
     &result_test == test
-}
-
-fn collect_results<'a>(
-    module: &'a ModuleDraft,
-    prefix: &[disk::EntryName],
-) -> Vec<(LogicalPath, &'a ResultDraft)> {
-    let mut out = Vec::new();
-    collect_results_into(module, prefix, &mut out);
-    out
-}
-
-fn collect_results_into<'a>(
-    module: &'a ModuleDraft,
-    prefix: &[disk::EntryName],
-    out: &mut Vec<(LogicalPath, &'a ResultDraft)>,
-) {
-    for (name, result) in &module.results {
-        out.push((
-            LogicalPath {
-                modules: prefix.to_vec(),
-                name: name.clone(),
-            },
-            result,
-        ));
-    }
-    for (name, submodule) in &module.modules {
-        let mut child_prefix = prefix.to_vec();
-        child_prefix.push(name.clone());
-        collect_results_into(submodule, &child_prefix, out);
-    }
 }
 
 #[cfg(test)]
@@ -430,13 +384,28 @@ mod test {
     fn passing_result() -> ResultDraft {
         let mut result = ResultDraft::new(
             "Definition",
-            ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("/tests/generic_test".to_string()),
             "t1",
         );
         result.status = StatusV1::Pass;
         result
+    }
+
+    /// Adds `result` under `requirement_name`'s own `results` map — the
+    /// only way to add a result now that ownership is structural, not a
+    /// `requirement_path` field.
+    fn add_result_to(
+        tree: &mut ModuleDraft,
+        requirement_name: &str,
+        result_name: &str,
+        result: ResultDraft,
+    ) {
+        tree.requirements
+            .get_mut(&disk::EntryName(requirement_name.to_string()))
+            .unwrap()
+            .add_result(result_name, result)
+            .unwrap();
     }
 
     fn validated(project: ProjectDraft) -> ValidatedProject {
@@ -470,10 +439,7 @@ mod test {
     #[test]
     fn met_with_a_current_passing_result() {
         let mut project = project_with_current_requirement_and_test();
-        project
-            .tree
-            .add_result("definition", passing_result())
-            .unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", passing_result());
 
         let project = validated(project);
         assert!(project.is_requirement_met(&requirement_path()));
@@ -485,7 +451,7 @@ mod test {
         let mut project = project_with_current_requirement_and_test();
         let mut result = passing_result();
         result.status = StatusV1::Fail;
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
@@ -500,7 +466,7 @@ mod test {
         let mut project = project_with_current_requirement_and_test();
         let mut result = passing_result();
         result.requirement_commit = "stale".to_string();
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
@@ -515,7 +481,7 @@ mod test {
         let mut project = project_with_current_requirement_and_test();
         let mut result = passing_result();
         result.test_commit = "stale".to_string();
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
@@ -547,10 +513,7 @@ mod test {
         test.test_text = "Text".to_string();
         test.commit = Some("t1".to_string());
         project.tree.add_test("generic_test", test).unwrap();
-        project
-            .tree
-            .add_result("definition", passing_result())
-            .unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", passing_result());
 
         let project = validated(project);
         assert!(!project.is_requirement_met(&requirement_path()));
@@ -656,10 +619,7 @@ mod test {
     #[test]
     fn not_met_for_a_requirement_that_was_never_persisted() {
         let mut project = project_with_current_requirement_and_test();
-        project
-            .tree
-            .add_result("definition", passing_result())
-            .unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", passing_result());
         // Simulate an in-memory-only requirement: no commit yet.
         project
             .tree
@@ -781,47 +741,11 @@ mod test {
     }
 
     #[test]
-    fn not_met_when_the_result_names_a_different_requirement() {
-        let mut project = project_with_current_requirement_and_test();
-        let mut requirement = RequirementDraft::new("Other");
-        requirement.requirement_text = "Text".to_string();
-        requirement.commit = Some("c1".to_string());
-        project.tree.add_requirement("other", requirement).unwrap();
-
-        let mut result = passing_result();
-        // Same commit as the real requirement, but names a different one.
-        result.requirement_path = ReferencePath("requirements/other".to_string());
-        project.tree.add_result("definition", result).unwrap();
-
-        let project = validated(project);
-        assert!(!project.is_requirement_met(&requirement_path()));
-        assert_eq!(
-            project.requirement_unmet_reason(&requirement_path()),
-            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
-        );
-    }
-
-    #[test]
-    fn not_met_when_the_results_requirement_reference_is_malformed() {
-        let mut project = project_with_current_requirement_and_test();
-        let mut result = passing_result();
-        result.requirement_path = ReferencePath("requirements".to_string());
-        project.tree.add_result("definition", result).unwrap();
-
-        let project = validated(project);
-        assert!(!project.is_requirement_met(&requirement_path()));
-        assert_eq!(
-            project.requirement_unmet_reason(&requirement_path()),
-            Some(unsatisfied_for(TestUnmetReason::NoPassingResult))
-        );
-    }
-
-    #[test]
     fn not_met_when_the_results_test_reference_is_malformed() {
         let mut project = project_with_current_requirement_and_test();
         let mut result = passing_result();
         result.test_path = ReferencePath("tests".to_string());
-        project.tree.add_result("definition", result).unwrap();
+        add_result_to(&mut project.tree, "definition", "definition", result);
 
         let project = ValidatedProject::new(project);
         assert!(!project.is_requirement_met(&requirement_path()));
@@ -861,13 +785,12 @@ mod test {
 
         let mut result = ResultDraft::new(
             "Definition",
-            ReferencePath("requirements/definition".to_string()),
             "c1",
             ReferencePath("tests/generic_test".to_string()),
             "t1",
         );
         result.status = StatusV1::Pass;
-        submodule.add_result("definition", result).unwrap();
+        add_result_to(submodule, "definition", "definition", result);
 
         let project = validated(project);
         let path = LogicalPath {

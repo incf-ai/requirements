@@ -10,8 +10,6 @@ use crate::attachments::{
 use crate::module::types::ModuleTree;
 use crate::requirement::operations::load::Error as LoadRequirementStageError;
 use crate::requirement::operations::save::Error as SaveRequirementStageError;
-use crate::result::operations::load::Error as LoadResultError;
-use crate::result::operations::save::Error as SaveResultError;
 use crate::test::operations::load::Error as LoadTestError;
 use crate::test::operations::save::Error as SaveTestError;
 use crate::util::{
@@ -37,10 +35,13 @@ pub(crate) enum LoadModuleTreeError {
     Requirements(#[from] LoadNamedChildrenError<LoadRequirementStageError>),
     #[error("failed to load tests: {0}")]
     Tests(#[from] LoadNamedChildrenError<LoadTestError>),
-    #[error("failed to load results: {0}")]
-    Results(#[from] LoadNamedChildrenError<LoadResultError>),
     #[error("failed to load modules: {0}")]
     Modules(#[from] LoadNamedChildrenError<LoadSubmoduleError>),
+    #[error(
+        "found a `results/` directory directly under {path} — this project uses the old flat \
+         results layout; run `upgrade-results-layout` before loading it"
+    )]
+    LegacyResultsLayout { path: PathBuf },
 }
 
 pub(crate) fn load_module_tree(
@@ -48,6 +49,13 @@ pub(crate) fn load_module_tree(
     git: &dyn Git,
     dir: &Path,
 ) -> Result<ModuleTree, LoadModuleTreeError> {
+    let legacy_results_dir = dir.join("results");
+    if fs.is_dir(&legacy_results_dir) {
+        return Err(LoadModuleTreeError::LegacyResultsLayout {
+            path: legacy_results_dir,
+        });
+    }
+
     let attachments = read_attachments(fs, git, &dir.join("attachments"))?;
     let templates = read_attachments(fs, git, &dir.join("templates"))
         .map_err(|source| LoadModuleTreeError::Templates { source })?;
@@ -63,12 +71,6 @@ pub(crate) fn load_module_tree(
         &dir.join("tests"),
         crate::test::operations::load_test,
     )?;
-    let results = load_named_children(
-        fs,
-        git,
-        &dir.join("results"),
-        crate::result::operations::load_result,
-    )?;
     let modules = load_named_children(fs, git, &dir.join("modules"), load_submodule)?;
 
     Ok(ModuleTree {
@@ -76,7 +78,6 @@ pub(crate) fn load_module_tree(
         templates,
         requirements,
         tests,
-        results,
         modules,
     })
 }
@@ -105,12 +106,6 @@ pub(crate) enum SaveModuleTreeError {
         #[source]
         source: SaveTestError,
     },
-    #[error("failed to save result '{name}': {source}")]
-    Result {
-        name: String,
-        #[source]
-        source: SaveResultError,
-    },
     #[error("failed to save module '{name}': {source}")]
     Module {
         name: String,
@@ -121,8 +116,6 @@ pub(crate) enum SaveModuleTreeError {
     StaleRequirements(RemoveStaleChildrenError),
     #[error("failed to remove stale tests: {0}")]
     StaleTests(RemoveStaleChildrenError),
-    #[error("failed to remove stale results: {0}")]
-    StaleResults(RemoveStaleChildrenError),
     #[error("failed to remove stale modules: {0}")]
     StaleModules(RemoveStaleChildrenError),
 }
@@ -181,26 +174,6 @@ pub(crate) fn save_module_tree(
         )?;
     }
 
-    let results_dir = dir.join("results");
-    fs.create_dir_all(&results_dir)
-        .map_err(|source| SaveModuleTreeError::CreateDir {
-            path: results_dir.clone(),
-            source,
-        })?;
-    remove_stale_children(
-        fs,
-        &results_dir,
-        &tree.results.iter().map(|r| r.name.clone()).collect(),
-    )
-    .map_err(SaveModuleTreeError::StaleResults)?;
-    for result in &tree.results {
-        crate::result::operations::save_result(fs, &results_dir.join(&result.name), result)
-            .map_err(|source| SaveModuleTreeError::Result {
-                name: result.name.to_string(),
-                source,
-            })?;
-    }
-
     let modules_dir = dir.join("modules");
     fs.create_dir_all(&modules_dir)
         .map_err(|source| SaveModuleTreeError::CreateDir {
@@ -229,9 +202,7 @@ pub(crate) fn save_module_tree(
 mod test {
     use super::*;
     use crate::module::types::SubmoduleOnDisk;
-    use crate::requirement::types::ReferencePath;
     use crate::requirement::types::{RequirementDefinitionV1, RequirementOnDisk};
-    use crate::result::types::{ResultOnDisk, ResultsV1};
     use crate::test::types::{ResultKindV1, TestOnDisk, TestV1};
     use crate::test_support::FixedGit;
     use crate::util::EntryName;
@@ -245,8 +216,11 @@ mod test {
         ))
     }
 
-    /// Builds a `dir` with all six required subdirectories present, except
-    /// for `skip`, which is left entirely absent.
+    /// Builds a `dir` with all five required subdirectories present, except
+    /// for `skip`, which is left entirely absent. `results/` is deliberately
+    /// not among these: it's no longer a module-level child at all (each
+    /// requirement owns its own nested `results/`) — a module-level
+    /// `results/` directory is the *legacy* layout, tested separately below.
     fn dir_with_all_but(name: &str, skip: &str) -> PathBuf {
         let dir = temp_dir(name);
         for sub in [
@@ -254,7 +228,6 @@ mod test {
             "templates",
             "requirements",
             "tests",
-            "results",
             "modules",
         ] {
             if sub != skip {
@@ -297,10 +270,18 @@ mod test {
     }
 
     #[test]
-    fn load_module_tree_reports_missing_results_dir() {
-        let dir = dir_with_all_but("missing-results", "results");
+    fn load_module_tree_rejects_the_legacy_flat_results_layout() {
+        let dir = dir_with_all_but("legacy-results", "modules");
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+        std::fs::create_dir_all(dir.join("results")).unwrap();
+
         let err = load_module_tree(&StdFilesystem, &FixedGit, &dir).unwrap_err();
-        assert!(matches!(err, LoadModuleTreeError::Results(_)));
+        assert!(matches!(
+            err,
+            LoadModuleTreeError::LegacyResultsLayout { .. }
+        ));
+        assert!(err.to_string().contains("upgrade-results-layout"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -329,6 +310,7 @@ mod test {
             requirement_guidance: None,
             test_guidance: None,
             attachments: Vec::new(),
+            results: Vec::new(),
             commit: Some("deadbeef".to_string()),
         }
     }
@@ -350,23 +332,6 @@ mod test {
             attachments: Vec::new(),
             template: Vec::new(),
             commit: Some("deadbeef".to_string()),
-        }
-    }
-
-    fn minimal_result(name: &str) -> ResultOnDisk {
-        ResultOnDisk {
-            name: EntryName(name.to_string()),
-            definition: ResultsV1 {
-                title: "Title".to_string(),
-                requirement_path: ReferencePath("requirements/definition".to_string()),
-                requirement_commit: "abc".to_string(),
-                test_path: ReferencePath("tests/generic_test".to_string()),
-                test_commit: "abc".to_string(),
-                status: crate::result::types::StatusV1::default(),
-                attachment: None,
-                attachments: None,
-            },
-            attachments: Vec::new(),
         }
     }
 
@@ -406,7 +371,7 @@ mod test {
 
     #[test]
     fn save_module_tree_reports_io_errors_creating_each_subdir() {
-        for sub in ["requirements", "tests", "results", "modules"] {
+        for sub in ["requirements", "tests", "modules"] {
             let dir = temp_dir(&format!("create-dir-{sub}"));
             let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
             fs.inject(dir.join(sub), io::ErrorKind::PermissionDenied);
@@ -458,25 +423,6 @@ mod test {
     }
 
     #[test]
-    fn save_module_tree_reports_a_failing_result() {
-        let dir = temp_dir("failing-result");
-        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
-        fs.inject(
-            dir.join("results").join("foo"),
-            io::ErrorKind::PermissionDenied,
-        );
-
-        let tree = ModuleTree {
-            results: vec![minimal_result("foo")],
-            ..Default::default()
-        };
-        let err = save_module_tree(&fs, &dir, &tree).unwrap_err();
-        assert!(matches!(err, SaveModuleTreeError::Result { .. }));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn save_module_tree_reports_a_failing_module() {
         let dir = temp_dir("failing-module");
         let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
@@ -504,32 +450,77 @@ mod test {
         let tree_with_one_of_each = ModuleTree {
             requirements: vec![minimal_requirement("foo")],
             tests: vec![minimal_test("foo")],
-            results: vec![minimal_result("foo")],
             modules: vec![minimal_submodule("foo")],
             ..Default::default()
         };
         save_module_tree(&StdFilesystem, &dir, &tree_with_one_of_each).unwrap();
         assert!(dir.join("requirements/foo").exists());
         assert!(dir.join("tests/foo").exists());
-        assert!(dir.join("results/foo").exists());
         assert!(dir.join("modules/foo").exists());
 
         save_module_tree(&StdFilesystem, &dir, &ModuleTree::default()).unwrap();
         assert!(!dir.join("requirements/foo").exists());
         assert!(!dir.join("tests/foo").exists());
-        assert!(!dir.join("results/foo").exists());
         assert!(!dir.join("modules/foo").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A requirement's own nested `results/` survive the full
+    /// `save_module_tree` -> `save_requirement_stage` path, and a result
+    /// dropped from the in-memory tree is deleted from disk the same way a
+    /// dropped requirement/test/module is (see the stale-children test
+    /// above) — this is `requirement::operations::save`'s own
+    /// responsibility, exercised end to end here since it's reached through
+    /// `save_module_tree`.
+    #[test]
+    fn save_module_tree_persists_and_removes_a_requirements_nested_results() {
+        let dir = temp_dir("nested-results");
+        let mut requirement = minimal_requirement("foo");
+        requirement.results = vec![crate::result::types::ResultOnDisk {
+            name: EntryName("bar".to_string()),
+            definition: crate::result::types::ResultsV1 {
+                title: "Title".to_string(),
+                requirement_commit: "abc".to_string(),
+                test_path: crate::requirement::types::ReferencePath(
+                    "tests/generic_test".to_string(),
+                ),
+                test_commit: "abc".to_string(),
+                status: crate::result::types::StatusV1::default(),
+                attachment: None,
+                attachments: None,
+            },
+            attachments: Vec::new(),
+        }];
+        let tree = ModuleTree {
+            requirements: vec![requirement],
+            ..Default::default()
+        };
+        save_module_tree(&StdFilesystem, &dir, &tree).unwrap();
+        assert!(dir.join("requirements/foo/results/bar/result.ron").exists());
+
+        let mut requirement_without_results = minimal_requirement("foo");
+        requirement_without_results.results = Vec::new();
+        let tree_without_results = ModuleTree {
+            requirements: vec![requirement_without_results],
+            ..Default::default()
+        };
+        save_module_tree(&StdFilesystem, &dir, &tree_without_results).unwrap();
+        assert!(!dir.join("requirements/foo/results/bar").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn save_module_tree_reports_io_errors_removing_stale_children() {
-        let cases: [(&str, fn(&SaveModuleTreeError) -> bool); 4] = [
-            ("requirements", |e| matches!(e, SaveModuleTreeError::StaleRequirements(_))),
+        let cases: [(&str, fn(&SaveModuleTreeError) -> bool); 3] = [
+            ("requirements", |e| {
+                matches!(e, SaveModuleTreeError::StaleRequirements(_))
+            }),
             ("tests", |e| matches!(e, SaveModuleTreeError::StaleTests(_))),
-            ("results", |e| matches!(e, SaveModuleTreeError::StaleResults(_))),
-            ("modules", |e| matches!(e, SaveModuleTreeError::StaleModules(_))),
+            ("modules", |e| {
+                matches!(e, SaveModuleTreeError::StaleModules(_))
+            }),
         ];
         for (sub, expect_variant) in cases {
             let dir = temp_dir(&format!("stale-io-{sub}"));
@@ -539,7 +530,10 @@ mod test {
             fs.inject(dir.join(sub).join("stale"), io::ErrorKind::PermissionDenied);
 
             let err = save_module_tree(&fs, &dir, &ModuleTree::default()).unwrap_err();
-            assert!(expect_variant(&err), "expected a stale-removal failure for {sub}");
+            assert!(
+                expect_variant(&err),
+                "expected a stale-removal failure for {sub}"
+            );
 
             std::fs::remove_dir_all(&dir).ok();
         }

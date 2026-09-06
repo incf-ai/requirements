@@ -40,11 +40,6 @@ fn export_module_tree(module: &ModuleDraft) -> ModuleTree {
             .iter()
             .map(|(name, test)| export_test(name, test))
             .collect(),
-        results: module
-            .results
-            .iter()
-            .map(|(name, result)| export_result(name, result))
-            .collect(),
         modules: module
             .modules
             .iter()
@@ -99,6 +94,11 @@ fn export_requirement(name: &EntryName, requirement: &RequirementDraft) -> Requi
         requirement_guidance: requirement.requirement_guidance.clone(),
         test_guidance: requirement.test_guidance.clone(),
         attachments: export_pool(&requirement.attachments),
+        results: requirement
+            .results
+            .iter()
+            .map(|(name, result)| export_result(name, result))
+            .collect(),
         commit: requirement.commit.clone(),
     }
 }
@@ -133,7 +133,6 @@ fn export_result(name: &EntryName, result: &ResultDraft) -> ResultOnDisk {
         name: name.clone(),
         definition: ResultsV1 {
             title: result.title.clone(),
-            requirement_path: result.requirement_path.clone(),
             requirement_commit: result.requirement_commit.clone(),
             test_path: result.test_path.clone(),
             test_commit: result.test_commit.clone(),
@@ -180,8 +179,21 @@ mod test {
             draft.tree.requirements.len()
         );
         assert_eq!(reimported.tree.tests.len(), draft.tree.tests.len());
-        assert_eq!(reimported.tree.results.len(), draft.tree.results.len());
         assert_eq!(reimported.tree.modules.len(), draft.tree.modules.len());
+        assert_eq!(
+            reimported
+                .tree
+                .requirements
+                .values()
+                .map(|r| r.results.len())
+                .sum::<usize>(),
+            draft
+                .tree
+                .requirements
+                .values()
+                .map(|r| r.results.len())
+                .sum::<usize>()
+        );
     }
 
     #[test]

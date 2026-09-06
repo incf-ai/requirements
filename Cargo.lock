@@ -770,6 +770,10 @@ dependencies = [
  "clap",
  "disk",
  "logical",
+ "nunny",
+ "ron",
+ "serde",
+ "serde_with",
  "syscalls",
  "thiserror 2.0.20",
 ]

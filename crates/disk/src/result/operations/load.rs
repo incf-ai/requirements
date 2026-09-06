@@ -70,7 +70,7 @@ mod test {
         std::fs::create_dir_all(dir.join("attachments")).unwrap();
         std::fs::write(
             dir.join("result.ron"),
-            "ResultsV1(title: \"Title\", requirement_path: \"requirements/definition\", requirement_commit: \"abc\", test_path: \"tests/generic_test\", test_commit: \"abc\")",
+            "ResultsV1(title: \"Title\", requirement_commit: \"abc\", test_path: \"tests/generic_test\", test_commit: \"abc\")",
         )
         .unwrap();
         dir
@@ -78,14 +78,10 @@ mod test {
 
     #[test]
     fn loads_the_design_result_from_the_test_project() -> Result<(), Error> {
-        let dir = test_project_dir().join("results/design");
+        let dir = test_project_dir().join("requirements/design/results/design");
         let result = load_result(&StdFilesystem, &FixedGit, &dir)?;
 
         assert_eq!(result.definition.title, "Design");
-        assert_eq!(
-            result.definition.requirement_path.0,
-            "requirements/design"
-        );
         assert!(matches!(
             result.definition.status,
             crate::result::types::StatusV1::Incomplete
@@ -130,7 +126,6 @@ mod test {
             dir.join("result.ron"),
             r#"ResultsV1(
                 title: "Title",
-                requirement_path: "requirements/definition",
                 requirement_commit: "abc",
                 test_path: "tests/generic_test",
                 test_commit: "abc",
@@ -156,7 +151,6 @@ mod test {
             dir.join("result.ron"),
             r#"ResultsV1(
                 title: "Title",
-                requirement_path: "requirements/definition",
                 requirement_commit: "abc",
                 test_path: "tests/generic_test",
                 test_commit: "abc",
@@ -182,7 +176,6 @@ mod test {
             dir.join("result.ron"),
             r#"ResultsV1(
                 title: "Title",
-                requirement_path: "requirements/definition",
                 requirement_commit: "abc",
                 test_path: "tests/generic_test",
                 test_commit: "abc",

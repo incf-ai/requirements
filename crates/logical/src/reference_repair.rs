@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::LogicalPath;
 use crate::draft::ProjectDraft;
-use crate::lookup::{get_module, get_module_mut, get_requirement, get_test};
-use crate::path::{format_reference_path, parse_reference_path};
+use crate::lookup::{get_module, get_module_mut, get_requirement, get_result, get_result_mut, get_test};
+use crate::path::{ResultPath, format_reference_path, parse_reference_path};
 
 /// What a rename/recreate is changing the identity of — both the "old"
 /// value `find_references` searches for, and (when repairing) the "new"
@@ -37,7 +37,7 @@ pub struct ReferenceSite {
     pub kind: ReferenceSiteKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceSiteKind {
     /// `RequirementDraft.tests[index]`.
     RequirementTestReference { index: usize },
@@ -46,13 +46,15 @@ pub enum ReferenceSiteKind {
     /// dependencies can't name an in-project entity, so they're never
     /// recorded here.
     RequirementDependency { index: usize },
-    /// `ResultDraft.requirement_path`/`requirement_commit` — a required
-    /// field, not a list entry: there's no empty state to fall back to,
-    /// so `ReferenceAction::Remove` on this site deletes the whole
-    /// result.
-    ResultRequirementRef,
-    /// `ResultDraft.test_path`/`test_commit` — see `ResultRequirementRef`.
-    ResultTestRef,
+    /// `ResultDraft.test_path`/`test_commit`, on the result named
+    /// `result_name` nested under the referrer requirement. A result's
+    /// *requirement* is no longer a field that can go stale — it's
+    /// structural (the result lives inside `RequirementDraft.results`), so
+    /// only its `test_path` reference can still break on a rename. A
+    /// required field, not a list entry: there's no empty state to fall
+    /// back to, so `ReferenceAction::Remove` on this site deletes the
+    /// whole result.
+    ResultTestRef { result_name: EntryName },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,35 +184,17 @@ fn walk_module(
                 });
             }
         }
-    }
-
-    for (name, result) in &module.results {
-        let referrer = LogicalPath {
-            modules: current_module.clone(),
-            name: name.clone(),
-        };
-        if let Ok(resolved) =
-            parse_reference_path(&result.requirement_path, current_module, "requirements")
-            && matches_target(
-                &resolved,
-                &result.requirement_path,
-                current_module,
-                EntityKind::Requirement,
-                target,
-            )
-        {
-            sites.push(ReferenceSite {
-                referrer: referrer.clone(),
-                kind: ReferenceSiteKind::ResultRequirementRef,
-            });
-        }
-        if let Ok(resolved) = parse_reference_path(&result.test_path, current_module, "tests")
-            && matches_target(&resolved, &result.test_path, current_module, EntityKind::Test, target)
-        {
-            sites.push(ReferenceSite {
-                referrer,
-                kind: ReferenceSiteKind::ResultTestRef,
-            });
+        for (result_name, result) in &requirement.results {
+            if let Ok(resolved) = parse_reference_path(&result.test_path, current_module, "tests")
+                && matches_target(&resolved, &result.test_path, current_module, EntityKind::Test, target)
+            {
+                sites.push(ReferenceSite {
+                    referrer: referrer.clone(),
+                    kind: ReferenceSiteKind::ResultTestRef {
+                        result_name: result_name.clone(),
+                    },
+                });
+            }
         }
     }
 
@@ -281,9 +265,9 @@ fn compute_repair(
 }
 
 fn site_index(kind: &ReferenceSiteKind) -> usize {
-    match *kind {
-        ReferenceSiteKind::RequirementTestReference { index } => index,
-        ReferenceSiteKind::RequirementDependency { index } => index,
+    match kind {
+        ReferenceSiteKind::RequirementTestReference { index } => *index,
+        ReferenceSiteKind::RequirementDependency { index } => *index,
         _ => 0,
     }
 }
@@ -310,18 +294,15 @@ pub fn apply_reference_actions(
     ordered.sort_by_key(|(site, _)| Reverse(site_index(&site.kind)));
 
     for (site, action) in ordered {
-        match site.kind {
+        match &site.kind {
             ReferenceSiteKind::RequirementTestReference { index } => {
-                apply_to_requirement_test_ref(project, site, index, *action, old_target, new_target)?
+                apply_to_requirement_test_ref(project, site, *index, *action, old_target, new_target)?
             }
             ReferenceSiteKind::RequirementDependency { index } => {
-                apply_to_requirement_dependency(project, site, index, *action, old_target, new_target)?
+                apply_to_requirement_dependency(project, site, *index, *action, old_target, new_target)?
             }
-            ReferenceSiteKind::ResultRequirementRef => {
-                apply_to_result(project, site, *action, old_target, new_target, EntityKind::Requirement)?
-            }
-            ReferenceSiteKind::ResultTestRef => {
-                apply_to_result(project, site, *action, old_target, new_target, EntityKind::Test)?
+            ReferenceSiteKind::ResultTestRef { result_name } => {
+                apply_to_result(project, site, result_name, *action, old_target, new_target)?
             }
         }
     }
@@ -448,64 +429,57 @@ fn apply_to_requirement_dependency(
     Ok(())
 }
 
+/// Applies a `ResultTestRef` action to the result named `result_name`,
+/// nested under the requirement at `site.referrer`. Unlike
+/// `apply_to_requirement_test_ref`/`apply_to_requirement_dependency`, there's
+/// no index to shift — a result's `test_path` is a single required field,
+/// same "no empty state" reasoning as those, but with only one referrer
+/// (the requirement) plus a name to pin down which of its results this is.
 fn apply_to_result(
     project: &mut ProjectDraft,
     site: &ReferenceSite,
+    result_name: &EntryName,
     action: ReferenceAction,
     old_target: &ReferenceTarget,
     new_target: Option<&ReferenceTarget>,
-    entity_kind: EntityKind,
 ) -> Result<(), ReferenceRepairError> {
     let referrer_modules = site.referrer.modules.clone();
+    let result_path = ResultPath {
+        requirement: site.referrer.clone(),
+        name: result_name.clone(),
+    };
 
     if action == ReferenceAction::Remove {
         let module = get_module_mut(&mut project.tree, &referrer_modules)
             .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
-        return match module.results.remove(&site.referrer.name) {
+        let requirement = module
+            .requirements
+            .get_mut(&site.referrer.name)
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        return match requirement.results.remove(result_name) {
             Some(_) => Ok(()),
             None => Err(ReferenceRepairError::UnknownReferrer(site.referrer.clone())),
         };
     }
 
-    let kind = match entity_kind {
-        EntityKind::Requirement => "requirements",
-        EntityKind::Test => "tests",
-    };
-    let raw = {
-        let result = get_module(&project.tree, &referrer_modules)
-            .and_then(|module| module.results.get(&site.referrer.name))
-            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
-        match entity_kind {
-            EntityKind::Requirement => result.requirement_path.clone(),
-            EntityKind::Test => result.test_path.clone(),
-        }
-    };
+    let raw = get_result(&project.tree, &result_path)
+        .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?
+        .test_path
+        .clone();
     let (new_path, new_commit) = compute_repair(
         project,
         &referrer_modules,
         &raw,
-        kind,
+        "tests",
         old_target,
         new_target,
-        entity_kind,
+        EntityKind::Test,
     )?;
 
-    let module = get_module_mut(&mut project.tree, &referrer_modules)
+    let result = get_result_mut(&mut project.tree, &result_path)
         .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
-    let result = module
-        .results
-        .get_mut(&site.referrer.name)
-        .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
-    match entity_kind {
-        EntityKind::Requirement => {
-            result.requirement_path = new_path;
-            result.requirement_commit = new_commit;
-        }
-        EntityKind::Test => {
-            result.test_path = new_path;
-            result.test_commit = new_commit;
-        }
-    }
+    result.test_path = new_path;
+    result.test_commit = new_commit;
     Ok(())
 }
 
@@ -605,7 +579,7 @@ mod test {
     }
 
     #[test]
-    fn find_references_finds_result_references() {
+    fn find_references_finds_a_result_test_reference() {
         let mut project = create_project("Project");
         project
             .tree
@@ -614,11 +588,13 @@ mod test {
         project.tree.add_test("generic_test", test("Text")).unwrap();
         project
             .tree
+            .requirements
+            .get_mut(&entry("definition"))
+            .unwrap()
             .add_result(
                 "result",
                 ResultDraft::new(
                     "Title",
-                    ReferencePath("/requirements/definition".to_string()),
                     "abc",
                     ReferencePath("/tests/generic_test".to_string()),
                     "def",
@@ -626,24 +602,23 @@ mod test {
             )
             .unwrap();
 
-        let requirement_sites =
-            find_references(&project, &ReferenceTarget::Requirement(root_path("definition")));
-        assert_eq!(
-            requirement_sites,
-            vec![ReferenceSite {
-                referrer: root_path("result"),
-                kind: ReferenceSiteKind::ResultRequirementRef,
-            }]
-        );
-
         let test_sites = find_references(&project, &ReferenceTarget::Test(root_path("generic_test")));
         assert_eq!(
             test_sites,
             vec![ReferenceSite {
-                referrer: root_path("result"),
-                kind: ReferenceSiteKind::ResultTestRef,
+                referrer: root_path("definition"),
+                kind: ReferenceSiteKind::ResultTestRef {
+                    result_name: entry("result"),
+                },
             }]
         );
+
+        // A result's requirement is structural now, not a tracked
+        // reference — renaming/removing the requirement never shows up as
+        // a `find_references` hit for it.
+        let requirement_sites =
+            find_references(&project, &ReferenceTarget::Requirement(root_path("definition")));
+        assert!(requirement_sites.is_empty());
     }
 
     #[test]
@@ -785,17 +760,16 @@ mod test {
     }
 
     #[test]
-    fn remove_deletes_the_whole_result_for_a_result_requirement_ref() {
+    fn remove_deletes_the_whole_result_for_a_result_test_ref() {
         let mut project = create_project("Project");
         project.tree.add_requirement("definition", requirement("Text")).unwrap();
         project.tree.add_test("generic_test", test("Text")).unwrap();
-        project
-            .tree
+        let definition = project.tree.requirements.get_mut(&entry("definition")).unwrap();
+        definition
             .add_result(
                 "result",
                 ResultDraft::new(
                     "Title",
-                    ReferencePath("/requirements/definition".to_string()),
                     "abc",
                     ReferencePath("/tests/generic_test".to_string()),
                     "def",
@@ -803,12 +777,20 @@ mod test {
             )
             .unwrap();
 
-        let old_target = ReferenceTarget::Requirement(root_path("definition"));
+        let old_target = ReferenceTarget::Test(root_path("generic_test"));
         let sites = find_references(&project, &old_target);
         apply_reference_actions(&mut project, &old_target, None, &[(sites[0].clone(), ReferenceAction::Remove)])
             .unwrap();
 
-        assert!(project.tree.results.is_empty());
+        assert!(
+            project
+                .tree
+                .requirements
+                .get(&entry("definition"))
+                .unwrap()
+                .results
+                .is_empty()
+        );
     }
 
     #[test]
@@ -953,17 +935,19 @@ mod test {
     }
 
     #[test]
-    fn repair_rewrites_a_result_requirement_ref_and_a_result_test_ref() {
+    fn repair_rewrites_a_result_test_ref() {
         let mut project = create_project("Project");
-        project.tree.add_requirement("renamed_definition", requirement("Text")).unwrap();
+        project.tree.add_requirement("definition", requirement("Text")).unwrap();
         project.tree.add_test("renamed_test", test("Text")).unwrap();
         project
             .tree
+            .requirements
+            .get_mut(&entry("definition"))
+            .unwrap()
             .add_result(
                 "result",
                 ResultDraft::new(
                     "Title",
-                    ReferencePath("/requirements/definition".to_string()),
                     "abc",
                     ReferencePath("/tests/generic_test".to_string()),
                     "def",
@@ -973,33 +957,28 @@ mod test {
 
         apply_reference_actions(
             &mut project,
-            &ReferenceTarget::Requirement(root_path("definition")),
-            Some(&ReferenceTarget::Requirement(root_path("renamed_definition"))),
-            &[(
-                ReferenceSite {
-                    referrer: root_path("result"),
-                    kind: ReferenceSiteKind::ResultRequirementRef,
-                },
-                ReferenceAction::Repair,
-            )],
-        )
-        .unwrap();
-        apply_reference_actions(
-            &mut project,
             &ReferenceTarget::Test(root_path("generic_test")),
             Some(&ReferenceTarget::Test(root_path("renamed_test"))),
             &[(
                 ReferenceSite {
-                    referrer: root_path("result"),
-                    kind: ReferenceSiteKind::ResultTestRef,
+                    referrer: root_path("definition"),
+                    kind: ReferenceSiteKind::ResultTestRef {
+                        result_name: entry("result"),
+                    },
                 },
                 ReferenceAction::Repair,
             )],
         )
         .unwrap();
 
-        let result = project.tree.results.get(&entry("result")).unwrap();
-        assert_eq!(result.requirement_path.0, "/requirements/renamed_definition");
+        let result = project
+            .tree
+            .requirements
+            .get(&entry("definition"))
+            .unwrap()
+            .results
+            .get(&entry("result"))
+            .unwrap();
         assert_eq!(result.test_path.0, "/tests/renamed_test");
     }
 
@@ -1219,11 +1198,13 @@ mod test {
         project.tree.add_test("generic_test", test("Text")).unwrap();
         project
             .tree
+            .requirements
+            .get_mut(&entry("definition"))
+            .unwrap()
             .add_result(
                 "result",
                 ResultDraft::new(
                     "Title",
-                    ReferencePath("/requirements/definition".to_string()),
                     "abc",
                     ReferencePath("/tests/generic_test".to_string()),
                     "def",
@@ -1232,12 +1213,14 @@ mod test {
             .unwrap();
 
         let site = ReferenceSite {
-            referrer: root_path("result"),
-            kind: ReferenceSiteKind::ResultRequirementRef,
+            referrer: root_path("definition"),
+            kind: ReferenceSiteKind::ResultTestRef {
+                result_name: entry("result"),
+            },
         };
         let err = apply_reference_actions(
             &mut project,
-            &ReferenceTarget::Requirement(root_path("definition")),
+            &ReferenceTarget::Test(root_path("generic_test")),
             None,
             &[(site, ReferenceAction::Repair)],
         )
@@ -1249,12 +1232,14 @@ mod test {
     fn removing_a_result_that_does_not_exist_is_an_error() {
         let mut project = create_project("Project");
         let site = ReferenceSite {
-            referrer: root_path("nonexistent_result"),
-            kind: ReferenceSiteKind::ResultRequirementRef,
+            referrer: root_path("nonexistent_requirement"),
+            kind: ReferenceSiteKind::ResultTestRef {
+                result_name: entry("nonexistent_result"),
+            },
         };
         let err = apply_reference_actions(
             &mut project,
-            &ReferenceTarget::Requirement(root_path("definition")),
+            &ReferenceTarget::Test(root_path("generic_test")),
             None,
             &[(site, ReferenceAction::Remove)],
         )
@@ -1344,42 +1329,17 @@ mod test {
     }
 
     #[test]
-    fn find_references_skips_a_malformed_result_requirement_reference() {
-        let mut project = create_project("Project");
-        project.tree.add_test("generic_test", test("Text")).unwrap();
-        project
-            .tree
-            .add_result(
-                "result",
-                ResultDraft::new(
-                    "Title",
-                    ReferencePath("bogus".to_string()),
-                    "abc",
-                    ReferencePath("/tests/generic_test".to_string()),
-                    "def",
-                ),
-            )
-            .unwrap();
-
-        let sites = find_references(&project, &ReferenceTarget::Requirement(root_path("definition")));
-        assert!(sites.is_empty());
-    }
-
-    #[test]
     fn find_references_skips_a_malformed_result_test_reference() {
         let mut project = create_project("Project");
         project.tree.add_requirement("definition", requirement("Text")).unwrap();
         project
             .tree
+            .requirements
+            .get_mut(&entry("definition"))
+            .unwrap()
             .add_result(
                 "result",
-                ResultDraft::new(
-                    "Title",
-                    ReferencePath("/requirements/definition".to_string()),
-                    "abc",
-                    ReferencePath("bogus".to_string()),
-                    "def",
-                ),
+                ResultDraft::new("Title", "abc", ReferencePath("bogus".to_string()), "def"),
             )
             .unwrap();
 

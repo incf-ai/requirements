@@ -5,14 +5,16 @@ use disk::{AttachmentReferenceKind, ReferencePath, StatusV1};
 
 use crate::pool::{AddPoolFileError, add_pool_file};
 
-/// A result, freely editable. `requirement_path`/`requirement_commit` and
-/// `test_path`/`test_commit` mirror `disk::ResultsV1` exactly (see
+/// A result, freely editable. `requirement_commit` and `test_path`/
+/// `test_commit` mirror `disk::ResultsV1` exactly (see
 /// `crates/logical/README.md`'s "Requirement-met semantics") — `logical`
-/// doesn't resolve or check these until `validate()`.
+/// doesn't resolve or check `test_path` until `validate()`. *Which*
+/// requirement this result belongs to isn't a field here at all: it's
+/// structural, determined by which `RequirementDraft.results` map this
+/// draft lives in.
 #[derive(Debug, Clone)]
 pub struct ResultDraft {
     pub title: String,
-    pub requirement_path: ReferencePath,
     pub requirement_commit: String,
     pub test_path: ReferencePath,
     pub test_commit: String,
@@ -26,14 +28,12 @@ pub struct ResultDraft {
 impl ResultDraft {
     pub fn new(
         title: impl Into<String>,
-        requirement_path: ReferencePath,
         requirement_commit: impl Into<String>,
         test_path: ReferencePath,
         test_commit: impl Into<String>,
     ) -> Self {
         ResultDraft {
             title: title.into(),
-            requirement_path,
             requirement_commit: requirement_commit.into(),
             test_path,
             test_commit: test_commit.into(),
@@ -59,7 +59,6 @@ mod test {
     fn minimal_result() -> ResultDraft {
         ResultDraft::new(
             "Title",
-            ReferencePath("requirements/definition".to_string()),
             "abc",
             ReferencePath("tests/generic_test".to_string()),
             "def",

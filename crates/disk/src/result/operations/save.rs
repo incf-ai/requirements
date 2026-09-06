@@ -63,7 +63,7 @@ mod test {
 
     #[test]
     fn round_trips_a_result_through_a_tempdir() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = test_project_dir().join("results/design");
+        let dir = test_project_dir().join("requirements/design/results/design");
         let original = load_result(&StdFilesystem, &FixedGit, &dir)?;
 
         let tempdir = std::env::temp_dir().join(format!(
@@ -94,9 +94,6 @@ mod test {
             name: crate::util::EntryName("definition".to_string()),
             definition: crate::result::types::ResultsV1 {
                 title: "Title".to_string(),
-                requirement_path: crate::requirement::types::ReferencePath(
-                    "requirements/definition".to_string(),
-                ),
                 requirement_commit: "abc".to_string(),
                 test_path: crate::requirement::types::ReferencePath(
                     "tests/generic_test".to_string(),

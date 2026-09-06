@@ -21,7 +21,7 @@ pub use disk::{
     DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, RemoteGitReference, ResultKindV1, StatusV1,
     TestReferenceKind,
 };
-pub use logical::LogicalPath;
+pub use logical::{LogicalPath, ResultPath};
 pub use logical::AddPoolFileError;
 pub use logical::draft::{RequirementDraft, ResultDraft, TestDraft, title_case_from_name};
 pub use logical::{RequirementResult, TestUnmetReason, UnmetReason, UnsatisfiedTest, resolve_reference_path};
@@ -155,19 +155,24 @@ pub enum Command {
         target: LogicalPath,
         request: RequestId,
     },
+    /// Unlike `AddRequirement`/`AddTest` (which take a *module* to add
+    /// into), this takes the owning *requirement*'s own path — a result's
+    /// location is nested under its requirement now
+    /// (`disk::RequirementOnDisk::results`), not a flat module-level
+    /// sibling, so there's no separate "module" to name.
     AddResult {
-        module: Vec<EntryName>,
+        requirement: LogicalPath,
         name: EntryName,
         result: Box<ResultDraft>,
         request: RequestId,
     },
     UpdateResult {
-        target: LogicalPath,
+        target: ResultPath,
         result: Box<ResultDraft>,
         request: RequestId,
     },
     RemoveResult {
-        target: LogicalPath,
+        target: ResultPath,
         request: RequestId,
     },
     AddModule {
@@ -278,25 +283,25 @@ pub enum Command {
         request: RequestId,
     },
     AddResultAttachment {
-        target: LogicalPath,
+        target: ResultPath,
         path: PathBuf,
         request: RequestId,
     },
     RemoveResultAttachment {
-        target: LogicalPath,
+        target: ResultPath,
         path: PathBuf,
         request: RequestId,
     },
 
     // -- Read-only --
+    /// `target` names both the entry and, via its own variant, which of
+    /// the three leaf kinds it is — a requirement, test, and result can
+    /// share the same name (a natural pairing, e.g. a result named after
+    /// the requirement it reports on), and a result additionally can't be
+    /// named by a bare `LogicalPath` at all (its location is nested under
+    /// a requirement, not a flat module-relative name) — see `EntryPath`.
     GetEntryDetail {
-        target: LogicalPath,
-        /// Which pool to resolve `target.name` against — a requirement,
-        /// test, and result can share the same name within the same
-        /// module (a natural pairing, e.g. a result named after the
-        /// requirement it reports on), so the lookup can't just try each
-        /// pool in turn and return the first hit.
-        kind: EntryKind,
+        target: EntryPath,
         request: RequestId,
     },
     /// A requirement's current `RequirementMetStatus` — the same
@@ -545,6 +550,12 @@ pub enum CommitAllError {
 pub enum AddChildError {
     #[error("module not found")]
     ModuleNotFound,
+    /// `AddResult` only: `requirement` named a module that exists but no
+    /// requirement of that name within it — a result's target is a
+    /// requirement, one level more specific than the other `Add*`
+    /// commands' plain module target.
+    #[error("requirement not found")]
+    RequirementNotFound,
     #[error(transparent)]
     Add(#[from] AddNamedChildError),
 }
@@ -753,7 +764,12 @@ pub enum EntryDetail {
     },
     Result {
         title: String,
-        requirement_path: String,
+        /// The owning requirement's own path — always known and never
+        /// edited by `gui-ui`'s Result form (a result's requirement is
+        /// structural, fixed by which requirement's `results` map it
+        /// lives in; unlike the old flat layout, there's no
+        /// `requirement_path` field to retarget).
+        requirement: LogicalPath,
         requirement_commit: String,
         test_path: String,
         test_commit: String,
@@ -834,6 +850,44 @@ pub enum EntryKind {
     Requirement,
     Test,
     Result,
+}
+
+/// Addresses one requirement/test/result, generically — the payload for
+/// any command or piece of `gui-ui` state (selection, navigation history)
+/// that needs to name "whichever leaf entry" without the caller having to
+/// separately track an `EntryKind`. Replaces the `(LogicalPath, EntryKind)`
+/// pairs this used to be before results were nested under their
+/// requirement: a `LogicalPath` alone is still enough to address a
+/// requirement or test, but a result additionally needs its own name
+/// distinct from its requirement's, hence `ResultPath` rather than a bare
+/// `LogicalPath` for that variant. No `Module` variant — a module is
+/// addressed by its own `Vec<EntryName>` path wherever that's needed
+/// (`SelectModule`, `GetModuleSummary`, etc.), never through this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryPath {
+    Requirement(LogicalPath),
+    Test(LogicalPath),
+    Result(ResultPath),
+}
+
+impl EntryPath {
+    pub fn kind(&self) -> EntryKind {
+        match self {
+            EntryPath::Requirement(_) => EntryKind::Requirement,
+            EntryPath::Test(_) => EntryKind::Test,
+            EntryPath::Result(_) => EntryKind::Result,
+        }
+    }
+
+    /// The module this entry lives in — for a result, that's its owning
+    /// requirement's own module, not a module of the result's "own" (it
+    /// has none independent of its requirement).
+    pub fn modules(&self) -> &[EntryName] {
+        match self {
+            EntryPath::Requirement(path) | EntryPath::Test(path) => &path.modules,
+            EntryPath::Result(path) => &path.requirement.modules,
+        }
+    }
 }
 
 /// Coarse status only — cheap enough to include on every node without a

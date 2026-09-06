@@ -23,6 +23,19 @@ impl LogicalPath {
     }
 }
 
+/// The location of a result: the `LogicalPath` of its owning requirement,
+/// plus its own name within that requirement's `results` map. Deliberately
+/// not a `LogicalPath` itself — a result's `modules` chain would be
+/// ambiguous with `LogicalPath::name` doing double duty as "requirement or
+/// result?" — and, unlike a requirement/test, a result is never named by a
+/// `disk::ReferencePath` reference string, so it never needs
+/// `parse_reference_path`/`format_reference_path`'s grammar.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResultPath {
+    pub requirement: LogicalPath,
+    pub name: EntryName,
+}
+
 impl std::fmt::Display for LogicalPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for module in &self.modules {

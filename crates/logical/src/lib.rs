@@ -10,7 +10,7 @@ mod test_support;
 pub mod validate;
 mod validated;
 
-pub use path::{LogicalPath, resolve_reference_path};
+pub use path::{LogicalPath, ResultPath, resolve_reference_path};
 pub use pool::AddPoolFileError;
 pub use reference_repair::{
     ReferenceAction, ReferenceRepairError, ReferenceSite, ReferenceSiteKind, ReferenceTarget,

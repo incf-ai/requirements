@@ -1,7 +1,8 @@
 use disk::EntryName;
 
+use crate::path::ResultPath;
 use crate::LogicalPath;
-use crate::draft::{ModuleDraft, RequirementDraft, TestDraft};
+use crate::draft::{ModuleDraft, RequirementDraft, ResultDraft, TestDraft};
 
 /// Walks `path` (a chain of submodule names from the project root) down
 /// through nested `ModuleDraft.modules` maps. Shared by validation
@@ -38,6 +39,23 @@ pub(crate) fn get_requirement<'a>(
 
 pub(crate) fn get_test<'a>(root: &'a ModuleDraft, target: &LogicalPath) -> Option<&'a TestDraft> {
     get_module(root, &target.modules)?.tests.get(&target.name)
+}
+
+pub(crate) fn get_result<'a>(root: &'a ModuleDraft, target: &ResultPath) -> Option<&'a ResultDraft> {
+    get_requirement(root, &target.requirement)?
+        .results
+        .get(&target.name)
+}
+
+/// Mutable counterpart to `get_result`, for `gui-core`'s in-place edits.
+pub(crate) fn get_result_mut<'a>(
+    root: &'a mut ModuleDraft,
+    target: &ResultPath,
+) -> Option<&'a mut ResultDraft> {
+    let requirement = get_module_mut(root, &target.requirement.modules)?
+        .requirements
+        .get_mut(&target.requirement.name)?;
+    requirement.results.get_mut(&target.name)
 }
 
 #[cfg(test)]

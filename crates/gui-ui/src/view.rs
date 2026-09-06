@@ -20,12 +20,11 @@ use crate::{
 
 /// A short label for a `ReferenceSiteKind`, for the broken-references
 /// modal's rows — see `GuiApp::render_broken_references_dialog`.
-fn reference_site_kind_label(kind: ReferenceSiteKind) -> &'static str {
+fn reference_site_kind_label(kind: &ReferenceSiteKind) -> &'static str {
     match kind {
         ReferenceSiteKind::RequirementTestReference { .. } => "test procedure",
         ReferenceSiteKind::RequirementDependency { .. } => "dependency",
-        ReferenceSiteKind::ResultRequirementRef => "result's requirement reference",
-        ReferenceSiteKind::ResultTestRef => "result's test procedure",
+        ReferenceSiteKind::ResultTestRef { .. } => "result's test procedure",
     }
 }
 
@@ -821,7 +820,7 @@ impl GuiApp {
         // references/Results links — acted on after `form`'s borrow of
         // `self.editor` ends below, same reasoning as every other
         // deferred-click flag in this function.
-        let mut navigate_clicked: Option<(LogicalPath, EntryKind)> = None;
+        let mut navigate_clicked: Option<gui_core::EntryPath> = None;
         {
             let EditorState::NewRequirement(form) = &mut self.editor else {
                 return;
@@ -1023,7 +1022,7 @@ impl GuiApp {
                         };
                         if let Some(target) = target {
                             if ui.link(dep.to_string()).clicked() {
-                                navigate_clicked = Some((target, EntryKind::Requirement));
+                                navigate_clicked = Some(gui_core::EntryPath::Requirement(target));
                             }
                         } else {
                             ui.label(dep.to_string());
@@ -1120,7 +1119,7 @@ impl GuiApp {
                         });
                         if let Some(target) = target {
                             if ui.link(test_ref.to_string()).clicked() {
-                                navigate_clicked = Some((target, EntryKind::Test));
+                                navigate_clicked = Some(gui_core::EntryPath::Test(target));
                             }
                         } else {
                             ui.label(test_ref.to_string());
@@ -1236,15 +1235,22 @@ impl GuiApp {
                             }
                         }
                         for result in &form.results {
-                            // Unlike Dependencies/Test references above,
-                            // `result.path` is already a resolved
-                            // `LogicalPath` (see `RequirementResult`), so
-                            // there's no parsing step before it's clickable.
+                            // Unlike Dependencies/Test references above, a
+                            // result's own name is already known without
+                            // parsing a reference string — its owning
+                            // requirement is `form.editing_target` itself
+                            // (structural nesting, not a resolved
+                            // reference), so this is always clickable once
+                            // the requirement itself has a stable path.
                             if ui
                                 .link(format!("{} ({:?})", result.title, result.status))
                                 .clicked()
+                                && let Some(requirement) = form.editing_target.clone()
                             {
-                                navigate_clicked = Some((result.path.clone(), EntryKind::Result));
+                                navigate_clicked = Some(gui_core::EntryPath::Result(gui_core::ResultPath {
+                                    requirement,
+                                    name: result.name.clone(),
+                                }));
                             }
                         }
                     });
@@ -1315,8 +1321,8 @@ impl GuiApp {
         if refresh_stale_test_references_clicked {
             self.refresh_stale_test_references_clicked();
         }
-        if let Some((target, kind)) = navigate_clicked {
-            self.select(target, kind);
+        if let Some(target) = navigate_clicked {
+            self.select(target);
         }
     }
 
@@ -1558,9 +1564,13 @@ impl GuiApp {
                     // lives next to the heading rather than only at the
                     // bottom.
                     let busy = form.pending_request.is_some();
+                    // A create-mode form has no requirement yet without a
+                    // pick — `build_command`'s `AddResult` branch relies on
+                    // this to guarantee `form.requirement` is `Some`.
+                    let can_submit = editing || form.requirement.is_some();
                     let button_label = if editing { "Save" } else { "Create" };
                     if ui
-                        .add_enabled(!busy, egui::Button::new(button_label))
+                        .add_enabled(!busy && can_submit, egui::Button::new(button_label))
                         .clicked()
                     {
                         create_clicked = true;
@@ -1603,8 +1613,13 @@ impl GuiApp {
                         ui.label(&form.title);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Requirement path:");
-                        ui.label(&form.requirement_path);
+                        ui.label("Requirement:");
+                        ui.label(
+                            form.requirement
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label("Requirement commit:");
@@ -1630,27 +1645,25 @@ impl GuiApp {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Requirement path:");
-                        if ui
-                            .text_edit_singleline(&mut form.requirement_path)
-                            .changed()
-                        {
-                            form.edited = true;
-                        }
-                        // A picker, not a replacement for the field above —
-                        // typing the path by hand still works (e.g. pasting
-                        // one, or for when the target hasn't loaded into
-                        // `self.tree` yet). Opens the shared path-picker modal
-                        // (`GuiApp::path_picker_dialog`) rather than an inline
-                        // `ComboBox` — a project with enough requirements
-                        // would otherwise overflow a `ComboBox` popup right
-                        // off the screen, with no way to search it down to
-                        // the one wanted. Selecting an entry there fills this
-                        // same field with the correctly-formatted absolute
-                        // reference path, so the user doesn't have to know
-                        // `logical`'s `/[modules/<sub>/]*requirements/<name>`
-                        // syntax by heart.
-                        if self.tree.is_some() && ui.button("Pick…").clicked() {
+                        ui.label("Requirement:");
+                        ui.label(
+                            form.requirement
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "(none picked)".to_string()),
+                        );
+                        // A result's owning requirement is structural
+                        // (it's saved nested under it — see
+                        // `ResultFormState::requirement`'s doc comment),
+                        // fixed once created: the picker only opens for a
+                        // create-mode form (`!editing`), same "Identifier"
+                        // treatment above. Opens the shared path-picker
+                        // modal (`GuiApp::path_picker_dialog`) rather than
+                        // an inline `ComboBox` — a project with enough
+                        // requirements would otherwise overflow a
+                        // `ComboBox` popup right off the screen, with no
+                        // way to search it down to the one wanted.
+                        if !editing && self.tree.is_some() && ui.button("Pick…").clicked() {
                             open_picker = Some(PathPickerTarget::ResultRequirementPath);
                         }
                     });
@@ -2805,7 +2818,7 @@ impl GuiApp {
                 ));
                 egui::Grid::new("recreate_requirement_references_grid").striped(true).show(ui, |ui| {
                     for (index, (site, action)) in reference_choices.iter_mut().enumerate() {
-                        ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(site.kind)));
+                        ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(&site.kind)));
                         egui::ComboBox::new(("recreate_requirement_reference_action", index), "")
                             .selected_text(match action {
                                 ReferenceAction::Repair => "Repair",
@@ -2901,7 +2914,7 @@ impl GuiApp {
                 ));
                 egui::Grid::new("recreate_test_references_grid").striped(true).show(ui, |ui| {
                     for (index, (site, action)) in reference_choices.iter_mut().enumerate() {
-                        ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(site.kind)));
+                        ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(&site.kind)));
                         egui::ComboBox::new(("recreate_test_reference_action", index), "")
                             .selected_text(match action {
                                 ReferenceAction::Repair => "Repair",
@@ -2977,7 +2990,7 @@ impl GuiApp {
             ));
             egui::Grid::new("broken_references_grid").striped(true).show(ui, |ui| {
                 for (index, (site, action)) in choices.iter_mut().enumerate() {
-                    ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(site.kind)));
+                    ui.label(format!("{} ({})", site.referrer, reference_site_kind_label(&site.kind)));
                     egui::ComboBox::new(("broken_reference_action", index), "")
                         .selected_text(match action {
                             ReferenceAction::Repair => "Repair",
@@ -3033,10 +3046,7 @@ impl GuiApp {
                 ui.label("Local gui-ui state:");
                 ui.label(format!("pending: {}", self.pending.len()));
                 ui.label(format!("dirty: {}", self.dirty));
-                ui.label(format!(
-                    "selection: {:?} ({:?})",
-                    self.selection, self.selected_kind
-                ));
+                ui.label(format!("selection: {:?}", self.selection));
                 ui.label(format!("selected_module: {:?}", self.selected_module));
                 ui.label(format!("project_path: {:?}", self.project_path));
                 ui.label(format!(
@@ -3327,16 +3337,15 @@ struct LeafGroupDisplay {
 fn count_kind_recursive(node: &TreeNode, kind: EntryKind) -> usize {
     node.children
         .iter()
-        .map(|child| {
-            if child.kind == EntryKind::Module {
-                count_kind_recursive(child, kind)
-            } else {
-                usize::from(child.kind == kind)
-            }
-        })
+        .map(|child| usize::from(child.kind == kind) + count_kind_recursive(child, kind))
         .sum()
 }
 
+/// Renders a requirement or test leaf — never a result: a result's own
+/// row is `render_result_leaf` instead, since its identity needs its
+/// owning requirement's name alongside `module_path`, which a bare
+/// `TreeNode`/`module_path` pair can't express (see `EntryPath`/
+/// `ResultPath`).
 fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName]) {
     // Both arms need to end up the same type for the one shared
     // `selectable_label` call below — `Atoms` is that common type (a
@@ -3347,13 +3356,16 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
     // Highlights the leaf currently open in the center pane the same way
     // `render_tree_node` highlights the current module — an accent-colored
     // name, so "this is the active thing" reads consistently whether it's
-    // a module or a leaf. `selected_kind` disambiguates a same-named
-    // requirement/test/result within one module (see its own doc comment).
-    let is_open = app.selection.as_ref().is_some_and(|selection| {
-        app.selected_kind == Some(node.kind)
-            && selection.modules == module_path
-            && selection.name == node.name
-    });
+    // a module or a leaf.
+    let is_open = match &app.selection {
+        Some(gui_core::EntryPath::Requirement(p)) => {
+            node.kind == EntryKind::Requirement && p.modules == module_path && p.name == node.name
+        }
+        Some(gui_core::EntryPath::Test(p)) => {
+            node.kind == EntryKind::Test && p.modules == module_path && p.name == node.name
+        }
+        _ => false,
+    };
     let mut name_text = egui::RichText::new(node.name.as_str());
     if is_open {
         name_text = name_text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
@@ -3371,18 +3383,19 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
         _ => name_text.into_atoms(),
     };
     let response = ui.selectable_label(false, content);
+    let target = LogicalPath {
+        modules: module_path.to_vec(),
+        name: node.name.clone(),
+    };
     if response.clicked() {
-        let target = LogicalPath {
-            modules: module_path.to_vec(),
-            name: node.name.clone(),
+        let entry_target = match node.kind {
+            EntryKind::Test => gui_core::EntryPath::Test(target.clone()),
+            _ => gui_core::EntryPath::Requirement(target.clone()),
         };
         if app.editor_has_unsaved_edits() {
-            app.unsaved_form_dialog_opened(PendingNavigation::Select {
-                target,
-                kind: node.kind,
-            });
+            app.unsaved_form_dialog_opened(PendingNavigation::Select(entry_target));
         } else {
-            app.select(target, node.kind);
+            app.select(entry_target);
         }
     }
     // Copy/Paste/Duplicate/Recreate/Delete are requirement-only affordances
@@ -3390,10 +3403,6 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
     // `duplicate_requirement_clicked`/`recreate_requirement_from_tree_clicked`/
     // `delete_requirement_from_tree_clicked` counterparts to receive one.
     if node.kind == EntryKind::Requirement {
-        let target = LogicalPath {
-            modules: module_path.to_vec(),
-            name: node.name.clone(),
-        };
         response.context_menu(|ui| {
             if ui.button("Copy").clicked() {
                 app.copy_requirement_clicked(target.clone());
@@ -3413,6 +3422,42 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
                 ui.close();
             }
         });
+    }
+    // A requirement's results are nested under it now (on disk and in the
+    // tree — see `disk::RequirementOnDisk::results`), rendered as an
+    // indented sub-list rather than their own flat "results" group.
+    if node.kind == EntryKind::Requirement && !node.children.is_empty() {
+        ui.indent((module_path, &node.name, "results"), |ui| {
+            for result_node in &node.children {
+                render_result_leaf(app, ui, result_node, &target);
+            }
+        });
+    }
+}
+
+/// A result's own row, nested under its owning requirement
+/// (`requirement`) — see `render_leaf`'s own doc comment on why this isn't
+/// just another `render_leaf` call.
+fn render_result_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, requirement: &LogicalPath) {
+    let is_open = matches!(
+        &app.selection,
+        Some(gui_core::EntryPath::Result(p)) if &p.requirement == requirement && p.name == node.name
+    );
+    let mut name_text = egui::RichText::new(node.name.as_str());
+    if is_open {
+        name_text = name_text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
+    }
+    let response = ui.selectable_label(false, name_text);
+    if response.clicked() {
+        let target = gui_core::EntryPath::Result(gui_core::ResultPath {
+            requirement: requirement.clone(),
+            name: node.name.clone(),
+        });
+        if app.editor_has_unsaved_edits() {
+            app.unsaved_form_dialog_opened(PendingNavigation::Select(target));
+        } else {
+            app.select(target);
+        }
     }
 }
 
@@ -3459,7 +3504,6 @@ fn render_selected_module_pane(
     let requirement_total =
         has_submodules.then(|| count_kind_recursive(node, EntryKind::Requirement));
     let test_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Test));
-    let result_total = has_submodules.then(|| count_kind_recursive(node, EntryKind::Result));
     let children = node.children.clone();
 
     render_leaf_group(
@@ -3484,18 +3528,6 @@ fn render_selected_module_pane(
         LeafGroupDisplay {
             force_open,
             recursive_total: test_total,
-        },
-    );
-    render_leaf_group(
-        app,
-        ui,
-        "results",
-        EntryKind::Result,
-        &children,
-        &module_path,
-        LeafGroupDisplay {
-            force_open,
-            recursive_total: result_total,
         },
     );
 

@@ -7,7 +7,11 @@ use crate::attachments::{WriteAttachmentsError, write_attachments};
 use crate::requirement::types::{
     RequirementDefinition, RequirementOnDisk, ValidateRequirementDefinitionError,
 };
-use crate::util::{SaveRonError, WriteTextError, save_ron, write_optional_text, write_text};
+use crate::result::operations::save::Error as SaveResultError;
+use crate::util::{
+    RemoveStaleChildrenError, SaveRonError, WriteTextError, remove_stale_children, save_ron,
+    write_optional_text, write_text,
+};
 
 #[derive(Debug, Error)]
 enum ErrorKind {
@@ -29,6 +33,14 @@ enum ErrorKind {
     TestGuidance { source: WriteTextError },
     #[error("failed to save attachments: {0}")]
     Attachments(#[from] WriteAttachmentsError),
+    #[error("failed to save result '{name}': {source}")]
+    Result {
+        name: String,
+        #[source]
+        source: SaveResultError,
+    },
+    #[error("failed to remove stale results: {0}")]
+    StaleResults(RemoveStaleChildrenError),
 }
 
 #[derive(Debug, Error)]
@@ -79,6 +91,26 @@ fn save_requirement_stage_inner(
     )
     .map_err(|source| ErrorKind::TestGuidance { source })?;
     write_attachments(fs, &dir.join("attachments"), &requirement.attachments)?;
+
+    let results_dir = dir.join("results");
+    fs.create_dir_all(&results_dir)
+        .map_err(|source| ErrorKind::CreateDir {
+            path: results_dir.clone(),
+            source,
+        })?;
+    remove_stale_children(
+        fs,
+        &results_dir,
+        &requirement.results.iter().map(|r| r.name.clone()).collect(),
+    )
+    .map_err(ErrorKind::StaleResults)?;
+    for result in &requirement.results {
+        crate::result::operations::save_result(fs, &results_dir.join(&result.name), result)
+            .map_err(|source| ErrorKind::Result {
+                name: result.name.to_string(),
+                source,
+            })?;
+    }
 
     Ok(())
 }
@@ -136,6 +168,7 @@ mod test {
             requirement_guidance: None,
             test_guidance: None,
             attachments: Vec::new(),
+            results: Vec::new(),
             commit: Some("deadbeef".to_string()),
         }
     }

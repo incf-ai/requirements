@@ -68,8 +68,16 @@ mod test {
         assert_eq!(project.definition.name, "Test Project");
         assert_eq!(project.tree.requirements.len(), 3);
         assert_eq!(project.tree.tests.len(), 3);
-        assert_eq!(project.tree.results.len(), 3);
         assert_eq!(project.tree.modules.len(), 2);
+        assert_eq!(
+            project
+                .tree
+                .requirements
+                .iter()
+                .map(|r| r.results.len())
+                .sum::<usize>(),
+            3
+        );
 
         let names: Vec<&str> = project
             .tree
@@ -139,7 +147,6 @@ mod test {
         ));
         std::fs::create_dir_all(dir.join("requirements")).unwrap();
         std::fs::create_dir_all(dir.join("tests")).unwrap();
-        std::fs::create_dir_all(dir.join("results")).unwrap();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
 
         let err = load_project(&StdFilesystem, &FixedGit, &dir).unwrap_err();
