@@ -323,6 +323,20 @@ pub enum DiffError {
     CommandFailed { status: ExitStatus, stderr: String },
 }
 
+/// `path` rewritten as a pathspec valid after `Command::current_dir(cwd)`
+/// — `.` when `path` and `cwd` are the same directory (git rejects an
+/// empty string as a pathspec, unlike `.`), the part of `path` beyond
+/// `cwd` when `path` is nested under it, or `path` itself unchanged if
+/// it isn't under `cwd` at all (doesn't happen for any real caller here,
+/// but a fallback beats a panic on a `strip_prefix` that fails).
+fn relative_pathspec<'a>(path: &'a Path, cwd: &Path) -> std::borrow::Cow<'a, Path> {
+    match path.strip_prefix(cwd) {
+        Ok(relative) if relative.as_os_str().is_empty() => Path::new(".").into(),
+        Ok(relative) => relative.into(),
+        Err(_) => path.into(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemGit;
 
@@ -359,14 +373,29 @@ impl Git for SystemGit {
             }
         }
 
+        // `git`'s own pathspecs below resolve relative to `current_dir`
+        // (`cwd`), which is deliberately *not* necessarily the calling
+        // process's own cwd — `cwd` walks to wherever `path` itself lives
+        // so `git` can discover the right repository regardless of what
+        // the process's cwd happens to be (that's also why `is_repository`
+        // above is checked against `cwd`, not `path`). A relative `path`
+        // has to be re-relativized against that same `cwd` before being
+        // used as a pathspec, or git resolves it against `cwd` a *second*
+        // time on top of whatever it was already relative to — e.g.
+        // `cwd` = "a/b" (from a relative `path` "a/b"), pathspec "a/b"
+        // resolves to "a/b/a/b", silently matching nothing. An absolute
+        // `path` never had this problem (unambiguous regardless of `cwd`),
+        // which is why this only ever shows up for a relative one.
+        let relative_path = relative_pathspec(path, cwd);
+
         let mut command = Command::new("git");
         command
             .current_dir(cwd)
             .args(["log", "-1", "--format=%H", "--"])
-            .arg(path);
+            .arg(relative_path.as_ref());
         for exclude in excludes {
             let mut pathspec = std::ffi::OsString::from(":(exclude)");
-            pathspec.push(exclude);
+            pathspec.push(relative_pathspec(exclude, cwd).as_ref());
             command.arg(pathspec);
         }
 
@@ -975,6 +1004,58 @@ mod tests {
             .commit_for_path_excluding(&dir, &[&dir.join("sub")])
             .unwrap();
         assert_eq!(excluded, initial_commit);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A caller passing a path relative to *its own* cwd (e.g. `cli --dir
+    /// test_project`, run from the workspace root) used to get a spurious
+    /// `NotTracked`: `commit_for_path_excluding` runs `git` from `cwd` =
+    /// `path` itself (a directory), a location generally different from
+    /// the calling process's own cwd, but re-passed `path` (and each
+    /// exclude) to `git` unchanged — resolved a second time against that
+    /// new `cwd`, doubling the prefix and matching nothing. Reproduced
+    /// here by actually changing the process's cwd to `dir`'s *parent* and
+    /// passing `dir`'s bare name (and `sub` beneath it) as relative paths,
+    /// the same shape a relative `--dir` produces.
+    #[test]
+    fn commit_for_path_excluding_works_with_a_relative_path_and_relative_excludes() {
+        let dir = scratch_git_repo("relative-path");
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        let initial_commit = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/inner.txt"), "hello").unwrap();
+        run(&["add", "sub/inner.txt"]);
+        run(&["commit", "--quiet", "-m", "touches only sub/"]);
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.parent().unwrap()).unwrap();
+        let relative_dir = PathBuf::from(dir.file_name().unwrap());
+        let result =
+            SystemGit.commit_for_path_excluding(&relative_dir, &[&relative_dir.join("sub")]);
+        std::env::set_current_dir(&original_cwd).unwrap();
+
+        assert_eq!(result.unwrap(), initial_commit);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
