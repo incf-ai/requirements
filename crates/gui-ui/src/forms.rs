@@ -15,9 +15,11 @@ use std::path::PathBuf;
 
 use gui_core::{
     Command, DependencyReferenceKind, EntryName, LocalGitReference, LogicalPath, ReferencePath,
-    RemoteGitReference, RequestId, RequirementDraft, ResultDraft, ResultKindV1, ResultPath, StatusV1,
-    TestDraft, TestReferenceKind,
+    RemoteGitReference, RequestId, RequirementDraft, ResultDraft, ResultKindV1, ResultPath,
+    StatusV1, TestDraft, TestReferenceKind,
 };
+
+use crate::spellcheck::{FieldSpellCache, SpellPopupState};
 
 fn non_empty(text: &str) -> Option<String> {
     if text.trim().is_empty() {
@@ -76,9 +78,9 @@ impl DependencyDraft {
                 commit: remote.commit,
             },
             DependencyReferenceKind::Submodules => DependencyDraft::Submodules,
-            DependencyReferenceKind::SubmoduleV1(name) => DependencyDraft::Submodule {
-                name: name.0,
-            },
+            DependencyReferenceKind::SubmoduleV1(name) => {
+                DependencyDraft::Submodule { name: name.0 }
+            }
         }
     }
 
@@ -339,6 +341,16 @@ pub struct RequirementFormState {
     /// this form and not part of `build_command`'s payload. Empty for a
     /// create-mode form (nothing saved yet to reference).
     pub results: Vec<gui_core::RequirementResult>,
+    /// Memoized spellcheck results for `title`/`requirement_text`/
+    /// `requirement_guidance`/`test_guidance` respectively — see
+    /// `FieldSpellCache`'s own doc comment.
+    pub title_spell: FieldSpellCache,
+    pub requirement_text_spell: FieldSpellCache,
+    pub requirement_guidance_spell: FieldSpellCache,
+    pub test_guidance_spell: FieldSpellCache,
+    /// This form's right-click spellcheck suggestion popup — `Some` while
+    /// open, for whichever of the four fields above it was opened against.
+    pub spell_popup: Option<SpellPopupState>,
 }
 
 impl Default for RequirementFormState {
@@ -370,6 +382,11 @@ impl Default for RequirementFormState {
             pending_test_commit_fetches: HashMap::new(),
             test_commit_fetch_error: None,
             results: Vec::new(),
+            title_spell: FieldSpellCache::default(),
+            requirement_text_spell: FieldSpellCache::default(),
+            requirement_guidance_spell: FieldSpellCache::default(),
+            test_guidance_spell: FieldSpellCache::default(),
+            spell_popup: None,
         }
     }
 }
@@ -451,6 +468,12 @@ pub struct TestFormState {
     pub template_files: Vec<PathBuf>,
     pub new_template_path: String,
     pub local_pool_error: Option<String>,
+    /// See `RequirementFormState::title_spell`'s doc comment — same idea,
+    /// for `title`/`test_text`.
+    pub title_spell: FieldSpellCache,
+    pub test_text_spell: FieldSpellCache,
+    /// See `RequirementFormState::spell_popup`'s doc comment.
+    pub spell_popup: Option<SpellPopupState>,
 }
 
 impl Default for TestFormState {
@@ -471,6 +494,9 @@ impl Default for TestFormState {
             template_files: Vec::new(),
             new_template_path: String::new(),
             local_pool_error: None,
+            title_spell: FieldSpellCache::default(),
+            test_text_spell: FieldSpellCache::default(),
+            spell_popup: None,
         }
     }
 }
@@ -552,6 +578,12 @@ pub struct ResultFormState {
     pub attachments: Vec<PathBuf>,
     pub new_attachment_path: String,
     pub local_pool_error: Option<String>,
+    /// See `RequirementFormState::title_spell`'s doc comment — same idea.
+    /// The only prose field in scope here (`requirement_commit`/
+    /// `test_path`/`test_commit` are structured, not spellchecked).
+    pub title_spell: FieldSpellCache,
+    /// See `RequirementFormState::spell_popup`'s doc comment.
+    pub spell_popup: Option<SpellPopupState>,
 }
 
 impl Default for ResultFormState {
@@ -579,6 +611,8 @@ impl Default for ResultFormState {
             attachments: Vec::new(),
             new_attachment_path: String::new(),
             local_pool_error: None,
+            title_spell: FieldSpellCache::default(),
+            spell_popup: None,
         }
     }
 }
@@ -697,7 +731,9 @@ impl ModuleDetailFormState {
 mod test {
     use std::collections::BTreeSet;
 
-    use gui_core::{ReferenceAction, ReferenceSite, ReferenceSiteKind, StatusV1, TestReferenceKind};
+    use gui_core::{
+        ReferenceAction, ReferenceSite, ReferenceSiteKind, StatusV1, TestReferenceKind,
+    };
 
     use super::*;
 
@@ -1061,7 +1097,10 @@ mod test {
         };
         let actions = vec![(site.clone(), ReferenceAction::Remove)];
 
-        let Command::RenameModule { reference_actions, .. } = form.build_command(actions.clone(), 1) else {
+        let Command::RenameModule {
+            reference_actions, ..
+        } = form.build_command(actions.clone(), 1)
+        else {
             panic!("expected RenameModule");
         };
         assert_eq!(reference_actions, actions);

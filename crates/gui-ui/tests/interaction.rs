@@ -1090,6 +1090,109 @@ fn selecting_a_theme_updates_the_selector_and_persists_to_the_config_file() {
 }
 
 #[test]
+fn the_spellcheck_checkbox_defaults_to_checked() {
+    let mut harness = harness();
+    harness.step();
+
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::CheckBox, "Spellcheck")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
+}
+
+#[test]
+fn unchecking_spellcheck_persists_to_the_config_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "gui-ui-interaction-test-spellcheck-persist-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("gui-config.ron");
+    let config_path_for_app = config_path.clone();
+
+    let mut harness = Harness::new_eframe(move |_cc| {
+        GuiApp::new(
+            gui_core::CoreHandle::start(),
+            GuiConfig::default(),
+            config_path_for_app.clone(),
+            RecentProjects::default(),
+            PathBuf::from("/dev/null"),
+        )
+    });
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::CheckBox, "Spellcheck")
+        .click();
+    harness.step();
+
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::CheckBox, "Spellcheck")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::False)
+    );
+
+    let (loaded, error) = GuiConfig::load(&config_path);
+    assert!(error.is_none());
+    assert!(!loaded.spellcheck_enabled);
+
+    drop(harness);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn typing_and_creating_a_requirement_still_works_once_spellcheck_is_ready() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+
+    // Opening the "New Requirement" form is what actually kicks off the
+    // background dictionary build (`GuiApp::ensure_spell_checker_started`,
+    // called from `render_requirement_form` — deliberately *not*
+    // unconditional every frame, see that method's own doc comment on
+    // why). Wait for it here, with real wall-clock time between steps,
+    // so this test actually exercises the `Ready` rendering path (the
+    // custom layouter and right-click popup wiring in
+    // `spellchecked_singleline`/`resizable_multiline`) rather than the
+    // "still building" passthrough every other interaction test in this
+    // file incidentally exercises by moving on before it ever finishes.
+    harness
+        .get_by_role_and_label(Role::Button, "New Requirement")
+        .click();
+    harness.step();
+    for _ in 0..100 {
+        harness.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    create_scratch_requirement(&mut harness);
+    open_leaf_for_editing(&mut harness, "\u{e32c} scratchreq", "Edit Requirement");
+
+    // Confirms the rewritten `.show()`-based rendering (needed to get at
+    // `TextEditOutput` for the right-click popup) still displays exactly
+    // what was typed, for both the singleline title and the resizable
+    // multiline text field.
+    assert!(
+        harness
+            .query(By::new().role(Role::TextInput).value("Scratch Requirement"))
+            .is_some()
+    );
+    assert!(
+        harness
+            .query(
+                By::new()
+                    .role(Role::MultilineTextInput)
+                    .value("Scratch requirement text.")
+            )
+            .is_some()
+    );
+}
+
+#[test]
 fn save_is_disabled_with_no_project_loaded_and_enables_once_one_is() {
     let mut harness = harness();
     harness.step();
@@ -1433,7 +1536,8 @@ fn clicking_a_changed_file_opens_its_diff() {
     harness.step();
 
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Diff: root.txt").is_some()
+        h.query_by_role_and_label(Role::Label, "Diff: root.txt")
+            .is_some()
     });
     // `FixedGit::diff`'s own fixed reply (see its doc comment) — a real
     // unified diff round-tripped through `Command::GetDiff`, proving the
@@ -1461,7 +1565,8 @@ fn closing_the_diff_dialog_leaves_the_commit_all_dialog_open() {
     harness.step();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Diff: root.txt").is_some()
+        h.query_by_role_and_label(Role::Label, "Diff: root.txt")
+            .is_some()
     });
 
     harness
@@ -1499,7 +1604,11 @@ fn push_button_opens_the_confirm_dialog() {
     // The dialog's own heading, "Push" — distinct from the toolbar
     // button's "Push…" label (see `render_push_dialog`'s own doc
     // comment on why the two differ).
-    assert!(harness.query_by_role_and_label(Role::Label, "Push").is_some());
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Push")
+            .is_some()
+    );
     assert!(
         harness
             .query_by_label("Push the current branch to its remote?")
@@ -1525,7 +1634,11 @@ fn cancel_button_closes_the_push_dialog_without_pushing() {
     harness.get_by_role_and_label(Role::Button, "Push…").click();
     harness.step();
     harness.step();
-    assert!(harness.query_by_role_and_label(Role::Label, "Push").is_some());
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Push")
+            .is_some()
+    );
 
     // `.click_accesskit()` — same "dialog can sit past the simulated
     // viewport" reasoning as the commit-all dialog's own Cancel button.
@@ -1535,7 +1648,11 @@ fn cancel_button_closes_the_push_dialog_without_pushing() {
     harness.step();
     harness.step();
 
-    assert!(harness.query_by_role_and_label(Role::Label, "Push").is_none());
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Push")
+            .is_none()
+    );
 
     drop(harness);
     std::fs::remove_dir_all(&dir).ok();
@@ -1563,8 +1680,16 @@ fn clicking_push_shows_the_output() {
     });
     // The confirm/push button is gone once output is showing — only
     // "Close" remains (see `render_push_dialog`'s own doc comment).
-    assert!(harness.query_by_role_and_label(Role::Button, "Push").is_none());
-    assert!(harness.query_by_role_and_label(Role::Button, "Close").is_some());
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Push")
+            .is_none()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Close")
+            .is_some()
+    );
 
     drop(harness);
     std::fs::remove_dir_all(&dir).ok();
@@ -1614,7 +1739,9 @@ fn create_scratch_requirement(harness: &mut Harness<GuiApp>) {
     multiline_fields[0].focus();
     multiline_fields[0].type_text("Scratch requirement text.");
     harness.step();
-    harness.get_by_role_and_label(Role::Button, "Create").click();
+    harness
+        .get_by_role_and_label(Role::Button, "Create")
+        .click();
     harness.step();
     wait_until(harness, |h| {
         h.query_by_label("\u{e18a} unsaved changes").is_some()
@@ -1718,7 +1845,8 @@ fn right_click_recreate_renames_a_requirement_and_regenerates_its_title() {
     // inline, so wait for the modal instead of assuming a fixed `step()`
     // count was enough.
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Recreate Requirement").is_some()
+        h.query_by_role_and_label(Role::Label, "Recreate Requirement")
+            .is_some()
     });
 
     // "Regenerate title from new name" is checked by default — leave it
@@ -1732,7 +1860,9 @@ fn right_click_recreate_renames_a_requirement_and_regenerates_its_title() {
     name_field.type_text("_renamed");
     harness.step();
 
-    harness.get_by_role_and_label(Role::Button, "Recreate").click();
+    harness
+        .get_by_role_and_label(Role::Button, "Recreate")
+        .click();
     harness.step();
 
     // The recreate flow chains a real `FindReferences`, then
@@ -1754,7 +1884,9 @@ fn right_click_recreate_renames_a_requirement_and_regenerates_its_title() {
         .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq_renamed")
         .click();
     harness.step();
-    wait_until(&mut harness, |h| h.query_by_label("Scratchreq Renamed").is_some());
+    wait_until(&mut harness, |h| {
+        h.query_by_label("Scratchreq Renamed").is_some()
+    });
 }
 
 #[test]
@@ -1814,7 +1946,8 @@ fn pressing_enter_in_the_recreate_name_field_submits_like_clicking_recreate() {
         .click_accesskit();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Recreate Requirement").is_some()
+        h.query_by_role_and_label(Role::Label, "Recreate Requirement")
+            .is_some()
     });
 
     let name_field = harness
@@ -1861,7 +1994,8 @@ fn pressing_enter_in_the_recreate_name_field_does_nothing_when_recreate_would_be
         .click_accesskit();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Recreate Requirement").is_some()
+        h.query_by_role_and_label(Role::Label, "Recreate Requirement")
+            .is_some()
     });
 
     // The name field starts out prefilled with the unchanged current name
@@ -1939,7 +2073,9 @@ fn right_click_duplicate_prompts_for_a_name_then_creates_the_copy() {
     // confirmation test above.
     harness.step();
 
-    harness.get_by_role_and_label(Role::Button, "Duplicate").click();
+    harness
+        .get_by_role_and_label(Role::Button, "Duplicate")
+        .click();
     harness.step();
 
     // The confirm click sends a real `AddRequirement` for the deduped
@@ -1965,7 +2101,9 @@ fn right_click_duplicate_prompts_for_a_name_then_creates_the_copy() {
         .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq copy")
         .click();
     harness.step();
-    wait_until(&mut harness, |h| h.query_by_label("Scratchreq Copy").is_some());
+    wait_until(&mut harness, |h| {
+        h.query_by_label("Scratchreq Copy").is_some()
+    });
 }
 
 #[test]
@@ -2044,7 +2182,9 @@ fn right_click_delete_removes_a_requirement_after_confirmation() {
     // normally provides for free by polling across several steps.
     harness.step();
 
-    harness.get_by_role_and_label(Role::Button, "Delete").click();
+    harness
+        .get_by_role_and_label(Role::Button, "Delete")
+        .click();
     harness.step();
 
     wait_until(&mut harness, |h| {
@@ -2511,7 +2651,11 @@ fn the_top_tree_shows_empty_modules_and_no_leaves() {
     );
     assert_eq!(
         harness
-            .get_all(By::new().role(Role::Button).label_contains("test procedures"))
+            .get_all(
+                By::new()
+                    .role(Role::Button)
+                    .label_contains("test procedures")
+            )
             .count(),
         1
     );
@@ -3338,7 +3482,8 @@ fn the_update_stale_reference_button_appears_only_for_a_stale_result_and_fixes_i
     // requirement-level test above — wait on the button actually being
     // gone rather than a fixed frame count.
     wait_until(&mut harness, |h| {
-        h.query_by_label_contains("Update Stale Reference").is_none()
+        h.query_by_label_contains("Update Stale Reference")
+            .is_none()
     });
 
     // `apply_refresh_stale_result_reference_result` marks `dirty` on
@@ -4160,7 +4305,8 @@ fn a_submodule_dependencys_link_navigates_to_that_module() {
         .click();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Requirement").is_some()
+        h.query_by_role_and_label(Role::Label, "Requirement")
+            .is_some()
     });
 
     // Back in the read-only viewer: the new dependency shows as a
@@ -4233,11 +4379,15 @@ fn adding_a_named_submodule_dependency_offers_the_current_modules_own_submodules
     // under "alpha", not a direct child of the project root) must not
     // gain a second entry; "alpha"/"beta" (the root's own direct
     // submodules) must.
-    let alpha_before = harness.query_all_by_role_and_label(Role::Button, "alpha").count();
+    let alpha_before = harness
+        .query_all_by_role_and_label(Role::Button, "alpha")
+        .count();
     let alpha_child_before = harness
         .query_all_by_role_and_label(Role::Button, "alpha_child")
         .count();
-    let beta_before = harness.query_all_by_role_and_label(Role::Button, "beta").count();
+    let beta_before = harness
+        .query_all_by_role_and_label(Role::Button, "beta")
+        .count();
 
     composer(&harness)
         .get_by_value("(choose a submodule)")
@@ -4246,11 +4396,15 @@ fn adding_a_named_submodule_dependency_offers_the_current_modules_own_submodules
     harness.step();
 
     assert_eq!(
-        harness.query_all_by_role_and_label(Role::Button, "alpha").count(),
+        harness
+            .query_all_by_role_and_label(Role::Button, "alpha")
+            .count(),
         alpha_before + 1
     );
     assert_eq!(
-        harness.query_all_by_role_and_label(Role::Button, "beta").count(),
+        harness
+            .query_all_by_role_and_label(Role::Button, "beta")
+            .count(),
         beta_before + 1
     );
     assert_eq!(
@@ -4890,7 +5044,8 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
     harness.get_by_role_and_label(Role::Button, "Edit").click();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Edit Requirement").is_some()
+        h.query_by_role_and_label(Role::Label, "Edit Requirement")
+            .is_some()
     });
 
     harness
@@ -4938,7 +5093,8 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
         .click();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "Requirement").is_some()
+        h.query_by_role_and_label(Role::Label, "Requirement")
+            .is_some()
     });
 
     // Back in the read-only viewer — "Create new result" doesn't mutate
@@ -4957,7 +5113,8 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
     harness.step();
 
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "New Result").is_some()
+        h.query_by_role_and_label(Role::Label, "New Result")
+            .is_some()
     });
 
     let fields: Vec<_> = harness
@@ -4980,11 +5137,11 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
         .split_once(' ')
         .expect("identifier missing date/name separator");
     assert_eq!(date_part.len(), 10);
-    assert!(
-        date_part
-            .char_indices()
-            .all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() })
-    );
+    assert!(date_part.char_indices().all(|(i, c)| if i == 4 || i == 7 {
+        c == '-'
+    } else {
+        c.is_ascii_digit()
+    }));
     assert_eq!(rest, "smoke");
 
     // "Generate title from identifier" is checked by default, same as
@@ -5551,7 +5708,10 @@ fn requirement_form_test_reference_picker_shows_scope_radios_and_scopes_by_this_
     // "smoke" is a real root-level test; "alpha_test" is alpha's own.
     // Both show under the default "All" scope.
     assert_eq!(harness.get_all_by_label("smoke").count(), 1);
-    assert_eq!(harness.get_all_by_label("modules/alpha/alpha_test").count(), 1);
+    assert_eq!(
+        harness.get_all_by_label("modules/alpha/alpha_test").count(),
+        1
+    );
 
     harness
         .get_by_role_and_label(Role::RadioButton, "This module")
@@ -5561,7 +5721,10 @@ fn requirement_form_test_reference_picker_shows_scope_radios_and_scopes_by_this_
     // Only alpha's own "alpha_test" remains — the root-level "smoke"
     // disappears.
     assert_eq!(harness.query_all_by_label("smoke").count(), 0);
-    assert_eq!(harness.get_all_by_label("modules/alpha/alpha_test").count(), 1);
+    assert_eq!(
+        harness.get_all_by_label("modules/alpha/alpha_test").count(),
+        1
+    );
 }
 
 #[test]

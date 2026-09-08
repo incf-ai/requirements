@@ -5,4 +5,8 @@ GuiConfig(
     ),
     zoom_percent: 120,
     theme: Dark,
+    spellcheck_enabled: true,
+    spellcheck_custom_words: [
+        "superset",
+    ],
 )

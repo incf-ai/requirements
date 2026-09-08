@@ -34,6 +34,12 @@ rfd = { workspace = true }
 ron = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# `unstable-suggestions` is documented upstream as unstable/slow — used only
+# for on-demand, single-word suggestion lookups from a background thread
+# (never for scanning a whole field), see `spellcheck.rs`. Version pinned
+# exactly since that feature's API shape is explicitly not covered by
+# semver guarantees yet.
+zspell = { version = "=0.5.5", features = ["unstable-suggestions"] }
 
 [dev-dependencies]
 accesskit = "0.24.1"

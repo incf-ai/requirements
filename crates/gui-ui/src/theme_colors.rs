@@ -95,6 +95,15 @@ pub fn diff_line_colors(dark_mode: bool, kind: DiffLineKind) -> Option<(Color32,
     }
 }
 
+/// Underline color for a misspelled word in a spellchecked prose field
+/// (see `view.rs`'s `spellcheck_text_layouter`) — reuses `status_colors`'
+/// `Unmet` foreground rather than inventing a new color, so a misspelling
+/// reads with the same "needs attention" semantic as a failing status
+/// chip.
+pub fn misspelling_underline_color(dark_mode: bool) -> Color32 {
+    status_colors(dark_mode, EntryStatus::Unmet).0
+}
+
 /// Foreground for the "set as current module" glyph (`icons::MODULE_CURRENT`)
 /// when it *is* the current module — the not-current glyph keeps egui's
 /// default text color. Same GitHub Primer-derived blue used for both

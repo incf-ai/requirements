@@ -27,6 +27,7 @@ mod fonts;
 mod forms;
 mod icons;
 mod recent;
+mod spellcheck;
 mod theme_colors;
 mod view;
 
@@ -41,13 +42,14 @@ pub use recent::{LoadError as RecentLoadError, RecentProjects};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use gui_core::{
-    Command, CoreHandle, EntryDetail, EntryKind, EntryName, EntryPath, Event, LogicalPath, ModulePools,
-    Outcome, ReferenceAction, ReferencePath, ReferenceRepairError, ReferenceSite, ReferenceTarget,
-    RequestId, RequirementDraft, ResultDraft, ResultPath, SaveError, TestDraft, TreeNode, TreeSnapshot,
-    title_case_from_name,
+    Command, CoreHandle, EntryDetail, EntryKind, EntryName, EntryPath, Event, LogicalPath,
+    ModulePools, Outcome, ReferenceAction, ReferencePath, ReferenceRepairError, ReferenceSite,
+    ReferenceTarget, RequestId, RequirementDraft, ResultDraft, ResultPath, SaveError, TestDraft,
+    TreeNode, TreeSnapshot, title_case_from_name,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -242,6 +244,15 @@ pub struct GuiApp {
     /// The requirement view's "Create new result" prompt — `Some` while
     /// it's open. See `CreateResultDialogState`'s own doc comment.
     create_result_dialog: Option<CreateResultDialogState>,
+    /// The shared spellcheck engine — `Building` until the background
+    /// dictionary-build thread (started in `new`) reports back, `Ready`
+    /// or `Unavailable` after. Shared by reference into every form's
+    /// prose fields — see `spellcheck` module doc comment.
+    spell_checker: spellcheck::SpellChecker,
+    /// `Some` until `poll_spell_checker_build` receives the built
+    /// dictionary, then cleared — no need to keep polling a channel that's
+    /// already delivered its one message.
+    spell_checker_rx: Option<mpsc::Receiver<spellcheck::SpellChecker>>,
     config: GuiConfig,
     /// Where `config` was loaded from — kept so a zoom click can write
     /// the changed config straight back to the same file (`GuiConfig::
@@ -898,6 +909,11 @@ impl GuiApp {
             duplicate_requirement_request: None,
             duplicate_requirement_dialog: None,
             create_result_dialog: None,
+            // Not started here — see `SpellChecker::NotStarted`'s own doc
+            // comment on why the actual background build waits for the
+            // first real render frame instead.
+            spell_checker: spellcheck::SpellChecker::NotStarted,
+            spell_checker_rx: None,
             zoom_input: config.zoom_percent.to_string(),
             tree_filter: String::new(),
             tree_force_open: None,
@@ -1090,8 +1106,7 @@ impl GuiApp {
             }
             Outcome::AddRequirement(result) => {
                 let is_recreate_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && d.deleted);
-                let is_duplicate_pending =
-                    matches!(&self.duplicate_requirement_dialog, Some(d) if d.pending_request == Some(request));
+                let is_duplicate_pending = matches!(&self.duplicate_requirement_dialog, Some(d) if d.pending_request == Some(request));
                 if is_recreate_pending {
                     self.apply_recreate_create_result(request, result);
                 } else if is_duplicate_pending {
@@ -1114,8 +1129,7 @@ impl GuiApp {
             }
             Outcome::UpdateTest(result) => self.apply_update_result(request, result),
             Outcome::AddResult(result) => {
-                let is_create_result_dialog_pending =
-                    matches!(&self.create_result_dialog, Some(d) if d.pending_request == Some(request));
+                let is_create_result_dialog_pending = matches!(&self.create_result_dialog, Some(d) if d.pending_request == Some(request));
                 if is_create_result_dialog_pending {
                     self.apply_create_result_dialog_result(request, result);
                 } else {
@@ -1147,10 +1161,12 @@ impl GuiApp {
                 self.apply_delete_result(request, removed)
             }
             Outcome::RenameModule(result) => {
-                let is_broken_references_pending =
-                    matches!(&self.broken_references_dialog, Some(d) if d.pending_request == Some(request));
+                let is_broken_references_pending = matches!(&self.broken_references_dialog, Some(d) if d.pending_request == Some(request));
                 if is_broken_references_pending {
-                    self.apply_broken_references_rename_result(request, result.map_err(|e| e.to_string()));
+                    self.apply_broken_references_rename_result(
+                        request,
+                        result.map_err(|e| e.to_string()),
+                    );
                 } else {
                     self.apply_module_rename_result(request, result.map_err(|e| e.to_string()));
                 }
@@ -1239,7 +1255,10 @@ impl GuiApp {
                 self.apply_entry_detail(detail);
             }
             Outcome::EntryDetail(detail)
-                if self.copy_requirement_request.as_ref().is_some_and(|(r, _)| *r == request) =>
+                if self
+                    .copy_requirement_request
+                    .as_ref()
+                    .is_some_and(|(r, _)| *r == request) =>
             {
                 let (_, name) = self.copy_requirement_request.take().unwrap();
                 self.apply_copy_requirement_result(name, detail);
@@ -1280,7 +1299,9 @@ impl GuiApp {
             }
             // Same stale-reply guard and "re-check `self.editor` at apply
             // time" nuance as `RequirementMetStatus` above.
-            Outcome::ResultReferenceIsStale(stale) if self.result_stale_request == Some(request) => {
+            Outcome::ResultReferenceIsStale(stale)
+                if self.result_stale_request == Some(request) =>
+            {
                 self.result_stale_request = None;
                 if let EditorState::NewResult(form) = &mut self.editor {
                     form.stale = stale;
@@ -1770,6 +1791,78 @@ impl GuiApp {
         self.core.send(command);
     }
 
+    /// Starts the background dictionary build the first time a
+    /// requirement/test/result form is actually about to render (called
+    /// from `render_requirement_form`/`render_test_form`/`render_result_form`,
+    /// before any of their fields build a `SpellCtx`) — not eagerly in
+    /// `new` or unconditionally every frame, since most of gui-ui's own
+    /// logic-only unit tests (and plenty of `tests/interaction.rs` cases —
+    /// toolbar/dialog/tree/zoom/theme, none of which ever open one of
+    /// these three forms) construct a `GuiApp`/step a `Harness` without
+    /// ever needing spellcheck at all; building the real ~49k-word
+    /// bundled dictionary on every one of those runs would be pure waste,
+    /// and — confirmed empirically — enough of it running concurrently
+    /// across a full parallel test run measurably slowed the whole suite
+    /// down and pushed an already-timing-marginal test over its own
+    /// threshold. A no-op once already `Building`/`Ready`/`Unavailable`.
+    fn ensure_spell_checker_started(&mut self) {
+        if matches!(self.spell_checker, spellcheck::SpellChecker::NotStarted) {
+            self.spell_checker = spellcheck::SpellChecker::Building;
+            self.spell_checker_rx = Some(spellcheck::SpellChecker::spawn_build());
+        }
+    }
+
+    /// Checks whether the background dictionary build (if
+    /// `ensure_spell_checker_started` has kicked one off) has finished —
+    /// a no-op once it already has (`spell_checker_rx` is `None` by then)
+    /// or if it was never started at all. Non-blocking `try_recv`, called
+    /// every frame alongside `poll_events` regardless of whether a
+    /// spellchecked form is currently open, so a build that finishes
+    /// while the user has since navigated away is still picked up
+    /// promptly rather than only on that form's next render.
+    fn poll_spell_checker_build(&mut self) {
+        if let Some(rx) = &self.spell_checker_rx {
+            if let Ok(checker) = rx.try_recv() {
+                self.spell_checker = checker;
+                self.spell_checker_rx = None;
+            }
+        }
+    }
+
+    /// Polls whichever form's right-click suggestion popup is currently
+    /// loading — at most one form is ever open in `self.editor` at a time,
+    /// so there's at most one popup to poll. Non-blocking, called every
+    /// frame alongside `poll_events`.
+    fn poll_spell_suggestions(&mut self) {
+        let popup = match &mut self.editor {
+            EditorState::NewRequirement(form) => &mut form.spell_popup,
+            EditorState::NewTest(form) => &mut form.spell_popup,
+            EditorState::NewResult(form) => &mut form.spell_popup,
+            EditorState::None | EditorState::NewModule(_) | EditorState::ExistingModule(_) => {
+                return;
+            }
+        };
+        if let Some(popup) = popup {
+            popup.poll();
+        }
+    }
+
+    /// A field's right-click "Add to dictionary" action — see
+    /// `view.rs`'s `SpellPopupAction::AddToDictionary`'s own doc comment
+    /// on why that can't just mutate `self.config` directly from inside
+    /// the free functions that render the popup.
+    fn add_spellcheck_word_to_dictionary(&mut self, word: String) {
+        self.config.spellcheck_custom_words.insert(word);
+        self.persist_config();
+    }
+
+    /// The status bar's spellcheck checkbox — same "persist immediately,
+    /// best-effort" shape as `theme_selected`.
+    fn spellcheck_toggled(&mut self, enabled: bool) {
+        self.config.spellcheck_enabled = enabled;
+        self.persist_config();
+    }
+
     /// The one place every `Event` is drained from `gui-core` — logs
     /// each one (debug builds only) before applying it, and — while an
     /// Rx stall is active — skips draining `try_recv_event` at all, so
@@ -1922,7 +2015,8 @@ impl GuiApp {
     /// its own "nothing selected" placeholder (a click there would just push
     /// a redundant `NavTarget::Empty` `Back` would have to step through).
     fn can_clear_center_pane(&self) -> bool {
-        self.tree.is_some() && (self.selection.is_some() || !matches!(self.editor, EditorState::None))
+        self.tree.is_some()
+            && (self.selection.is_some() || !matches!(self.editor, EditorState::None))
     }
 
     fn can_go_forward(&self) -> bool {
@@ -2124,7 +2218,11 @@ impl GuiApp {
     /// "meaningless/dangling for a copy that's never been saved" reasoning
     /// as `paste_requirement_clicked`'s own doc comment — only the name is
     /// still undecided at this point.
-    fn open_duplicate_requirement_dialog(&mut self, source: LogicalPath, requirement: RequirementDraft) {
+    fn open_duplicate_requirement_dialog(
+        &mut self,
+        source: LogicalPath,
+        requirement: RequirementDraft,
+    ) {
         let Some(tree) = &self.tree else { return };
         let Some(node) = view::resolve_tree_module(&tree.root, &source.modules) else {
             return;
@@ -2135,7 +2233,8 @@ impl GuiApp {
             .filter(|child| child.kind == EntryKind::Requirement)
             .map(|child| child.name.as_str())
             .collect();
-        let (suggested_name, duplicated) = prepare_pasted_requirement(&source.name, requirement, &existing);
+        let (suggested_name, duplicated) =
+            prepare_pasted_requirement(&source.name, requirement, &existing);
         let existing_names: std::collections::BTreeSet<String> =
             existing.into_iter().map(str::to_string).collect();
 
@@ -2220,8 +2319,7 @@ impl GuiApp {
         request: RequestId,
         result: Result<(), gui_core::AddChildError>,
     ) -> bool {
-        let is_pending =
-            matches!(&self.duplicate_requirement_dialog, Some(d) if d.pending_request == Some(request));
+        let is_pending = matches!(&self.duplicate_requirement_dialog, Some(d) if d.pending_request == Some(request));
         if !is_pending {
             return false;
         }
@@ -2484,7 +2582,9 @@ impl GuiApp {
                     _ => Vec::new(),
                 }
             }
-            PathPickerTarget::ResultRequirementPath | PathPickerTarget::ResultTestPath => Vec::new(),
+            PathPickerTarget::ResultRequirementPath | PathPickerTarget::ResultTestPath => {
+                Vec::new()
+            }
         };
         self.path_picker_dialog = Some(PathPickerDialogState {
             kind: target.kind(),
@@ -2639,17 +2739,20 @@ impl GuiApp {
         let read_only = self.current_nav_mode() == NavMode::View;
         self.editor = match (target, detail) {
             (_, None) => EditorState::None,
-            (EntryPath::Requirement(target), Some(EntryDetail::Requirement {
-                title,
-                requirement_text,
-                requirement_guidance,
-                test_guidance,
-                dependencies,
-                attachments,
-                met_status,
-                results,
-                original,
-            })) => {
+            (
+                EntryPath::Requirement(target),
+                Some(EntryDetail::Requirement {
+                    title,
+                    requirement_text,
+                    requirement_guidance,
+                    test_guidance,
+                    dependencies,
+                    attachments,
+                    met_status,
+                    results,
+                    original,
+                }),
+            ) => {
                 let tests = original
                     .tests
                     .iter()
@@ -2686,16 +2789,24 @@ impl GuiApp {
                     commit_fetch_error: None,
                     pending_test_commit_fetches: HashMap::new(),
                     test_commit_fetch_error: None,
+                    title_spell: spellcheck::FieldSpellCache::default(),
+                    requirement_text_spell: spellcheck::FieldSpellCache::default(),
+                    requirement_guidance_spell: spellcheck::FieldSpellCache::default(),
+                    test_guidance_spell: spellcheck::FieldSpellCache::default(),
+                    spell_popup: None,
                 })
             }
-            (EntryPath::Test(target), Some(EntryDetail::Test {
-                title,
-                test_text,
-                result_kind,
-                attachments,
-                template_files,
-                original,
-            })) => EditorState::NewTest(TestFormState {
+            (
+                EntryPath::Test(target),
+                Some(EntryDetail::Test {
+                    title,
+                    test_text,
+                    result_kind,
+                    attachments,
+                    template_files,
+                    original,
+                }),
+            ) => EditorState::NewTest(TestFormState {
                 name: target.name.as_str().to_string(),
                 title,
                 test_text,
@@ -2711,17 +2822,23 @@ impl GuiApp {
                 template_files,
                 new_template_path: String::new(),
                 local_pool_error: None,
+                title_spell: spellcheck::FieldSpellCache::default(),
+                test_text_spell: spellcheck::FieldSpellCache::default(),
+                spell_popup: None,
             }),
-            (EntryPath::Result(target), Some(EntryDetail::Result {
-                title,
-                requirement,
-                requirement_commit,
-                test_path,
-                test_commit,
-                attachments,
-                stale,
-                original,
-            })) => EditorState::NewResult(ResultFormState {
+            (
+                EntryPath::Result(target),
+                Some(EntryDetail::Result {
+                    title,
+                    requirement,
+                    requirement_commit,
+                    test_path,
+                    test_commit,
+                    attachments,
+                    stale,
+                    original,
+                }),
+            ) => EditorState::NewResult(ResultFormState {
                 name: target.name.as_str().to_string(),
                 title,
                 requirement: Some(requirement),
@@ -2739,6 +2856,8 @@ impl GuiApp {
                 attachments,
                 new_attachment_path: String::new(),
                 local_pool_error: None,
+                title_spell: spellcheck::FieldSpellCache::default(),
+                spell_popup: None,
             }),
             // A selection's kind and its `GetEntryDetail` reply's kind
             // always agree in practice (both come from the same
@@ -3081,16 +3200,32 @@ impl GuiApp {
         );
         let command = match (kind, target) {
             (LocalPoolKind::RequirementAttachment, EntryPath::Requirement(target)) => {
-                Command::AddRequirementAttachment { target, path, request }
+                Command::AddRequirementAttachment {
+                    target,
+                    path,
+                    request,
+                }
             }
             (LocalPoolKind::TestAttachment, EntryPath::Test(target)) => {
-                Command::AddTestAttachment { target, path, request }
+                Command::AddTestAttachment {
+                    target,
+                    path,
+                    request,
+                }
             }
             (LocalPoolKind::TestTemplate, EntryPath::Test(target)) => {
-                Command::AddTestTemplateFile { target, path, request }
+                Command::AddTestTemplateFile {
+                    target,
+                    path,
+                    request,
+                }
             }
             (LocalPoolKind::ResultAttachment, EntryPath::Result(target)) => {
-                Command::AddResultAttachment { target, path, request }
+                Command::AddResultAttachment {
+                    target,
+                    path,
+                    request,
+                }
             }
             _ => unreachable!("kind and target always agree"),
         };
@@ -3112,16 +3247,32 @@ impl GuiApp {
         );
         let command = match (kind, target) {
             (LocalPoolKind::RequirementAttachment, EntryPath::Requirement(target)) => {
-                Command::RemoveRequirementAttachment { target, path, request }
+                Command::RemoveRequirementAttachment {
+                    target,
+                    path,
+                    request,
+                }
             }
             (LocalPoolKind::TestAttachment, EntryPath::Test(target)) => {
-                Command::RemoveTestAttachment { target, path, request }
+                Command::RemoveTestAttachment {
+                    target,
+                    path,
+                    request,
+                }
             }
             (LocalPoolKind::TestTemplate, EntryPath::Test(target)) => {
-                Command::RemoveTestTemplateFile { target, path, request }
+                Command::RemoveTestTemplateFile {
+                    target,
+                    path,
+                    request,
+                }
             }
             (LocalPoolKind::ResultAttachment, EntryPath::Result(target)) => {
-                Command::RemoveResultAttachment { target, path, request }
+                Command::RemoveResultAttachment {
+                    target,
+                    path,
+                    request,
+                }
             }
             _ => unreachable!("kind and target always agree"),
         };
@@ -3138,10 +3289,14 @@ impl GuiApp {
     /// otherwise).
     fn local_attachment_add_clicked(&mut self, kind: LocalPoolKind) {
         let Some((target, path)) = (match (&mut self.editor, kind) {
-            (EditorState::NewRequirement(form), LocalPoolKind::RequirementAttachment) => form
-                .editing_target
-                .clone()
-                .map(|target| (EntryPath::Requirement(target), &mut form.new_attachment_path)),
+            (EditorState::NewRequirement(form), LocalPoolKind::RequirementAttachment) => {
+                form.editing_target.clone().map(|target| {
+                    (
+                        EntryPath::Requirement(target),
+                        &mut form.new_attachment_path,
+                    )
+                })
+            }
             (EditorState::NewTest(form), LocalPoolKind::TestAttachment) => form
                 .editing_target
                 .clone()
@@ -3347,7 +3502,9 @@ impl GuiApp {
                 match op.kind {
                     LocalPoolKind::TestAttachment => apply_pool_op(&mut form.attachments, op),
                     LocalPoolKind::TestTemplate => apply_pool_op(&mut form.template_files, op),
-                    LocalPoolKind::RequirementAttachment | LocalPoolKind::ResultAttachment => return,
+                    LocalPoolKind::RequirementAttachment | LocalPoolKind::ResultAttachment => {
+                        return;
+                    }
                 }
                 form.local_pool_error = None;
             }
@@ -3364,18 +3521,22 @@ impl GuiApp {
     fn set_local_pool_error(&mut self, kind: LocalPoolKind, target: &EntryPath, message: String) {
         match (&mut self.editor, target) {
             (EditorState::NewRequirement(form), EntryPath::Requirement(target))
-                if kind == LocalPoolKind::RequirementAttachment && form.editing_target.as_ref() == Some(target) =>
-            {
-                form.local_pool_error = Some(message);
-            }
-            (EditorState::NewTest(form), EntryPath::Test(target))
-                if matches!(kind, LocalPoolKind::TestAttachment | LocalPoolKind::TestTemplate)
+                if kind == LocalPoolKind::RequirementAttachment
                     && form.editing_target.as_ref() == Some(target) =>
             {
                 form.local_pool_error = Some(message);
             }
+            (EditorState::NewTest(form), EntryPath::Test(target))
+                if matches!(
+                    kind,
+                    LocalPoolKind::TestAttachment | LocalPoolKind::TestTemplate
+                ) && form.editing_target.as_ref() == Some(target) =>
+            {
+                form.local_pool_error = Some(message);
+            }
             (EditorState::NewResult(form), EntryPath::Result(target))
-                if kind == LocalPoolKind::ResultAttachment && form.editing_target.as_ref() == Some(target) =>
+                if kind == LocalPoolKind::ResultAttachment
+                    && form.editing_target.as_ref() == Some(target) =>
             {
                 form.local_pool_error = Some(message);
             }
@@ -3519,7 +3680,11 @@ impl GuiApp {
     /// Stale replies (a since-abandoned rename, or the module page having
     /// navigated away) are dropped, same "ignore stale replies by request
     /// id" shape as `detail_request`.
-    fn apply_module_rename_find_references(&mut self, request: RequestId, sites: Vec<ReferenceSite>) {
+    fn apply_module_rename_find_references(
+        &mut self,
+        request: RequestId,
+        sites: Vec<ReferenceSite>,
+    ) {
         if self.module_rename_find_references_request != Some(request) {
             return;
         }
@@ -3541,7 +3706,10 @@ impl GuiApp {
             self.broken_references_dialog = Some(BrokenReferencesState {
                 target: form.path.clone(),
                 new_name: form.new_name.clone(),
-                choices: sites.into_iter().map(|site| (site, ReferenceAction::Repair)).collect(),
+                choices: sites
+                    .into_iter()
+                    .map(|site| (site, ReferenceAction::Repair))
+                    .collect(),
                 pending_request: None,
                 error: None,
             });
@@ -3585,7 +3753,11 @@ impl GuiApp {
     /// exactly as `apply_module_rename_result` does for the no-references
     /// path; failure leaves the modal open with the error, so the user's
     /// row choices aren't lost.
-    fn apply_broken_references_rename_result(&mut self, request: RequestId, result: Result<(), String>) {
+    fn apply_broken_references_rename_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), String>,
+    ) {
         let Some(dialog) = &mut self.broken_references_dialog else {
             return;
         };
@@ -3778,7 +3950,11 @@ impl GuiApp {
     /// see `RecreateRequirementState`'s own doc comment. `regenerate_title`
     /// starts `true`: see that struct's doc comment on what unchecking it
     /// in the dialog does instead.
-    fn open_recreate_requirement_dialog(&mut self, target: LogicalPath, requirement: RequirementDraft) {
+    fn open_recreate_requirement_dialog(
+        &mut self,
+        target: LogicalPath,
+        requirement: RequirementDraft,
+    ) {
         let new_name = target.name.as_str().to_string();
         self.recreate_requirement_dialog = Some(RecreateRequirementState {
             target,
@@ -3825,7 +4001,8 @@ impl GuiApp {
         }
         if !dialog.deleted && new_name == dialog.target.name.as_str() {
             if let Some(dialog) = &mut self.recreate_requirement_dialog {
-                dialog.error = Some("New name must be different from the current name.".to_string());
+                dialog.error =
+                    Some("New name must be different from the current name.".to_string());
             }
             return;
         }
@@ -3885,7 +4062,11 @@ impl GuiApp {
     /// delete leg exactly as if no check had happened; a non-empty result
     /// populates `reference_choices` for the user to review (default
     /// `Repair` each) and stops, waiting for another "Recreate" click.
-    fn apply_recreate_requirement_find_references(&mut self, request: RequestId, sites: Vec<ReferenceSite>) -> bool {
+    fn apply_recreate_requirement_find_references(
+        &mut self,
+        request: RequestId,
+        sites: Vec<ReferenceSite>,
+    ) -> bool {
         let is_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.find_references_request == Some(request));
         if !is_pending {
             return false;
@@ -3897,7 +4078,10 @@ impl GuiApp {
         dialog.find_references_request = None;
         dialog.checked_references = true;
         let is_empty = sites.is_empty();
-        dialog.reference_choices = sites.into_iter().map(|site| (site, ReferenceAction::Repair)).collect();
+        dialog.reference_choices = sites
+            .into_iter()
+            .map(|site| (site, ReferenceAction::Repair))
+            .collect();
         if is_empty {
             self.recreate_requirement_confirmed();
         }
@@ -4116,14 +4300,16 @@ impl GuiApp {
         }
         if !dialog.deleted && new_name == dialog.target.name.as_str() {
             if let Some(dialog) = &mut self.recreate_test_dialog {
-                dialog.error = Some("New name must be different from the current name.".to_string());
+                dialog.error =
+                    Some("New name must be different from the current name.".to_string());
             }
             return;
         }
         if !dialog.deleted && dialog.test.test_text.trim().is_empty() {
             if let Some(dialog) = &mut self.recreate_test_dialog {
-                dialog.error =
-                    Some("Test procedure text must not be empty — fix it before recreating.".to_string());
+                dialog.error = Some(
+                    "Test procedure text must not be empty — fix it before recreating.".to_string(),
+                );
             }
             return;
         }
@@ -4166,16 +4352,26 @@ impl GuiApp {
     /// pre-delete check — see
     /// `apply_recreate_requirement_find_references`'s doc comment;
     /// identical reasoning.
-    fn apply_recreate_test_find_references(&mut self, request: RequestId, sites: Vec<ReferenceSite>) -> bool {
+    fn apply_recreate_test_find_references(
+        &mut self,
+        request: RequestId,
+        sites: Vec<ReferenceSite>,
+    ) -> bool {
         let is_pending = matches!(&self.recreate_test_dialog, Some(d) if d.find_references_request == Some(request));
         if !is_pending {
             return false;
         }
-        let dialog = self.recreate_test_dialog.as_mut().expect("just matched Some above");
+        let dialog = self
+            .recreate_test_dialog
+            .as_mut()
+            .expect("just matched Some above");
         dialog.find_references_request = None;
         dialog.checked_references = true;
         let is_empty = sites.is_empty();
-        dialog.reference_choices = sites.into_iter().map(|site| (site, ReferenceAction::Repair)).collect();
+        dialog.reference_choices = sites
+            .into_iter()
+            .map(|site| (site, ReferenceAction::Repair))
+            .collect();
         if is_empty {
             self.recreate_test_confirmed();
         }
@@ -4223,7 +4419,10 @@ impl GuiApp {
         }
         match result {
             Ok(()) => {
-                let dialog = self.recreate_test_dialog.take().expect("just matched Some above");
+                let dialog = self
+                    .recreate_test_dialog
+                    .take()
+                    .expect("just matched Some above");
                 let new_target = LogicalPath {
                     modules: dialog.target.modules,
                     name: EntryName(dialog.new_name.trim().to_string()),
@@ -4368,11 +4567,17 @@ impl GuiApp {
                 match &self.editor {
                     EditorState::NewRequirement(f) => {
                         let name = EntryName(f.name.trim().to_string());
-                        self.select(EntryPath::Requirement(LogicalPath { modules: module, name }));
+                        self.select(EntryPath::Requirement(LogicalPath {
+                            modules: module,
+                            name,
+                        }));
                     }
                     EditorState::NewTest(f) => {
                         let name = EntryName(f.name.trim().to_string());
-                        self.select(EntryPath::Test(LogicalPath { modules: module, name }));
+                        self.select(EntryPath::Test(LogicalPath {
+                            modules: module,
+                            name,
+                        }));
                     }
                     EditorState::NewResult(f) => {
                         let name = EntryName(f.name.trim().to_string());
@@ -4657,6 +4862,8 @@ fn apply_pool_op(paths: &mut Vec<PathBuf>, op: &LocalPoolOp) {
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
+        self.poll_spell_checker_build();
+        self.poll_spell_suggestions();
         #[cfg(all(feature = "debug-panel", debug_assertions))]
         self.flush_stalled_tx();
 
@@ -4819,7 +5026,10 @@ pub(crate) fn scoped_leaf_paths(
 /// one specific module's own immediate children, matching
 /// `DependencyReferenceKind::SubmoduleV1`'s scope. Empty if `module_path`
 /// doesn't resolve or the module has no submodules.
-pub(crate) fn direct_submodule_names(tree: &TreeSnapshot, module_path: &[EntryName]) -> Vec<String> {
+pub(crate) fn direct_submodule_names(
+    tree: &TreeSnapshot,
+    module_path: &[EntryName],
+) -> Vec<String> {
     let mut node = &tree.root;
     for name in module_path {
         match node
@@ -4989,7 +5199,9 @@ pub(crate) fn leaf_kind_segment(kind: EntryKind) -> &'static str {
     match kind {
         EntryKind::Requirement => "requirements",
         EntryKind::Test => "tests",
-        EntryKind::Result => unreachable!("nothing ever names a result via a reference-path string"),
+        EntryKind::Result => {
+            unreachable!("nothing ever names a result via a reference-path string")
+        }
         EntryKind::Module => unreachable!("a module has no leaf path of its own"),
     }
 }
@@ -5236,11 +5448,15 @@ mod test {
         app.new_module_clicked();
         assert!(matches!(app.editor, EditorState::NewModule(_)));
 
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
 
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("definition")
+            )))
         );
         assert!(matches!(app.editor, EditorState::None));
         assert!(app.detail_request.is_some());
@@ -5257,7 +5473,9 @@ mod test {
     #[test]
     fn a_single_selection_still_cannot_go_back_or_forward() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
         assert!(!app.can_go_back());
         assert!(!app.can_go_forward());
     }
@@ -5265,11 +5483,17 @@ mod test {
     #[test]
     fn back_then_forward_round_trips_two_selections() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("second"),
+        )));
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("second")
+            )))
         );
         assert!(app.can_go_back());
         assert!(!app.can_go_forward());
@@ -5277,7 +5501,9 @@ mod test {
         app.back_clicked();
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("first")
+            )))
         );
         assert!(!app.can_go_back());
         assert!(app.can_go_forward());
@@ -5285,7 +5511,9 @@ mod test {
         app.forward_clicked();
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("second")
+            )))
         );
         assert!(app.can_go_back());
         assert!(!app.can_go_forward());
@@ -5294,14 +5522,18 @@ mod test {
     #[test]
     fn back_clicked_with_nothing_to_go_back_to_does_nothing() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
         let pending_before = app.pending.len();
 
         app.back_clicked();
 
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("first")
+            )))
         );
         assert_eq!(app.pending.len(), pending_before);
     }
@@ -5309,14 +5541,18 @@ mod test {
     #[test]
     fn forward_clicked_with_nothing_to_go_forward_to_does_nothing() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
         let pending_before = app.pending.len();
 
         app.forward_clicked();
 
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("first")
+            )))
         );
         assert_eq!(app.pending.len(), pending_before);
     }
@@ -5324,8 +5560,12 @@ mod test {
     #[test]
     fn a_new_selection_after_going_back_discards_forward_history() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("second"),
+        )));
         app.back_clicked();
         assert!(app.can_go_forward());
 
@@ -5333,13 +5573,17 @@ mod test {
         // should truncate the "second" entry out of history entirely,
         // same as a browser dropping forward history on a fresh
         // navigation.
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("third"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("third"),
+        )));
 
         assert!(!app.can_go_forward());
         app.back_clicked();
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("first")
+            )))
         );
     }
 
@@ -5350,8 +5594,12 @@ mod test {
     #[test]
     fn back_after_selecting_a_module_between_two_leaves_lands_on_the_middle_leaf() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("second"),
+        )));
         app.select_module(vec![disk_entry_name("m")]);
         assert!(matches!(app.editor, EditorState::ExistingModule(_)));
 
@@ -5359,7 +5607,9 @@ mod test {
 
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("second")
+            )))
         );
         assert!(matches!(app.editor, EditorState::None));
     }
@@ -5367,8 +5617,12 @@ mod test {
     #[test]
     fn selecting_a_module_after_going_back_discards_forward_history() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("second"),
+        )));
         app.back_clicked();
         assert!(app.can_go_forward());
 
@@ -5378,16 +5632,22 @@ mod test {
         app.back_clicked();
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("first")
+            )))
         );
     }
 
     #[test]
     fn back_and_forward_walk_through_a_mixed_leaf_and_module_history() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("a"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("a"),
+        )));
         app.select_module(vec![disk_entry_name("m1")]);
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("b"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("b"),
+        )));
         app.select_module(Vec::new()); // the project root
 
         // history: [a, m1, b, root], position 3 (root)
@@ -5395,21 +5655,36 @@ mod test {
         assert_eq!(app.selected_module, Vec::<gui_core::EntryName>::new());
 
         app.back_clicked(); // -> b
-        assert_eq!(app.selection, Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("b")))));
+        assert_eq!(
+            app.selection,
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("b")
+            )))
+        );
 
         app.back_clicked(); // -> m1
         assert_eq!(app.selected_module, vec![disk_entry_name("m1")]);
         assert!(matches!(app.editor, EditorState::ExistingModule(_)));
 
         app.back_clicked(); // -> a
-        assert_eq!(app.selection, Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("a")))));
+        assert_eq!(
+            app.selection,
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("a")
+            )))
+        );
         assert!(!app.can_go_back());
 
         app.forward_clicked(); // -> m1
         assert_eq!(app.selected_module, vec![disk_entry_name("m1")]);
 
         app.forward_clicked(); // -> b
-        assert_eq!(app.selection, Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("b")))));
+        assert_eq!(
+            app.selection,
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("b")
+            )))
+        );
 
         app.forward_clicked(); // -> root
         assert_eq!(app.selected_module, Vec::<gui_core::EntryName>::new());
@@ -5591,7 +5866,9 @@ mod test {
             Stop::Leaf { name, mode } => {
                 assert_eq!(
                     app.selection,
-                    Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name(name))))
+                    Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                        disk_entry_name(name)
+                    )))
                 );
                 let EditorState::NewRequirement(form) = &app.editor else {
                     panic!("expected NewRequirement, got {:?}", app.editor);
@@ -5618,7 +5895,9 @@ mod test {
 
         let mut rng = StdRng::seed_from_u64(seed);
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name(FAKE_LEAVES[0]))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name(FAKE_LEAVES[0]),
+        )));
         settle(&mut app);
         let mut model = Model::new(Stop::Leaf {
             name: FAKE_LEAVES[0],
@@ -5639,7 +5918,9 @@ mod test {
             match action {
                 Action::SelectLeaf(i) => {
                     let name = FAKE_LEAVES[i];
-                    app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name(name))));
+                    app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+                        disk_entry_name(name),
+                    )));
                     model.navigate(Stop::Leaf {
                         name,
                         mode: NavMode::View,
@@ -5706,7 +5987,9 @@ mod test {
     #[test]
     fn a_matching_requirement_detail_reply_opens_it_pre_filled_and_read_only() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         let request = app.detail_request.unwrap();
 
         app.apply_event(Event::Completed {
@@ -5800,7 +6083,10 @@ mod test {
     #[test]
     fn a_missing_entry_detail_reply_leaves_an_existing_clipboard_untouched() {
         let mut app = test_app();
-        app.requirement_clipboard = Some((disk_entry_name("existing"), RequirementDraft::new("Existing")));
+        app.requirement_clipboard = Some((
+            disk_entry_name("existing"),
+            RequirementDraft::new("Existing"),
+        ));
 
         app.copy_requirement_clicked(LogicalPath::root(disk_entry_name("gone")));
         let (request, _) = app.copy_requirement_request.clone().unwrap();
@@ -5822,10 +6108,16 @@ mod test {
         assert_eq!(unique_copy_name("definition", &existing), "definition copy");
 
         existing.insert("definition copy");
-        assert_eq!(unique_copy_name("definition", &existing), "definition copy 2");
+        assert_eq!(
+            unique_copy_name("definition", &existing),
+            "definition copy 2"
+        );
 
         existing.insert("definition copy 2");
-        assert_eq!(unique_copy_name("definition", &existing), "definition copy 3");
+        assert_eq!(
+            unique_copy_name("definition", &existing),
+            "definition copy 3"
+        );
     }
 
     #[test]
@@ -5836,7 +6128,8 @@ mod test {
         draft.attachments.insert(PathBuf::from("diagram.png"));
         let existing = std::collections::HashSet::new();
 
-        let (name, pasted) = prepare_pasted_requirement(&disk_entry_name("definition"), draft, &existing);
+        let (name, pasted) =
+            prepare_pasted_requirement(&disk_entry_name("definition"), draft, &existing);
 
         assert_eq!(name, disk_entry_name("definition"));
         assert_eq!(pasted.requirement_text, "The system shall...");
@@ -5849,7 +6142,8 @@ mod test {
         let draft = RequirementDraft::new("Definition");
         let existing: std::collections::HashSet<&str> = ["definition"].into_iter().collect();
 
-        let (name, _) = prepare_pasted_requirement(&disk_entry_name("definition"), draft, &existing);
+        let (name, _) =
+            prepare_pasted_requirement(&disk_entry_name("definition"), draft, &existing);
 
         assert_eq!(name, disk_entry_name("definition copy"));
     }
@@ -5878,7 +6172,10 @@ mod test {
     #[test]
     fn paste_requirement_clicked_does_nothing_for_an_unknown_module() {
         let mut app = test_app();
-        app.requirement_clipboard = Some((disk_entry_name("definition"), RequirementDraft::new("Definition")));
+        app.requirement_clipboard = Some((
+            disk_entry_name("definition"),
+            RequirementDraft::new("Definition"),
+        ));
         app.apply_event(Event::TreeChanged(TreeSnapshot {
             root: module_tree_node("Project", Vec::new()),
             can_undo: false,
@@ -5896,11 +6193,17 @@ mod test {
     #[test]
     fn a_successful_paste_marks_dirty_without_touching_the_editor() {
         let mut app = test_app();
-        app.requirement_clipboard = Some((disk_entry_name("definition"), RequirementDraft::new("Definition")));
+        app.requirement_clipboard = Some((
+            disk_entry_name("definition"),
+            RequirementDraft::new("Definition"),
+        ));
         app.apply_event(Event::TreeChanged(TreeSnapshot {
             root: module_tree_node(
                 "Project",
-                vec![module_tree_node("sub", vec![requirement_tree_node("definition")])],
+                vec![module_tree_node(
+                    "sub",
+                    vec![requirement_tree_node("definition")],
+                )],
             ),
             can_undo: false,
             can_redo: false,
@@ -5996,7 +6299,10 @@ mod test {
             .duplicate_requirement_dialog
             .as_ref()
             .expect("dialog should be open");
-        assert_eq!(dialog.source, LogicalPath::root(disk_entry_name("definition")));
+        assert_eq!(
+            dialog.source,
+            LogicalPath::root(disk_entry_name("definition"))
+        );
         assert_eq!(dialog.new_name, "definition copy");
         assert!(dialog.regenerate_title);
         assert!(dialog.existing_names.contains("definition"));
@@ -6098,7 +6404,12 @@ mod test {
     fn a_successful_duplicate_closes_the_dialog_and_navigates_to_the_new_entry() {
         let mut app = app_with_open_duplicate_dialog();
         app.duplicate_requirement_confirmed();
-        let request = app.duplicate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let request = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request,
@@ -6109,7 +6420,9 @@ mod test {
         assert!(app.duplicate_requirement_dialog.is_none());
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition copy"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("definition copy")
+            )))
         );
     }
 
@@ -6117,7 +6430,12 @@ mod test {
     fn a_failed_duplicate_create_leaves_the_dialog_open_with_an_error() {
         let mut app = app_with_open_duplicate_dialog();
         app.duplicate_requirement_confirmed();
-        let request = app.duplicate_requirement_dialog.as_ref().unwrap().pending_request.unwrap();
+        let request = app
+            .duplicate_requirement_dialog
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .unwrap();
 
         app.apply_event(Event::Completed {
             request,
@@ -6155,7 +6473,9 @@ mod test {
     #[test]
     fn a_requirement_detail_replys_dependencies_populate_the_form() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         let request = app.detail_request.unwrap();
 
         app.apply_event(Event::Completed {
@@ -6198,7 +6518,9 @@ mod test {
     #[test]
     fn editor_edit_clicked_switches_the_viewer_to_the_editable_form() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         complete_definition_requirement_detail(&mut app);
         let EditorState::NewRequirement(form) = &app.editor else {
             unreachable!()
@@ -6221,7 +6543,9 @@ mod test {
     #[test]
     fn editor_edit_clicked_registers_as_a_navigation_back_returns_to_the_viewer() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         complete_definition_requirement_detail(&mut app);
         assert!(!app.can_go_back());
 
@@ -6242,7 +6566,9 @@ mod test {
         assert!(form.read_only);
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("definition")
+            )))
         );
     }
 
@@ -6299,7 +6625,9 @@ mod test {
     #[test]
     fn editor_has_unsaved_edits_is_false_for_the_read_only_viewer() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         complete_definition_requirement_detail(&mut app);
         // A plain tree click lands read-only — nothing editable to have
         // set `edited` in the first place.
@@ -6370,7 +6698,9 @@ mod test {
     #[test]
     fn unsaved_form_dialog_cancelled_clears_it_without_navigating() {
         let mut app = app_editing_a_requirement();
-        app.unsaved_form_dialog_opened(PendingNavigation::Select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("discovery")))));
+        app.unsaved_form_dialog_opened(PendingNavigation::Select(
+            gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("discovery"))),
+        ));
 
         app.unsaved_form_dialog_cancelled();
 
@@ -6378,7 +6708,9 @@ mod test {
         // Still on "definition" — nothing navigated.
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("definition")
+            )))
         );
     }
 
@@ -6393,14 +6725,18 @@ mod test {
     #[test]
     fn unsaved_form_dialog_confirmed_runs_the_pending_select() {
         let mut app = app_editing_a_requirement();
-        app.unsaved_form_dialog_opened(PendingNavigation::Select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("discovery")))));
+        app.unsaved_form_dialog_opened(PendingNavigation::Select(
+            gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("discovery"))),
+        ));
 
         app.unsaved_form_dialog_confirmed();
 
         assert!(app.unsaved_form_dialog.is_none());
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("discovery"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("discovery")
+            )))
         );
     }
 
@@ -6422,9 +6758,13 @@ mod test {
     #[test]
     fn a_stale_entry_detail_reply_is_ignored_after_a_new_selection() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("first"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("first"),
+        )));
         let first_request = app.detail_request.unwrap();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("second"),
+        )));
 
         // The first selection's reply arrives late, after the user already
         // moved on to a second selection.
@@ -6446,7 +6786,9 @@ mod test {
         assert!(matches!(app.editor, EditorState::None));
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("second"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("second")
+            )))
         );
     }
 
@@ -6986,7 +7328,9 @@ mod test {
         // `Pane::Empty` branch show "Loading…" forever, since nothing was
         // actually pending.
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         let stale_detail_request = app.detail_request.take().unwrap();
         app.pending.remove(&stale_detail_request);
 
@@ -7011,7 +7355,9 @@ mod test {
         assert!(matches!(app.editor, EditorState::None));
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("fresh"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("fresh")
+            )))
         );
         assert!(app.detail_request.is_some());
         assert!(app.pending.contains_key(&app.detail_request.unwrap()));
@@ -7073,7 +7419,9 @@ mod test {
     #[test]
     fn select_module_sets_selected_module_and_clears_the_leaf_selection() {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         assert!(app.selection.is_some());
 
         app.select_module(vec![disk_entry_name("setup")]);
@@ -7088,9 +7436,9 @@ mod test {
         let mut app = test_app();
 
         app.select(gui_core::EntryPath::Requirement(LogicalPath {
-                modules: vec![disk_entry_name("setup")],
-                name: disk_entry_name("something"),
-            }));
+            modules: vec![disk_entry_name("setup")],
+            name: disk_entry_name("something"),
+        }));
 
         assert_eq!(app.selected_module, vec![disk_entry_name("setup")]);
     }
@@ -7133,7 +7481,9 @@ mod test {
     /// `read_only: false`.
     fn app_editing_a_requirement() -> GuiApp {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))));
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
         complete_definition_requirement_detail(&mut app);
         app.editor_edit_clicked();
         complete_definition_requirement_detail(&mut app);
@@ -7165,7 +7515,9 @@ mod test {
     /// `editing_target: Some(_)`, `read_only: false`.
     fn app_editing_a_test() -> GuiApp {
         let mut app = test_app();
-        app.select(gui_core::EntryPath::Test(LogicalPath::root(disk_entry_name("smoke"))));
+        app.select(gui_core::EntryPath::Test(LogicalPath::root(
+            disk_entry_name("smoke"),
+        )));
         complete_smoke_test_detail(&mut app);
         app.editor_edit_clicked();
         complete_smoke_test_detail(&mut app);
@@ -8311,19 +8663,19 @@ mod test {
 
         app.apply_event(Event::Completed {
             request: dep_request,
-            outcome: Outcome::ResolveLocalCommit(Err(
-                gui_core::ResolveLocalCommitError::Commit(syscalls::CommitForPathError::NotTracked {
+            outcome: Outcome::ResolveLocalCommit(Err(gui_core::ResolveLocalCommitError::Commit(
+                syscalls::CommitForPathError::NotTracked {
                     path: "requirements/discovery".into(),
-                }),
-            )),
+                },
+            ))),
         });
         app.apply_event(Event::Completed {
             request: test_request,
-            outcome: Outcome::ResolveLocalCommit(Err(
-                gui_core::ResolveLocalCommitError::Commit(syscalls::CommitForPathError::NotTracked {
+            outcome: Outcome::ResolveLocalCommit(Err(gui_core::ResolveLocalCommitError::Commit(
+                syscalls::CommitForPathError::NotTracked {
                     path: "tests/smoke".into(),
-                }),
-            )),
+                },
+            ))),
         });
 
         let EditorState::NewRequirement(form) = &app.editor else {
@@ -8651,7 +9003,8 @@ mod test {
     }
 
     #[test]
-    fn a_non_empty_find_references_reply_opens_the_broken_references_dialog_with_repair_defaulted() {
+    fn a_non_empty_find_references_reply_opens_the_broken_references_dialog_with_repair_defaulted()
+    {
         let mut app = test_app();
         app.select_module(vec![disk_entry_name("setup")]);
         app.editor_edit_clicked();
@@ -8668,7 +9021,10 @@ mod test {
             outcome: Outcome::FindReferences(vec![site_a.clone(), site_b.clone()]),
         });
 
-        let dialog = app.broken_references_dialog.as_ref().expect("dialog should be open");
+        let dialog = app
+            .broken_references_dialog
+            .as_ref()
+            .expect("dialog should be open");
         assert_eq!(dialog.new_name, "renamed");
         assert_eq!(
             dialog.choices,
@@ -8732,8 +9088,13 @@ mod test {
 
         app.broken_references_confirmed();
 
-        let dialog = app.broken_references_dialog.as_ref().expect("dialog stays open while pending");
-        let request = dialog.pending_request.expect("confirm should track a pending request");
+        let dialog = app
+            .broken_references_dialog
+            .as_ref()
+            .expect("dialog stays open while pending");
+        let request = dialog
+            .pending_request
+            .expect("confirm should track a pending request");
         app.apply_event(Event::Completed {
             request,
             outcome: Outcome::RenameModule(Ok(())),
@@ -8775,7 +9136,10 @@ mod test {
             outcome: Outcome::RenameModule(Err(gui_core::RenameModuleError::NotFound)),
         });
 
-        let dialog = app.broken_references_dialog.as_ref().expect("dialog should stay open on failure");
+        let dialog = app
+            .broken_references_dialog
+            .as_ref()
+            .expect("dialog should stay open on failure");
         assert!(dialog.error.is_some());
         let EditorState::ExistingModule(form) = &app.editor else {
             panic!("expected ExistingModule");
@@ -9016,7 +9380,9 @@ mod test {
     fn recreate_requirement_from_tree_clicked_opens_the_dialog_after_a_fetch() {
         let mut app = test_app();
 
-        app.recreate_requirement_from_tree_clicked(LogicalPath::root(disk_entry_name("definition")));
+        app.recreate_requirement_from_tree_clicked(LogicalPath::root(disk_entry_name(
+            "definition",
+        )));
 
         assert!(app.recreate_requirement_dialog.is_none());
         let (request, target) = app
@@ -9034,7 +9400,10 @@ mod test {
             .recreate_requirement_dialog
             .as_ref()
             .expect("dialog should be open");
-        assert_eq!(dialog.target, LogicalPath::root(disk_entry_name("definition")));
+        assert_eq!(
+            dialog.target,
+            LogicalPath::root(disk_entry_name("definition"))
+        );
         assert_eq!(dialog.new_name, "definition");
         assert!(dialog.regenerate_title);
         assert!(!dialog.deleted);
@@ -9249,7 +9618,10 @@ mod test {
             .expect("dialog stays open for review");
         assert!(dialog.checked_references);
         assert!(dialog.pending_request.is_none());
-        assert_eq!(dialog.reference_choices, vec![(site, ReferenceAction::Repair)]);
+        assert_eq!(
+            dialog.reference_choices,
+            vec![(site, ReferenceAction::Repair)]
+        );
         assert!(app.pending.is_empty());
     }
 
@@ -9349,7 +9721,9 @@ mod test {
         assert!(app.dirty);
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("renamed"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("renamed")
+            )))
         );
     }
 
@@ -9407,7 +9781,9 @@ mod test {
         assert!(dialog.pending_request.is_some());
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("definition"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("definition")
+            )))
         );
     }
 
@@ -9462,7 +9838,9 @@ mod test {
         assert!(app.recreate_requirement_dialog.is_none());
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Requirement(LogicalPath::root(disk_entry_name("renamed"))))
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("renamed")
+            )))
         );
     }
 
@@ -9821,7 +10199,9 @@ mod test {
         assert!(app.dirty);
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Test(LogicalPath::root(disk_entry_name("renamed"))))
+            Some(gui_core::EntryPath::Test(LogicalPath::root(
+                disk_entry_name("renamed")
+            )))
         );
     }
 
@@ -9879,7 +10259,9 @@ mod test {
         assert!(dialog.pending_request.is_some());
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Test(LogicalPath::root(disk_entry_name("smoke"))))
+            Some(gui_core::EntryPath::Test(LogicalPath::root(
+                disk_entry_name("smoke")
+            )))
         );
     }
 
@@ -9934,7 +10316,9 @@ mod test {
         assert!(app.recreate_test_dialog.is_none());
         assert_eq!(
             app.selection,
-            Some(gui_core::EntryPath::Test(LogicalPath::root(disk_entry_name("renamed"))))
+            Some(gui_core::EntryPath::Test(LogicalPath::root(
+                disk_entry_name("renamed")
+            )))
         );
     }
 

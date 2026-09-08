@@ -1,5 +1,6 @@
 //! `gui-config.ron`. See `README.md`'s "Configuration" section.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,6 +23,15 @@ pub struct GuiConfig {
     /// comment on why this is `gui-ui`'s own type rather than
     /// `egui::ThemePreference` directly.
     pub theme: ThemeChoice,
+    /// Whether requirement/test/result prose fields get live misspelling
+    /// underlines and a right-click suggestion popup — see `spellcheck.rs`.
+    pub spellcheck_enabled: bool,
+    /// Words the user has explicitly accepted via a field's "Add to
+    /// dictionary" action. Filtered out of `zspell`'s results rather than
+    /// merged into the dictionary itself (which has no runtime add-word
+    /// API — see `spellcheck.rs`). `BTreeSet` rather than `HashSet` so a
+    /// human diffing `gui-config.ron` sees a stable order across saves.
+    pub spellcheck_custom_words: BTreeSet<String>,
 }
 
 impl Default for GuiConfig {
@@ -30,6 +40,8 @@ impl Default for GuiConfig {
             save_on_exit_timeout: Duration::from_secs(15),
             zoom_percent: 100,
             theme: ThemeChoice::default(),
+            spellcheck_enabled: true,
+            spellcheck_custom_words: BTreeSet::new(),
         }
     }
 }
@@ -218,6 +230,8 @@ mod test {
             save_on_exit_timeout: Duration::from_secs(30),
             zoom_percent: 150,
             theme: ThemeChoice::Dark,
+            spellcheck_enabled: false,
+            spellcheck_custom_words: BTreeSet::from(["zspell".to_owned(), "typ".to_owned()]),
         };
         config.save(&path).unwrap();
 
@@ -226,6 +240,11 @@ mod test {
         assert_eq!(loaded.save_on_exit_timeout, Duration::from_secs(30));
         assert_eq!(loaded.zoom_percent, 150);
         assert_eq!(loaded.theme, ThemeChoice::Dark);
+        assert!(!loaded.spellcheck_enabled);
+        assert_eq!(
+            loaded.spellcheck_custom_words,
+            BTreeSet::from(["zspell".to_owned(), "typ".to_owned()])
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

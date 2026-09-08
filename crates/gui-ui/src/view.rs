@@ -3,14 +3,19 @@
 //! just draws widgets and calls them. See README's "Logic: keep it out of
 //! `update()`" and "Layout".
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use gui_core::{
-    EntryKind, EntryName, EntryStatus, LogicalPath, ReferenceAction, ReferenceSiteKind,
-    ReferencePath, RequirementMetStatus, ResultKindV1, TestUnmetReason, TreeNode, TreeSnapshot,
+    EntryKind, EntryName, EntryStatus, LogicalPath, ReferenceAction, ReferencePath,
+    ReferenceSiteKind, RequirementMetStatus, ResultKindV1, TestUnmetReason, TreeNode, TreeSnapshot,
     UnmetReason, title_case_from_name,
 };
 
+use crate::spellcheck::{
+    FieldSpellCache, SpellChecker, SpellField, SpellPopupState, SuggestionRequest, SuggestionState,
+    replace_word_in_place, word_at_byte_offset,
+};
 use crate::{
     AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp,
     LocalPoolKind, PathPickerScope, PathPickerTarget, PendingNavigation, PendingProjectAction,
@@ -137,9 +142,7 @@ fn describe_unmet_reason(reason: &UnmetReason) -> Vec<String> {
                     TestUnmetReason::UnresolvedReference => {
                         "its reference doesn't resolve to a real test procedure"
                     }
-                    TestUnmetReason::TestNotYetSaved => {
-                        "the test procedure hasn't been saved yet"
-                    }
+                    TestUnmetReason::TestNotYetSaved => "the test procedure hasn't been saved yet",
                     TestUnmetReason::StaleReference => {
                         "its reference is stale (pointing at an old commit of the test procedure)"
                     }
@@ -205,26 +208,267 @@ const MULTILINE_MAX_DEFAULT_ROWS: usize = 4;
 /// entry being edited (callers fold the entry's identity in), or this
 /// content-tracking default would only ever apply to the very first entry
 /// ever opened in a given box.
-fn resizable_multiline(ui: &mut egui::Ui, id_salt: &str, text: &mut String) -> egui::Response {
-    resizable_multiline_with_max_height(ui, id_salt, text, f32::INFINITY)
+/// Everything a spellchecked field needs, bundled so `spellchecked_singleline`/
+/// `resizable_multiline` don't need a 5-6-parameter signature each. Built
+/// fresh at each of the 7 in-scope call sites from that field's own slice
+/// of its form (`&self.spell_checker`, `&self.config.spellcheck_custom_words`,
+/// and the form's own `<field>_spell`/`spell_popup`).
+struct SpellCtx<'a> {
+    checker: &'a SpellChecker,
+    /// `self.config.spellcheck_enabled` — the status bar's checkbox.
+    /// Checked alongside `checker.is_ready()` everywhere that matters, so
+    /// disabling it behaves exactly like the dictionary never having
+    /// finished building: no layouter, no popup.
+    enabled: bool,
+    custom_words: &'a BTreeSet<String>,
+    cache: &'a mut FieldSpellCache,
+    popup: &'a mut Option<SpellPopupState>,
+    field: SpellField,
+}
+
+/// What happened inside a field's right-click suggestion popup this frame
+/// — returned by `attach_spellcheck_popup` so its two callers
+/// (`spellchecked_singleline`/`resizable_multiline`'s spellchecked branch)
+/// can apply it without duplicating the match themselves (see
+/// `apply_spell_popup_action`).
+enum SpellPopupAction {
+    /// A suggestion was clicked — the word has already been replaced in
+    /// the buffer (that's the one action here that must happen inside
+    /// `attach_spellcheck_popup` itself, since it's the only thing with
+    /// both the click and `text` in scope at the same time).
+    Replace,
+    /// "Add to dictionary" was clicked, carrying the word to add — left
+    /// for the caller to actually insert into `GuiConfig` and save, since
+    /// this function never sees `GuiConfig` at all (same "free function
+    /// inside `&mut self.editor`'s borrow can't call back into `self`"
+    /// reasoning as every other deferred-click flag in this file).
+    AddToDictionary(String),
+}
+
+/// Applies a `SpellPopupAction` returned by `attach_spellcheck_popup`:
+/// folds `Replace` into the caller's own `changed` flag (the widget's own
+/// `Response::changed()`, computed during `.show()`, can't reflect a
+/// mutation `attach_spellcheck_popup` makes afterward) and passes
+/// `AddToDictionary`'s word up one more level, to wherever `GuiConfig` is
+/// actually reachable.
+fn apply_spell_popup_action(
+    action: Option<SpellPopupAction>,
+    changed: &mut bool,
+) -> Option<String> {
+    match action {
+        Some(SpellPopupAction::Replace) => {
+            *changed = true;
+            None
+        }
+        Some(SpellPopupAction::AddToDictionary(word)) => Some(word),
+        None => None,
+    }
+}
+
+/// Builds a `TextEdit::layouter` from `cache`'s already-computed
+/// misspellings, underlining each one — used by both `spellchecked_singleline`
+/// and `resizable_multiline`. Does no `zspell` work itself (that already
+/// happened in `cache.refresh`, before this is ever called), so it's cheap
+/// to call every frame regardless of typing activity. Matches the default
+/// layouter's own font/color choice (see `egui::TextEdit::show`'s internal
+/// `default_layouter`) so a field with no misspellings looks identical to
+/// before this feature existed.
+fn spellcheck_text_layouter(
+    cache: &FieldSpellCache,
+    break_on_newline: bool,
+) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::Galley> + '_ {
+    move |ui, buffer, wrap_width| {
+        let text = buffer.as_str();
+        let text_color = ui
+            .visuals()
+            .override_text_color
+            .unwrap_or_else(|| ui.visuals().widgets.inactive.text_color());
+        let font_id = egui::FontSelection::default().resolve(ui.style());
+        let underline_color = theme_colors::misspelling_underline_color(ui.visuals().dark_mode);
+
+        let normal_format = egui::TextFormat::simple(font_id, text_color);
+        let mut misspelled_format = normal_format.clone();
+        misspelled_format.underline = egui::Stroke::new(1.5, underline_color);
+
+        let mut job = egui::text::LayoutJob {
+            break_on_newline,
+            wrap: egui::text::TextWrapping {
+                max_width: wrap_width,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut cursor = 0;
+        for m in cache.misspellings() {
+            if m.range.start > cursor {
+                job.append(&text[cursor..m.range.start], 0.0, normal_format.clone());
+            }
+            job.append(&text[m.range.clone()], 0.0, misspelled_format.clone());
+            cursor = m.range.end;
+        }
+        if cursor < text.len() || job.sections.is_empty() {
+            job.append(&text[cursor..], 0.0, normal_format);
+        }
+
+        ui.fonts_mut(|f| f.layout_job(job))
+    }
+}
+
+/// The right-click side of a spellchecked field: opens/updates `popup` on
+/// a secondary click over a misspelled word (spawning a background
+/// suggestion lookup), and renders the popup's contents from whatever
+/// `popup` currently holds. Called after `.show()`, so — unlike the
+/// layouter above — the click detection here always reflects last frame's
+/// misspelling ranges, one frame behind a keystroke that just changed
+/// them; self-corrects the next frame, same as the layouter's own
+/// one-frame lag against a same-frame edit.
+fn attach_spellcheck_popup(
+    output: &egui::text_edit::TextEditOutput,
+    text: &mut String,
+    checker: &SpellChecker,
+    cache: &mut FieldSpellCache,
+    popup: &mut Option<SpellPopupState>,
+    field: SpellField,
+) -> Option<SpellPopupAction> {
+    if output.response.secondary_clicked() {
+        if let Some(pos) = output.response.interact_pointer_pos() {
+            let local = pos - output.galley_pos;
+            let char_idx = output.galley.cursor_from_pos(local).index;
+            let byte_offset = text
+                .char_indices()
+                .nth(char_idx.0)
+                .map(|(offset, _)| offset)
+                .unwrap_or(text.len());
+            if let Some(m) = word_at_byte_offset(cache.misspellings(), byte_offset) {
+                if let Some(request) = SuggestionRequest::spawn(checker, m.word.clone()) {
+                    *popup = Some(SpellPopupState::new(field, m.clone(), request));
+                }
+            }
+        }
+    }
+
+    let mut action = None;
+    output.response.context_menu(|ui| {
+        let Some(state) = popup.as_ref().filter(|state| state.field == field) else {
+            ui.close();
+            return;
+        };
+        ui.label(format!("\u{201c}{}\u{201d}", state.misspelling.word));
+        ui.separator();
+        match &state.suggestions {
+            SuggestionState::Loading(_) => {
+                ui.add_enabled(false, egui::Label::new("Loading suggestions…"));
+            }
+            SuggestionState::Ready(list) if list.is_empty() => {
+                ui.add_enabled(false, egui::Label::new("No suggestions"));
+            }
+            SuggestionState::Ready(list) => {
+                for suggestion in list {
+                    if ui.button(suggestion).clicked() {
+                        replace_word_in_place(text, &state.misspelling.range, suggestion);
+                        action = Some(SpellPopupAction::Replace);
+                        ui.close();
+                    }
+                }
+            }
+        }
+        ui.separator();
+        if ui.button("Add to dictionary").clicked() {
+            action = Some(SpellPopupAction::AddToDictionary(
+                state.misspelling.word.clone(),
+            ));
+            ui.close();
+        }
+        if ui.button("Ignore").clicked() {
+            ui.close();
+        }
+    });
+
+    if action.is_some() {
+        cache.invalidate();
+        *popup = None;
+    }
+    action
+}
+
+/// A single-line spellchecked prose field (a requirement/test/result
+/// title) — the singleline counterpart to `resizable_multiline`, and the
+/// first shared singleline wrapper in this file (every other singleline
+/// field calls `text_edit_singleline`/`TextEdit::singleline` directly).
+/// Returns `(changed, word added to dictionary)` rather than a bare
+/// `Response`, since call sites only ever checked `.changed()` and this
+/// additionally needs to surface an "Add to dictionary" click up to
+/// wherever `GuiConfig` is reachable — see `SpellPopupAction`'s own doc
+/// comment on why that can't just happen in here.
+fn spellchecked_singleline(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    spell: SpellCtx<'_>,
+) -> (bool, Option<String>) {
+    if !spell.checker.is_ready() || !spell.enabled {
+        // Behaves exactly as before this feature existed — no layouter,
+        // no popup — while the dictionary is still building or failed to
+        // build at all, or the user has switched spellcheck off.
+        return (ui.text_edit_singleline(text).changed(), None);
+    }
+    let SpellCtx {
+        checker,
+        custom_words,
+        cache,
+        popup,
+        field,
+        ..
+    } = spell;
+    cache.refresh(text, checker, custom_words);
+    let mut layouter = spellcheck_text_layouter(cache, false);
+    let output = egui::TextEdit::singleline(text)
+        .layouter(&mut layouter)
+        .show(ui);
+    // Ends the layouter's own borrow of `cache` explicitly — otherwise it
+    // (an `impl Trait` closure) is conservatively considered to borrow
+    // `cache` until this scope ends, even though nothing calls it again
+    // after `.show()` above.
+    drop(layouter);
+    let mut changed = output.response.changed();
+    let action = attach_spellcheck_popup(&output, text, checker, cache, popup, field);
+    let added_to_dictionary = apply_spell_popup_action(action, &mut changed);
+    (changed, added_to_dictionary)
+}
+
+/// See `spellchecked_singleline`'s own doc comment on the return type —
+/// same reasoning here.
+fn resizable_multiline(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    text: &mut String,
+    spell: SpellCtx<'_>,
+) -> (bool, Option<String>) {
+    resizable_multiline_with_max_height(ui, id_salt, text, f32::INFINITY, Some(spell))
 }
 
 /// Same as `resizable_multiline`, but caps how tall the user can drag the
 /// box — for callers (like the commit-all dialog) that aren't inside their
 /// own scroll area and would otherwise let a drag push the surrounding
-/// modal/window past the screen's edge.
+/// modal/window past the screen's edge. `spell: None` (the commit-all
+/// dialog's own call) renders exactly as before this feature existed.
 fn resizable_multiline_with_max_height(
     ui: &mut egui::Ui,
     id_salt: &str,
     text: &mut String,
     max_height: f32,
-) -> egui::Response {
+    spell: Option<SpellCtx<'_>>,
+) -> (bool, Option<String>) {
     let default_rows = text
         .lines()
         .count()
         .max(1)
         .clamp(MULTILINE_MIN_ROWS, MULTILINE_MAX_DEFAULT_ROWS);
     let available_width = ui.available_width();
+    // Same "behaves exactly as before while not `Ready`/disabled"
+    // reasoning as `spellchecked_singleline`.
+    let spell = spell.filter(|spell| spell.checker.is_ready() && spell.enabled);
+    let mut changed = false;
+    let mut added_to_dictionary = None;
     egui::Resize::default()
         .id_salt(id_salt)
         .resizable([false, true])
@@ -238,11 +482,48 @@ fn resizable_multiline_with_max_height(
             // `TextEdit` otherwise only grows to fit its text (or
             // `desired_rows`' default of 4 lines) rather than the space
             // `Resize` just gave it, so the drag handle would visibly move
-            // the frame without the box inside it following — `add_sized`
-            // with the ui's own available size is what makes it fill the
-            // frame instead.
-            ui.add_sized(ui.available_size(), egui::TextEdit::multiline(text))
-        })
+            // the frame without the box inside it following.
+            let desired_size = ui.available_size();
+            match spell {
+                None => {
+                    // Same "fill the frame" trick `add_sized` itself uses
+                    // internally — kept spelled out here (rather than
+                    // calling `add_sized`) so the spellchecked branch below
+                    // can use the identical wrapping to also get at the
+                    // full `TextEditOutput`, which `add_sized` discards.
+                    changed = ui
+                        .add_sized(desired_size, egui::TextEdit::multiline(text))
+                        .changed();
+                }
+                Some(SpellCtx {
+                    checker,
+                    custom_words,
+                    cache,
+                    popup,
+                    field,
+                    ..
+                }) => {
+                    cache.refresh(text, checker, custom_words);
+                    let mut layouter = spellcheck_text_layouter(cache, true);
+                    let layout = egui::Layout::centered_and_justified(ui.layout().main_dir());
+                    let output = ui
+                        .allocate_ui_with_layout(desired_size, layout, |ui| {
+                            egui::TextEdit::multiline(text)
+                                .layouter(&mut layouter)
+                                .show(ui)
+                        })
+                        .inner;
+                    // See `spellchecked_singleline`'s own comment on why
+                    // this is dropped explicitly.
+                    drop(layouter);
+                    changed = output.response.changed();
+                    let action =
+                        attach_spellcheck_popup(&output, text, checker, cache, popup, field);
+                    added_to_dictionary = apply_spell_popup_action(action, &mut changed);
+                }
+            }
+        });
+    (changed, added_to_dictionary)
 }
 
 /// `count / total` as a percentage, `0.0` for an empty `total` rather than
@@ -515,13 +796,8 @@ impl GuiApp {
                 // same "every navigation is Back-able" convention Back/
                 // Forward and the four "New ___" buttons already follow.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(
-                        ui,
-                        self.can_clear_center_pane(),
-                        icons::CLEAR,
-                        "Clear",
-                    )
-                    .clicked()
+                    if icon_button(ui, self.can_clear_center_pane(), icons::CLEAR, "Clear")
+                        .clicked()
                     {
                         if self.editor_has_unsaved_edits() {
                             self.unsaved_form_dialog_opened(PendingNavigation::Clear);
@@ -594,6 +870,11 @@ impl GuiApp {
                     }
                     if ui.button("Reset").clicked() {
                         self.zoom_reset_clicked();
+                    }
+
+                    let mut spellcheck_enabled = self.config.spellcheck_enabled;
+                    if ui.checkbox(&mut spellcheck_enabled, "Spellcheck").changed() {
+                        self.spellcheck_toggled(spellcheck_enabled);
                     }
 
                     let mut selected_theme = None;
@@ -721,9 +1002,10 @@ impl GuiApp {
                                             };
                                             let mut text = egui::RichText::new(glyph);
                                             if is_root_current {
-                                                text = text.color(theme_colors::module_current_color(
-                                                    ui.visuals().dark_mode,
-                                                ));
+                                                text =
+                                                    text.color(theme_colors::module_current_color(
+                                                        ui.visuals().dark_mode,
+                                                    ));
                                             }
                                             if ui
                                                 .add(egui::Button::new(text).small())
@@ -732,9 +1014,11 @@ impl GuiApp {
                                             {
                                                 self.select_module(Vec::new());
                                             }
-                                            let mut root_text =
-                                                egui::RichText::new(module_label(&root, tree.validated))
-                                                    .strong();
+                                            let mut root_text = egui::RichText::new(module_label(
+                                                &root,
+                                                tree.validated,
+                                            ))
+                                            .strong();
                                             if is_root_current {
                                                 root_text = root_text.color(
                                                     theme_colors::module_current_color(
@@ -748,9 +1032,14 @@ impl GuiApp {
                                             // plain `ui.label` can't host a
                                             // context menu.
                                             let root_response = ui.add(
-                                                egui::Label::new(root_text).sense(egui::Sense::click()),
+                                                egui::Label::new(root_text)
+                                                    .sense(egui::Sense::click()),
                                             );
-                                            attach_paste_requirement_menu(&root_response, self, Vec::new());
+                                            attach_paste_requirement_menu(
+                                                &root_response,
+                                                self,
+                                                Vec::new(),
+                                            );
                                         });
                                         render_module_children(
                                             self,
@@ -841,6 +1130,7 @@ impl GuiApp {
     /// same scope) would conflict, since that method needs to reach
     /// `self.editor` itself.
     fn render_requirement_form(&mut self, ui: &mut egui::Ui) {
+        self.ensure_spell_checker_started();
         let mut create_clicked = false;
         let mut cancel_clicked = false;
         let mut edit_clicked = false;
@@ -864,6 +1154,11 @@ impl GuiApp {
         // `EntryPath` of their own (see that type's variants), so they go
         // through `select_module` instead of `select`.
         let mut navigate_module_clicked: Option<Vec<EntryName>> = None;
+        // Set by any of this form's 4 prose fields' "Add to dictionary"
+        // popup action — applied once, after `self.editor`'s borrow ends,
+        // since `attach_spellcheck_popup` never sees `self.config` at all
+        // (see `SpellPopupAction::AddToDictionary`'s own doc comment).
+        let mut spellcheck_add_to_dictionary: Option<String> = None;
         {
             let EditorState::NewRequirement(form) = &mut self.editor else {
                 return;
@@ -987,8 +1282,23 @@ impl GuiApp {
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
-                        if ui.text_edit_singleline(&mut form.title).changed() {
+                        let (changed, added) = spellchecked_singleline(
+                            ui,
+                            &mut form.title,
+                            SpellCtx {
+                                checker: &self.spell_checker,
+                                enabled: self.config.spellcheck_enabled,
+                                custom_words: &self.config.spellcheck_custom_words,
+                                cache: &mut form.title_spell,
+                                popup: &mut form.spell_popup,
+                                field: SpellField::Title,
+                            },
+                        );
+                        if changed {
                             form.edited = true;
+                        }
+                        if spellcheck_add_to_dictionary.is_none() {
+                            spellcheck_add_to_dictionary = added;
                         }
                         if ui
                             .button(icons::REGENERATE_TITLE)
@@ -1007,34 +1317,64 @@ impl GuiApp {
                     // comment.
                     let entry_id = entry_id_salt(&form.editing_target);
                     ui.label("Requirement text:");
-                    if resizable_multiline(
+                    let (changed, added) = resizable_multiline(
                         ui,
                         &format!("requirement_text:{entry_id}"),
                         &mut form.requirement_text,
-                    )
-                    .changed()
-                    {
+                        SpellCtx {
+                            checker: &self.spell_checker,
+                            enabled: self.config.spellcheck_enabled,
+                            custom_words: &self.config.spellcheck_custom_words,
+                            cache: &mut form.requirement_text_spell,
+                            popup: &mut form.spell_popup,
+                            field: SpellField::RequirementText,
+                        },
+                    );
+                    if changed {
                         form.edited = true;
                     }
+                    if spellcheck_add_to_dictionary.is_none() {
+                        spellcheck_add_to_dictionary = added;
+                    }
                     ui.label("Requirement guidance:");
-                    if resizable_multiline(
+                    let (changed, added) = resizable_multiline(
                         ui,
                         &format!("requirement_guidance:{entry_id}"),
                         &mut form.requirement_guidance,
-                    )
-                    .changed()
-                    {
+                        SpellCtx {
+                            checker: &self.spell_checker,
+                            enabled: self.config.spellcheck_enabled,
+                            custom_words: &self.config.spellcheck_custom_words,
+                            cache: &mut form.requirement_guidance_spell,
+                            popup: &mut form.spell_popup,
+                            field: SpellField::RequirementGuidance,
+                        },
+                    );
+                    if changed {
                         form.edited = true;
                     }
+                    if spellcheck_add_to_dictionary.is_none() {
+                        spellcheck_add_to_dictionary = added;
+                    }
                     ui.label("Test procedure guidance:");
-                    if resizable_multiline(
+                    let (changed, added) = resizable_multiline(
                         ui,
                         &format!("test_guidance:{entry_id}"),
                         &mut form.test_guidance,
-                    )
-                    .changed()
-                    {
+                        SpellCtx {
+                            checker: &self.spell_checker,
+                            enabled: self.config.spellcheck_enabled,
+                            custom_words: &self.config.spellcheck_custom_words,
+                            cache: &mut form.test_guidance_spell,
+                            popup: &mut form.spell_popup,
+                            field: SpellField::TestGuidance,
+                        },
+                    );
+                    if changed {
                         form.edited = true;
+                    }
+                    if spellcheck_add_to_dictionary.is_none() {
+                        spellcheck_add_to_dictionary = added;
                     }
                 }
                 if let Some(error) = &form.error {
@@ -1048,183 +1388,183 @@ impl GuiApp {
                 // requiring the entry to already exist.
                 ui.separator();
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label("Dependencies:");
-                let mut remove_dependency: Option<usize> = None;
-                let mut dependency_edited = false;
-                for (i, dep) in form.dependencies.iter_mut().enumerate() {
-                    if i > 0 {
-                        ui.separator();
-                    }
-                    if read_only {
-                        // `LocalRequirement` and `Submodule` are the two
-                        // variants naming something else inside this same
-                        // project, so both get a link to it, each behind a
-                        // "Requirement:"/"Submodule:" label denoting the
-                        // dependency's kind — `Remote` points outside it
-                        // (nothing here to navigate to) and `Submodules`
-                        // names no single entry at all, so those two stay
-                        // plain labels.
-                        match dep {
-                            DependencyDraft::LocalRequirement { path, .. } => {
-                                let target = form.editing_target.as_ref().and_then(|t| {
-                                    gui_core::resolve_reference_path(
-                                        &ReferencePath(path.clone()),
-                                        &t.modules,
-                                        "requirements",
-                                    )
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Requirement:");
-                                    if let Some(target) = target {
-                                        if ui.link(dep.brief()).clicked() {
-                                            navigate_clicked =
-                                                Some(gui_core::EntryPath::Requirement(target));
+                    ui.label("Dependencies:");
+                    let mut remove_dependency: Option<usize> = None;
+                    let mut dependency_edited = false;
+                    for (i, dep) in form.dependencies.iter_mut().enumerate() {
+                        if i > 0 {
+                            ui.separator();
+                        }
+                        if read_only {
+                            // `LocalRequirement` and `Submodule` are the two
+                            // variants naming something else inside this same
+                            // project, so both get a link to it, each behind a
+                            // "Requirement:"/"Submodule:" label denoting the
+                            // dependency's kind — `Remote` points outside it
+                            // (nothing here to navigate to) and `Submodules`
+                            // names no single entry at all, so those two stay
+                            // plain labels.
+                            match dep {
+                                DependencyDraft::LocalRequirement { path, .. } => {
+                                    let target = form.editing_target.as_ref().and_then(|t| {
+                                        gui_core::resolve_reference_path(
+                                            &ReferencePath(path.clone()),
+                                            &t.modules,
+                                            "requirements",
+                                        )
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Requirement:");
+                                        if let Some(target) = target {
+                                            if ui.link(dep.brief()).clicked() {
+                                                navigate_clicked =
+                                                    Some(gui_core::EntryPath::Requirement(target));
+                                            }
+                                        } else {
+                                            ui.label(dep.brief());
                                         }
-                                    } else {
-                                        ui.label(dep.brief());
-                                    }
-                                });
-                            }
-                            DependencyDraft::Submodule { name } => {
-                                // A submodule dependency names a *direct
-                                // child* module of this requirement's own
-                                // module by bare name, so there's no
-                                // reference path to parse — "does it
-                                // resolve" is a lookup in the tree instead,
-                                // and a name with no such child stays a
-                                // plain label (same treatment an
-                                // unparseable `LocalRequirement` path gets
-                                // above). Modules aren't `EntryPath`s, so
-                                // this navigates via `select_module` rather
-                                // than `navigate_clicked` — see
-                                // `navigate_module_clicked` below.
-                                let target = form.editing_target.as_ref().and_then(|t| {
-                                    let tree = self.tree.as_ref()?;
-                                    direct_submodule_names(tree, &t.modules)
-                                        .iter()
-                                        .any(|child| child == name)
-                                        .then(|| {
-                                            let mut module = t.modules.clone();
-                                            module.push(EntryName(name.clone()));
-                                            module
-                                        })
-                                });
-                                // The "Submodule:" prefix stays a plain
-                                // label; the link itself shows the fully
-                                // qualified module path (this requirement's
-                                // own module plus the child's bare name),
-                                // not just the bare name, since several
-                                // sibling modules can share a child name.
-                                // Leading `/` matches the project-root-
-                                // relative `disk::ReferencePath` convention
-                                // other dependency kinds display.
-                                let full_path = form.editing_target.as_ref().map(|t| {
-                                    let joined = t
-                                        .modules
-                                        .iter()
-                                        .map(EntryName::as_str)
-                                        .chain(std::iter::once(name.as_str()))
-                                        .collect::<Vec<_>>()
-                                        .join("/");
-                                    format!("/{joined}")
-                                });
-                                let label_text = full_path.unwrap_or_else(|| name.clone());
-                                ui.horizontal(|ui| {
-                                    ui.label("Submodule:");
-                                    match target {
-                                        Some(module) => {
-                                            if ui.link(label_text).clicked() {
-                                                navigate_module_clicked = Some(module);
+                                    });
+                                }
+                                DependencyDraft::Submodule { name } => {
+                                    // A submodule dependency names a *direct
+                                    // child* module of this requirement's own
+                                    // module by bare name, so there's no
+                                    // reference path to parse — "does it
+                                    // resolve" is a lookup in the tree instead,
+                                    // and a name with no such child stays a
+                                    // plain label (same treatment an
+                                    // unparseable `LocalRequirement` path gets
+                                    // above). Modules aren't `EntryPath`s, so
+                                    // this navigates via `select_module` rather
+                                    // than `navigate_clicked` — see
+                                    // `navigate_module_clicked` below.
+                                    let target = form.editing_target.as_ref().and_then(|t| {
+                                        let tree = self.tree.as_ref()?;
+                                        direct_submodule_names(tree, &t.modules)
+                                            .iter()
+                                            .any(|child| child == name)
+                                            .then(|| {
+                                                let mut module = t.modules.clone();
+                                                module.push(EntryName(name.clone()));
+                                                module
+                                            })
+                                    });
+                                    // The "Submodule:" prefix stays a plain
+                                    // label; the link itself shows the fully
+                                    // qualified module path (this requirement's
+                                    // own module plus the child's bare name),
+                                    // not just the bare name, since several
+                                    // sibling modules can share a child name.
+                                    // Leading `/` matches the project-root-
+                                    // relative `disk::ReferencePath` convention
+                                    // other dependency kinds display.
+                                    let full_path = form.editing_target.as_ref().map(|t| {
+                                        let joined = t
+                                            .modules
+                                            .iter()
+                                            .map(EntryName::as_str)
+                                            .chain(std::iter::once(name.as_str()))
+                                            .collect::<Vec<_>>()
+                                            .join("/");
+                                        format!("/{joined}")
+                                    });
+                                    let label_text = full_path.unwrap_or_else(|| name.clone());
+                                    ui.horizontal(|ui| {
+                                        ui.label("Submodule:");
+                                        match target {
+                                            Some(module) => {
+                                                if ui.link(label_text).clicked() {
+                                                    navigate_module_clicked = Some(module);
+                                                }
+                                            }
+                                            None => {
+                                                ui.label(label_text);
                                             }
                                         }
-                                        None => {
-                                            ui.label(label_text);
+                                    });
+                                }
+                                DependencyDraft::Remote { .. } | DependencyDraft::Submodules => {
+                                    ui.label(dep.brief());
+                                }
+                            }
+                        } else {
+                            dependency_edited |= render_dependency_kind_dropdown(ui, i, dep);
+                            let (changed, auto, pick_clicked) = render_dependency_fields(
+                                ui,
+                                dep,
+                                self.tree.as_ref(),
+                                &self.selected_module,
+                            );
+                            dependency_edited |= changed;
+                            if let Some(kind) = auto {
+                                auto_commit_clicked = Some((DependencySlot::Existing(i), kind));
+                            }
+                            if pick_clicked {
+                                pick_dependency_path_clicked = Some(DependencySlot::Existing(i));
+                            }
+                            if ui.button("Remove").clicked() {
+                                remove_dependency = Some(i);
+                            }
+                        }
+                    }
+                    if let Some(i) = remove_dependency {
+                        form.dependencies.remove(i);
+                        dependency_edited = true;
+                    }
+                    if dependency_edited {
+                        form.edited = true;
+                    }
+                    if let Some(error) = &form.commit_fetch_error {
+                        ui.colored_label(egui::Color32::RED, error);
+                    }
+                    if !read_only {
+                        if !form.dependencies.is_empty() {
+                            ui.separator();
+                        }
+                        if form.adding_dependency {
+                            egui::Modal::new(egui::Id::new("add_dependency_dialog")).show(
+                                ui.ctx(),
+                                |ui| {
+                                    ui.heading("Add Dependency");
+                                    ui.horizontal(|ui| {
+                                        // Composing a not-yet-added entry isn't
+                                        // itself an edit to the form's real
+                                        // content — only actually clicking "Add
+                                        // dependency" below is, so this return
+                                        // value is deliberately ignored (unlike
+                                        // the existing-row loop above).
+                                        render_dependency_kind_picker(ui, &mut form.new_dependency);
+                                    });
+                                    let (_, auto, pick_clicked) = render_dependency_fields(
+                                        ui,
+                                        &mut form.new_dependency,
+                                        self.tree.as_ref(),
+                                        &self.selected_module,
+                                    );
+                                    if let Some(kind) = auto {
+                                        auto_commit_clicked = Some((DependencySlot::New, kind));
+                                    }
+                                    if pick_clicked {
+                                        pick_dependency_path_clicked = Some(DependencySlot::New);
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Add dependency").clicked() {
+                                            form.dependencies.push(form.new_dependency.clone());
+                                            form.new_dependency = DependencyDraft::default();
+                                            form.adding_dependency = false;
+                                            form.edited = true;
                                         }
-                                    }
-                                });
-                            }
-                            DependencyDraft::Remote { .. } | DependencyDraft::Submodules => {
-                                ui.label(dep.brief());
-                            }
-                        }
-                    } else {
-                        dependency_edited |= render_dependency_kind_dropdown(ui, i, dep);
-                        let (changed, auto, pick_clicked) = render_dependency_fields(
-                            ui,
-                            dep,
-                            self.tree.as_ref(),
-                            &self.selected_module,
-                        );
-                        dependency_edited |= changed;
-                        if let Some(kind) = auto {
-                            auto_commit_clicked = Some((DependencySlot::Existing(i), kind));
-                        }
-                        if pick_clicked {
-                            pick_dependency_path_clicked = Some(DependencySlot::Existing(i));
-                        }
-                        if ui.button("Remove").clicked() {
-                            remove_dependency = Some(i);
+                                        if ui.button("Cancel").clicked() {
+                                            form.new_dependency = DependencyDraft::default();
+                                            form.adding_dependency = false;
+                                        }
+                                    });
+                                },
+                            );
+                        } else if ui.button("Add dependency").clicked() {
+                            form.adding_dependency = true;
                         }
                     }
-                }
-                if let Some(i) = remove_dependency {
-                    form.dependencies.remove(i);
-                    dependency_edited = true;
-                }
-                if dependency_edited {
-                    form.edited = true;
-                }
-                if let Some(error) = &form.commit_fetch_error {
-                    ui.colored_label(egui::Color32::RED, error);
-                }
-                if !read_only {
-                    if !form.dependencies.is_empty() {
-                        ui.separator();
-                    }
-                    if form.adding_dependency {
-                        egui::Modal::new(egui::Id::new("add_dependency_dialog")).show(
-                            ui.ctx(),
-                            |ui| {
-                                ui.heading("Add Dependency");
-                                ui.horizontal(|ui| {
-                                    // Composing a not-yet-added entry isn't
-                                    // itself an edit to the form's real
-                                    // content — only actually clicking "Add
-                                    // dependency" below is, so this return
-                                    // value is deliberately ignored (unlike
-                                    // the existing-row loop above).
-                                    render_dependency_kind_picker(ui, &mut form.new_dependency);
-                                });
-                                let (_, auto, pick_clicked) = render_dependency_fields(
-                                    ui,
-                                    &mut form.new_dependency,
-                                    self.tree.as_ref(),
-                                    &self.selected_module,
-                                );
-                                if let Some(kind) = auto {
-                                    auto_commit_clicked = Some((DependencySlot::New, kind));
-                                }
-                                if pick_clicked {
-                                    pick_dependency_path_clicked = Some(DependencySlot::New);
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui.button("Add dependency").clicked() {
-                                        form.dependencies.push(form.new_dependency.clone());
-                                        form.new_dependency = DependencyDraft::default();
-                                        form.adding_dependency = false;
-                                        form.edited = true;
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        form.new_dependency = DependencyDraft::default();
-                                        form.adding_dependency = false;
-                                    }
-                                });
-                            },
-                        );
-                    } else if ui.button("Add dependency").clicked() {
-                        form.adding_dependency = true;
-                    }
-                }
                 });
 
                 // Test references, like Dependencies above (and unlike Local
@@ -1233,109 +1573,111 @@ impl GuiApp {
                 // requiring the entry to already exist.
                 ui.separator();
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label("Test procedures:");
-                let mut remove_test_ref: Option<usize> = None;
-                let mut test_ref_edited = false;
-                for (i, test_ref) in form.tests.iter_mut().enumerate() {
-                    if read_only {
-                        let target = form.editing_target.as_ref().and_then(|t| {
-                            gui_core::resolve_reference_path(
-                                &ReferencePath(test_ref.path.clone()),
-                                &t.modules,
-                                "tests",
-                            )
-                        });
-                        if let Some(target) = target {
-                            if ui.link(test_ref.to_string()).clicked() {
-                                navigate_clicked = Some(gui_core::EntryPath::Test(target));
+                    ui.label("Test procedures:");
+                    let mut remove_test_ref: Option<usize> = None;
+                    let mut test_ref_edited = false;
+                    for (i, test_ref) in form.tests.iter_mut().enumerate() {
+                        if read_only {
+                            let target = form.editing_target.as_ref().and_then(|t| {
+                                gui_core::resolve_reference_path(
+                                    &ReferencePath(test_ref.path.clone()),
+                                    &t.modules,
+                                    "tests",
+                                )
+                            });
+                            if let Some(target) = target {
+                                if ui.link(test_ref.to_string()).clicked() {
+                                    navigate_clicked = Some(gui_core::EntryPath::Test(target));
+                                }
+                            } else {
+                                ui.label(test_ref.to_string());
                             }
                         } else {
-                            ui.label(test_ref.to_string());
-                        }
-                    } else {
-                        let (changed, auto, pick_clicked) =
-                            render_test_ref_fields(ui, test_ref, self.tree.as_ref());
-                        test_ref_edited |= changed;
-                        if let Some(target) = auto {
-                            test_ref_auto_commit_clicked = Some((TestRefSlot::Existing(i), target));
-                        }
-                        if pick_clicked {
-                            pick_test_ref_path_clicked = Some(TestRefSlot::Existing(i));
-                        }
-                        if ui.button("Remove").clicked() {
-                            remove_test_ref = Some(i);
+                            let (changed, auto, pick_clicked) =
+                                render_test_ref_fields(ui, test_ref, self.tree.as_ref());
+                            test_ref_edited |= changed;
+                            if let Some(target) = auto {
+                                test_ref_auto_commit_clicked =
+                                    Some((TestRefSlot::Existing(i), target));
+                            }
+                            if pick_clicked {
+                                pick_test_ref_path_clicked = Some(TestRefSlot::Existing(i));
+                            }
+                            if ui.button("Remove").clicked() {
+                                remove_test_ref = Some(i);
+                            }
                         }
                     }
-                }
-                if let Some(i) = remove_test_ref {
-                    form.tests.remove(i);
-                    test_ref_edited = true;
-                }
-                if test_ref_edited {
-                    form.edited = true;
-                }
-                if let Some(error) = &form.test_commit_fetch_error {
-                    ui.colored_label(egui::Color32::RED, error);
-                }
-                if !read_only {
-                    if form.adding_test_ref {
-                        egui::Modal::new(egui::Id::new("add_test_reference_dialog")).show(
-                            ui.ctx(),
-                            |ui| {
-                                ui.heading("Add Test Procedure");
-                                let (_, auto, pick_clicked) = render_test_ref_fields(
-                                    ui,
-                                    &mut form.new_test_ref,
-                                    self.tree.as_ref(),
-                                );
-                                if let Some(target) = auto {
-                                    test_ref_auto_commit_clicked = Some((TestRefSlot::New, target));
-                                }
-                                if pick_clicked {
-                                    pick_test_ref_path_clicked = Some(TestRefSlot::New);
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui.button("Add test procedure").clicked() {
-                                        form.tests.push(form.new_test_ref.clone());
-                                        let new_index = form.tests.len() - 1;
-                                        // Auto-populate the new row's commit
-                                        // exactly as if its own "Auto" button
-                                        // had been clicked, so the user
-                                        // doesn't have to do that as a
-                                        // manual follow-up step.
-                                        if let Some(tree) = self.tree.as_ref() {
-                                            let path = form.tests[new_index].path.clone();
-                                            if let Some(target) =
-                                                flatten_leaf_paths(tree, EntryKind::Test)
-                                                    .into_iter()
-                                                    .find(|target| {
-                                                        absolute_reference_path(
-                                                            target,
-                                                            leaf_kind_segment(EntryKind::Test),
-                                                        ) == path
-                                                    })
-                                            {
-                                                test_ref_auto_commit_clicked = Some((
-                                                    TestRefSlot::Existing(new_index),
-                                                    target,
-                                                ));
+                    if let Some(i) = remove_test_ref {
+                        form.tests.remove(i);
+                        test_ref_edited = true;
+                    }
+                    if test_ref_edited {
+                        form.edited = true;
+                    }
+                    if let Some(error) = &form.test_commit_fetch_error {
+                        ui.colored_label(egui::Color32::RED, error);
+                    }
+                    if !read_only {
+                        if form.adding_test_ref {
+                            egui::Modal::new(egui::Id::new("add_test_reference_dialog")).show(
+                                ui.ctx(),
+                                |ui| {
+                                    ui.heading("Add Test Procedure");
+                                    let (_, auto, pick_clicked) = render_test_ref_fields(
+                                        ui,
+                                        &mut form.new_test_ref,
+                                        self.tree.as_ref(),
+                                    );
+                                    if let Some(target) = auto {
+                                        test_ref_auto_commit_clicked =
+                                            Some((TestRefSlot::New, target));
+                                    }
+                                    if pick_clicked {
+                                        pick_test_ref_path_clicked = Some(TestRefSlot::New);
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Add test procedure").clicked() {
+                                            form.tests.push(form.new_test_ref.clone());
+                                            let new_index = form.tests.len() - 1;
+                                            // Auto-populate the new row's commit
+                                            // exactly as if its own "Auto" button
+                                            // had been clicked, so the user
+                                            // doesn't have to do that as a
+                                            // manual follow-up step.
+                                            if let Some(tree) = self.tree.as_ref() {
+                                                let path = form.tests[new_index].path.clone();
+                                                if let Some(target) =
+                                                    flatten_leaf_paths(tree, EntryKind::Test)
+                                                        .into_iter()
+                                                        .find(|target| {
+                                                            absolute_reference_path(
+                                                                target,
+                                                                leaf_kind_segment(EntryKind::Test),
+                                                            ) == path
+                                                        })
+                                                {
+                                                    test_ref_auto_commit_clicked = Some((
+                                                        TestRefSlot::Existing(new_index),
+                                                        target,
+                                                    ));
+                                                }
                                             }
+                                            form.new_test_ref = TestRefDraft::default();
+                                            form.adding_test_ref = false;
+                                            form.edited = true;
                                         }
-                                        form.new_test_ref = TestRefDraft::default();
-                                        form.adding_test_ref = false;
-                                        form.edited = true;
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        form.new_test_ref = TestRefDraft::default();
-                                        form.adding_test_ref = false;
-                                    }
-                                });
-                            },
-                        );
-                    } else if ui.button("Add test procedure").clicked() {
-                        form.adding_test_ref = true;
+                                        if ui.button("Cancel").clicked() {
+                                            form.new_test_ref = TestRefDraft::default();
+                                            form.adding_test_ref = false;
+                                        }
+                                    });
+                                },
+                            );
+                        } else if ui.button("Add test procedure").clicked() {
+                            form.adding_test_ref = true;
+                        }
                     }
-                }
                 });
 
                 // Results, unlike Dependencies/Test references above, are
@@ -1375,10 +1717,11 @@ impl GuiApp {
                                 .clicked()
                                 && let Some(requirement) = form.editing_target.clone()
                             {
-                                navigate_clicked = Some(gui_core::EntryPath::Result(gui_core::ResultPath {
-                                    requirement,
-                                    name: result.name.clone(),
-                                }));
+                                navigate_clicked =
+                                    Some(gui_core::EntryPath::Result(gui_core::ResultPath {
+                                        requirement,
+                                        name: result.name.clone(),
+                                    }));
                             }
                         }
                     });
@@ -1454,9 +1797,13 @@ impl GuiApp {
         } else if let Some(module) = navigate_module_clicked {
             self.select_module(module);
         }
+        if let Some(word) = spellcheck_add_to_dictionary {
+            self.add_spellcheck_word_to_dictionary(word);
+        }
     }
 
     fn render_test_form(&mut self, ui: &mut egui::Ui) {
+        self.ensure_spell_checker_started();
         let mut create_clicked = false;
         let mut cancel_clicked = false;
         let mut edit_clicked = false;
@@ -1466,6 +1813,8 @@ impl GuiApp {
         let mut add_template_clicked = false;
         let mut remove_template: Option<PathBuf> = None;
         let mut recreate_clicked = false;
+        // See the Requirement form's own comment on this.
+        let mut spellcheck_add_to_dictionary: Option<String> = None;
         {
             let EditorState::NewTest(form) = &mut self.editor else {
                 return;
@@ -1549,8 +1898,23 @@ impl GuiApp {
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
-                        if ui.text_edit_singleline(&mut form.title).changed() {
+                        let (changed, added) = spellchecked_singleline(
+                            ui,
+                            &mut form.title,
+                            SpellCtx {
+                                checker: &self.spell_checker,
+                                enabled: self.config.spellcheck_enabled,
+                                custom_words: &self.config.spellcheck_custom_words,
+                                cache: &mut form.title_spell,
+                                popup: &mut form.spell_popup,
+                                field: SpellField::Title,
+                            },
+                        );
+                        if changed {
                             form.edited = true;
+                        }
+                        if spellcheck_add_to_dictionary.is_none() {
+                            spellcheck_add_to_dictionary = added;
                         }
                         if ui
                             .button(icons::REGENERATE_TITLE)
@@ -1565,10 +1929,24 @@ impl GuiApp {
                     // same reasoning, for this test's `resizable_multiline`.
                     let entry_id = entry_id_salt(&form.editing_target);
                     ui.label("Test procedure text:");
-                    if resizable_multiline(ui, &format!("test_text:{entry_id}"), &mut form.test_text)
-                        .changed()
-                    {
+                    let (changed, added) = resizable_multiline(
+                        ui,
+                        &format!("test_text:{entry_id}"),
+                        &mut form.test_text,
+                        SpellCtx {
+                            checker: &self.spell_checker,
+                            enabled: self.config.spellcheck_enabled,
+                            custom_words: &self.config.spellcheck_custom_words,
+                            cache: &mut form.test_text_spell,
+                            popup: &mut form.spell_popup,
+                            field: SpellField::TestText,
+                        },
+                    );
+                    if changed {
                         form.edited = true;
+                    }
+                    if spellcheck_add_to_dictionary.is_none() {
+                        spellcheck_add_to_dictionary = added;
                     }
                     ui.horizontal(|ui| {
                         ui.label("Result kind:");
@@ -1669,9 +2047,13 @@ impl GuiApp {
         } else if let Some(path) = remove_template {
             self.local_attachment_remove_clicked(LocalPoolKind::TestTemplate, path);
         }
+        if let Some(word) = spellcheck_add_to_dictionary {
+            self.add_spellcheck_word_to_dictionary(word);
+        }
     }
 
     fn render_result_form(&mut self, ui: &mut egui::Ui) {
+        self.ensure_spell_checker_started();
         let mut create_clicked = false;
         let mut cancel_clicked = false;
         let mut edit_clicked = false;
@@ -1680,6 +2062,8 @@ impl GuiApp {
         let mut remove_attachment: Option<PathBuf> = None;
         let mut open_picker: Option<PathPickerTarget> = None;
         let mut refresh_stale_result_reference_clicked = false;
+        // See the Requirement form's own comment on this.
+        let mut spellcheck_add_to_dictionary: Option<String> = None;
         {
             let EditorState::NewResult(form) = &mut self.editor else {
                 return;
@@ -1705,7 +2089,10 @@ impl GuiApp {
                         if ui
                             .add_enabled(
                                 !busy,
-                                egui::Button::new((icons::UPDATE_STALE_REFERENCES, "Update Stale Reference")),
+                                egui::Button::new((
+                                    icons::UPDATE_STALE_REFERENCES,
+                                    "Update Stale Reference",
+                                )),
                             )
                             .clicked()
                         {
@@ -1793,8 +2180,23 @@ impl GuiApp {
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
-                        if ui.text_edit_singleline(&mut form.title).changed() {
+                        let (changed, added) = spellchecked_singleline(
+                            ui,
+                            &mut form.title,
+                            SpellCtx {
+                                checker: &self.spell_checker,
+                                enabled: self.config.spellcheck_enabled,
+                                custom_words: &self.config.spellcheck_custom_words,
+                                cache: &mut form.title_spell,
+                                popup: &mut form.spell_popup,
+                                field: SpellField::Title,
+                            },
+                        );
+                        if changed {
                             form.edited = true;
+                        }
+                        if spellcheck_add_to_dictionary.is_none() {
+                            spellcheck_add_to_dictionary = added;
                         }
                         if ui
                             .button(icons::REGENERATE_TITLE)
@@ -1859,14 +2261,20 @@ impl GuiApp {
                     ui.horizontal(|ui| {
                         ui.label("Status:");
                         if ui
-                            .selectable_label(matches!(form.status, gui_core::StatusV1::Pass), "Pass")
+                            .selectable_label(
+                                matches!(form.status, gui_core::StatusV1::Pass),
+                                "Pass",
+                            )
                             .clicked()
                         {
                             form.status = gui_core::StatusV1::Pass;
                             form.edited = true;
                         }
                         if ui
-                            .selectable_label(matches!(form.status, gui_core::StatusV1::Fail), "Fail")
+                            .selectable_label(
+                                matches!(form.status, gui_core::StatusV1::Fail),
+                                "Fail",
+                            )
                             .clicked()
                         {
                             form.status = gui_core::StatusV1::Fail;
@@ -1934,6 +2342,9 @@ impl GuiApp {
         }
         if refresh_stale_result_reference_clicked {
             self.refresh_stale_result_reference_clicked();
+        }
+        if let Some(word) = spellcheck_add_to_dictionary {
+            self.add_spellcheck_word_to_dictionary(word);
         }
     }
 
@@ -2460,6 +2871,7 @@ impl GuiApp {
                             "commit_all_message",
                             &mut dialog.message,
                             max_message_height,
+                            None,
                         );
 
                         ui.separator();
@@ -2564,7 +2976,8 @@ impl GuiApp {
                         for line in dialog.diff.lines() {
                             let kind = theme_colors::classify_diff_line(line);
                             let mut text = egui::RichText::new(line).monospace();
-                            if let Some((fg, bg)) = theme_colors::diff_line_colors(dark_mode, kind) {
+                            if let Some((fg, bg)) = theme_colors::diff_line_colors(dark_mode, kind)
+                            {
                                 text = text.color(fg).background_color(bg);
                             }
                             ui.label(text);
@@ -2692,7 +3105,11 @@ impl GuiApp {
             ) {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut dialog.scope, PathPickerScope::All, "All");
-                    ui.radio_value(&mut dialog.scope, PathPickerScope::ThisModule, "This module");
+                    ui.radio_value(
+                        &mut dialog.scope,
+                        PathPickerScope::ThisModule,
+                        "This module",
+                    );
                     ui.radio_value(&mut dialog.scope, PathPickerScope::Submodules, "Submodules");
                 });
             }
@@ -2704,7 +3121,9 @@ impl GuiApp {
                 .max_height(300.0)
                 .show(ui, |ui| {
                     let mut any_shown = false;
-                    for target in scoped_leaf_paths(tree, dialog.kind, dialog.scope, &dialog.owning_module) {
+                    for target in
+                        scoped_leaf_paths(tree, dialog.kind, dialog.scope, &dialog.owning_module)
+                    {
                         let path_str = absolute_reference_path(&target, kind_segment);
                         if !filter.is_empty() && !path_str.to_lowercase().contains(&filter) {
                             continue;
@@ -2825,7 +3244,8 @@ impl GuiApp {
             ));
             ui.horizontal(|ui| {
                 ui.label("New name:");
-                let name_response = ui.add_enabled(!busy, egui::TextEdit::singleline(&mut new_name));
+                let name_response =
+                    ui.add_enabled(!busy, egui::TextEdit::singleline(&mut new_name));
                 if name_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     enter_pressed_in_name_field = true;
                 }
@@ -2846,7 +3266,10 @@ impl GuiApp {
             }
             let can_confirm = !busy && !new_name.trim().is_empty() && !name_taken;
             ui.horizontal(|ui| {
-                if ui.add_enabled(can_confirm, egui::Button::new("Duplicate")).clicked() {
+                if ui
+                    .add_enabled(can_confirm, egui::Button::new("Duplicate"))
+                    .clicked()
+                {
                     confirmed = true;
                 }
                 if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
@@ -2911,7 +3334,10 @@ impl GuiApp {
             }
             ui.horizontal(|ui| {
                 ui.label("Title:");
-                ui.add_enabled(!busy && !regenerate_title, egui::TextEdit::singleline(&mut title));
+                ui.add_enabled(
+                    !busy && !regenerate_title,
+                    egui::TextEdit::singleline(&mut title),
+                );
             });
             ui.add_enabled(
                 !busy,
@@ -2948,7 +3374,10 @@ impl GuiApp {
                     status = gui_core::StatusV1::Fail;
                 }
                 if ui
-                    .selectable_label(matches!(status, gui_core::StatusV1::Incomplete), "Incomplete")
+                    .selectable_label(
+                        matches!(status, gui_core::StatusV1::Incomplete),
+                        "Incomplete",
+                    )
                     .clicked()
                 {
                     status = gui_core::StatusV1::Incomplete;
@@ -2973,7 +3402,10 @@ impl GuiApp {
             }
             let can_confirm = !busy && !name.trim().is_empty() && !dialog.tests.is_empty();
             ui.horizontal(|ui| {
-                if ui.add_enabled(can_confirm, egui::Button::new("Create result")).clicked() {
+                if ui
+                    .add_enabled(can_confirm, egui::Button::new("Create result"))
+                    .clicked()
+                {
                     confirmed = true;
                 }
                 if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
@@ -3033,7 +3465,11 @@ impl GuiApp {
         let mut cancelled = false;
         let mut enter_pressed_in_name_field = false;
         let busy = dialog.pending_request.is_some();
-        let button_label = if dialog.repairing { "Retry Repair" } else { "Recreate" };
+        let button_label = if dialog.repairing {
+            "Retry Repair"
+        } else {
+            "Recreate"
+        };
         egui::Modal::new(egui::Id::new("recreate_requirement_dialog")).show(ui.ctx(), |ui| {
             ui.heading("Recreate Requirement");
             ui.label(format!(
@@ -3133,7 +3569,11 @@ impl GuiApp {
         let mut cancelled = false;
         let mut enter_pressed_in_name_field = false;
         let busy = dialog.pending_request.is_some();
-        let button_label = if dialog.repairing { "Retry Repair" } else { "Recreate" };
+        let button_label = if dialog.repairing {
+            "Retry Repair"
+        } else {
+            "Recreate"
+        };
         egui::Modal::new(egui::Id::new("recreate_test_dialog")).show(ui.ctx(), |ui| {
             ui.heading("Recreate Test Procedure");
             ui.label(format!(
@@ -3376,10 +3816,17 @@ impl GuiApp {
 /// currently selected. Disabled (not hidden) with nothing on
 /// `app.requirement_clipboard`, so right-clicking any of these always
 /// shows the same menu shape whether or not a Copy has happened yet.
-fn attach_paste_requirement_menu(response: &egui::Response, app: &mut GuiApp, module: Vec<EntryName>) {
+fn attach_paste_requirement_menu(
+    response: &egui::Response,
+    app: &mut GuiApp,
+    module: Vec<EntryName>,
+) {
     response.context_menu(|ui| {
         if ui
-            .add_enabled(app.requirement_clipboard.is_some(), egui::Button::new("Paste"))
+            .add_enabled(
+                app.requirement_clipboard.is_some(),
+                egui::Button::new("Paste"),
+            )
             .clicked()
         {
             app.paste_requirement_clicked(module.clone());
@@ -3682,7 +4129,10 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
 /// read-model tree gui-ui already has in hand each frame). An empty
 /// `path` returns `root` itself, the same "empty means project root"
 /// convention `selected_module` uses.
-pub(crate) fn resolve_tree_module<'a>(root: &'a TreeNode, path: &[EntryName]) -> Option<&'a TreeNode> {
+pub(crate) fn resolve_tree_module<'a>(
+    root: &'a TreeNode,
+    path: &[EntryName],
+) -> Option<&'a TreeNode> {
     let mut current = root;
     for name in path {
         current = current
@@ -3785,7 +4235,11 @@ fn render_pool_group(ui: &mut egui::Ui, title: &str, paths: &[PathBuf]) {
 /// where a compact single-line control fits the row layout better; the
 /// "Add dependency" composer keeps the radio-button picker since it isn't
 /// squeezed into a row.
-fn render_dependency_kind_dropdown(ui: &mut egui::Ui, id_source: usize, dep: &mut DependencyDraft) -> bool {
+fn render_dependency_kind_dropdown(
+    ui: &mut egui::Ui,
+    id_source: usize,
+    dep: &mut DependencyDraft,
+) -> bool {
     let mut changed = false;
     egui::ComboBox::new(("dependency_kind", id_source), "")
         .selected_text(match dep {
@@ -3796,7 +4250,10 @@ fn render_dependency_kind_dropdown(ui: &mut egui::Ui, id_source: usize, dep: &mu
         })
         .show_ui(ui, |ui| {
             if ui
-                .selectable_label(matches!(dep, DependencyDraft::LocalRequirement { .. }), "Local")
+                .selectable_label(
+                    matches!(dep, DependencyDraft::LocalRequirement { .. }),
+                    "Local",
+                )
                 .clicked()
                 && !matches!(dep, DependencyDraft::LocalRequirement { .. })
             {
@@ -3827,7 +4284,10 @@ fn render_dependency_kind_dropdown(ui: &mut egui::Ui, id_source: usize, dep: &mu
                 changed = true;
             }
             if ui
-                .selectable_label(matches!(dep, DependencyDraft::Submodule { .. }), "Submodule")
+                .selectable_label(
+                    matches!(dep, DependencyDraft::Submodule { .. }),
+                    "Submodule",
+                )
                 .clicked()
                 && !matches!(dep, DependencyDraft::Submodule { .. })
             {
@@ -3873,7 +4333,10 @@ fn render_dependency_kind_picker(ui: &mut egui::Ui, dep: &mut DependencyDraft) -
         return true;
     }
     if ui
-        .radio(matches!(dep, DependencyDraft::Submodule { .. }), "Submodule")
+        .radio(
+            matches!(dep, DependencyDraft::Submodule { .. }),
+            "Submodule",
+        )
         .clicked()
     {
         *dep = DependencyDraft::Submodule {
@@ -4408,11 +4871,21 @@ mod test {
         };
 
         assert_eq!(
-            scoped_leaf_paths(&tree, EntryKind::Requirement, PathPickerScope::ThisModule, &[]),
+            scoped_leaf_paths(
+                &tree,
+                EntryKind::Requirement,
+                PathPickerScope::ThisModule,
+                &[]
+            ),
             vec![LogicalPath::root(name("root_level"))]
         );
         assert_eq!(
-            scoped_leaf_paths(&tree, EntryKind::Requirement, PathPickerScope::Submodules, &[]),
+            scoped_leaf_paths(
+                &tree,
+                EntryKind::Requirement,
+                PathPickerScope::Submodules,
+                &[]
+            ),
             vec![LogicalPath {
                 modules: vec![name("setup")],
                 name: name("nested"),
