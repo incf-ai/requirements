@@ -8,14 +8,15 @@ use std::path::PathBuf;
 use gui_core::{
     EntryKind, EntryName, EntryStatus, LogicalPath, ReferenceAction, ReferenceSiteKind,
     ReferencePath, RequirementMetStatus, ResultKindV1, TestUnmetReason, TreeNode, TreeSnapshot,
-    UnmetReason,
+    UnmetReason, title_case_from_name,
 };
 
 use crate::{
     AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp,
-    LocalPoolKind, PathPickerTarget, PendingNavigation, PendingProjectAction, TestRefDraft,
-    TestRefSlot, ThemeChoice, ValidateBeforeSaveDialogState, absolute_reference_path,
-    flatten_leaf_paths, icons, leaf_kind_segment, theme_colors,
+    LocalPoolKind, PathPickerScope, PathPickerTarget, PendingNavigation, PendingProjectAction,
+    TestRefDraft, TestRefSlot, ThemeChoice, ValidateBeforeSaveDialogState, absolute_reference_path,
+    direct_submodule_names, flatten_leaf_paths, icons, leaf_kind_segment, scoped_leaf_paths,
+    theme_colors,
 };
 
 /// A short label for a `ReferenceSiteKind`, for the broken-references
@@ -24,6 +25,7 @@ fn reference_site_kind_label(kind: &ReferenceSiteKind) -> &'static str {
     match kind {
         ReferenceSiteKind::RequirementTestReference { .. } => "test procedure",
         ReferenceSiteKind::RequirementDependency { .. } => "dependency",
+        ReferenceSiteKind::RequirementSubmoduleDependency { .. } => "submodule dependency",
         ReferenceSiteKind::ResultTestRef { .. } => "result's test procedure",
     }
 }
@@ -254,6 +256,22 @@ fn percentage(count: usize, total: usize) -> f64 {
     }
 }
 
+/// A module tree row's label: just its name, unless the project is
+/// validated and the module's subtree (itself plus every nested submodule)
+/// has at least one requirement, in which case its "requirements met"
+/// percentage is appended. Suppressed for an unvalidated project (nothing
+/// meaningful to report yet — see `TreeSnapshot::validated`'s own doc
+/// comment) and for a subtree with no requirements at all (a bare "(0%)"
+/// would read as "unmet" rather than "nothing to measure").
+fn module_label(node: &TreeNode, project_validated: bool) -> String {
+    if project_validated && node.requirement_count > 0 {
+        let met_pct = percentage(node.requirements_met, node.requirement_count);
+        format!("{} ({met_pct:.0}%)", node.name.as_str())
+    } else {
+        node.name.as_str().to_string()
+    }
+}
+
 impl GuiApp {
     /// Shared by the toolbar's and the File menu's "Save" — falls back
     /// to the same native folder picker "Save As…" uses when the current
@@ -396,6 +414,10 @@ impl GuiApp {
                 if icon_button(ui, self.tree.is_some(), icons::SAVE, "Save").clicked() {
                     self.save_button_clicked();
                 }
+                if icon_button(ui, true, icons::VALIDATE, "Validate").clicked() {
+                    self.validate_clicked();
+                }
+                ui.separator();
                 if icon_button(
                     ui,
                     self.tree.is_some(),
@@ -406,8 +428,8 @@ impl GuiApp {
                 {
                     self.commit_all_button_clicked();
                 }
-                if icon_button(ui, true, icons::VALIDATE, "Validate").clicked() {
-                    self.validate_clicked();
+                if icon_button(ui, self.tree.is_some(), icons::PUSH, "Push…").clicked() {
+                    self.push_button_clicked();
                 }
                 ui.separator();
                 // `can_undo`/`can_redo` come from `self.tree` (`gui-core`'s
@@ -660,75 +682,91 @@ impl GuiApp {
                     Some(tree) => {
                         let root = tree.root.clone();
 
-                        // Reserved *before* the top area is drawn: a
-                        // `ScrollArea` with no `max_height` fills all
-                        // available space in its container, so computing
-                        // this split only after rendering the top area
-                        // (as before) left nothing for the bottom area —
-                        // its content was still drawn, just pushed below
-                        // the visible panel.
-                        let bottom_height = ui.available_height() * 0.4;
-                        let top_height = (ui.available_height() - bottom_height - 8.0).max(0.0);
-
-                        egui::ScrollArea::vertical()
-                            .id_salt("tree_pane_modules")
-                            .max_height(top_height)
-                            .auto_shrink([false, false])
+                        // A resizable nested `Panel::top`, not a fixed
+                        // 0.4/0.6 height split — its drag handle lets the
+                        // user trade space between the module tree above
+                        // and the selected-module detail below, and (like
+                        // the outer `tree_pane` itself) egui persists the
+                        // dragged height across frames/restarts keyed by
+                        // this panel's id, so no manual state is needed
+                        // here.
+                        egui::Panel::top("tree_pane_modules_panel")
+                            .resizable(true)
+                            .default_size(ui.available_height() * 0.6)
+                            .size_range(60.0..=f32::INFINITY)
                             .show(ui, |ui| {
-                                // The root `TreeNode`'s own `name` is the
-                                // project's display name (see `gui-core`'s
-                                // `build_tree_snapshot`) — a label, not a real
-                                // module-path segment. Unlike every other
-                                // `Module` node, it must never be pushed into a
-                                // path, so the root is rendered specially here
-                                // (its own selector + iterating its children
-                                // with an *empty* path) rather than through
-                                // `render_tree_node`, which pushes `node.name`
-                                // for every module it handles.
-                                let is_root_current = self.selected_module.is_empty();
-                                ui.horizontal(|ui| {
-                                    let glyph = if is_root_current {
-                                        icons::MODULE_CURRENT
-                                    } else {
-                                        icons::MODULE_NOT_CURRENT
-                                    };
-                                    let mut text = egui::RichText::new(glyph);
-                                    if is_root_current {
-                                        text = text.color(theme_colors::module_current_color(
-                                            ui.visuals().dark_mode,
-                                        ));
-                                    }
-                                    if ui
-                                        .add(egui::Button::new(text).small())
-                                        .on_hover_text("Set as current module")
-                                        .clicked()
-                                    {
-                                        self.select_module(Vec::new());
-                                    }
-                                    let mut root_text =
-                                        egui::RichText::new(root.name.as_str()).strong();
-                                    if is_root_current {
-                                        root_text = root_text.color(
-                                            theme_colors::module_current_color(
-                                                ui.visuals().dark_mode,
-                                            ),
+                                egui::ScrollArea::vertical()
+                                    .id_salt("tree_pane_modules")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        // The root `TreeNode`'s own `name` is
+                                        // the project's display name (see
+                                        // `gui-core`'s `build_tree_snapshot`)
+                                        // — a label, not a real module-path
+                                        // segment. Unlike every other
+                                        // `Module` node, it must never be
+                                        // pushed into a path, so the root is
+                                        // rendered specially here (its own
+                                        // selector + iterating its children
+                                        // with an *empty* path) rather than
+                                        // through `render_tree_node`, which
+                                        // pushes `node.name` for every module
+                                        // it handles.
+                                        let is_root_current = self.selected_module.is_empty();
+                                        ui.horizontal(|ui| {
+                                            let glyph = if is_root_current {
+                                                icons::MODULE_CURRENT
+                                            } else {
+                                                icons::MODULE_NOT_CURRENT
+                                            };
+                                            let mut text = egui::RichText::new(glyph);
+                                            if is_root_current {
+                                                text = text.color(theme_colors::module_current_color(
+                                                    ui.visuals().dark_mode,
+                                                ));
+                                            }
+                                            if ui
+                                                .add(egui::Button::new(text).small())
+                                                .on_hover_text("Set as current module")
+                                                .clicked()
+                                            {
+                                                self.select_module(Vec::new());
+                                            }
+                                            let mut root_text =
+                                                egui::RichText::new(module_label(&root, tree.validated))
+                                                    .strong();
+                                            if is_root_current {
+                                                root_text = root_text.color(
+                                                    theme_colors::module_current_color(
+                                                        ui.visuals().dark_mode,
+                                                    ),
+                                                );
+                                            }
+                                            // `Sense::click()` — see the
+                                            // no-submodules branch of
+                                            // `render_tree_node` for why a
+                                            // plain `ui.label` can't host a
+                                            // context menu.
+                                            let root_response = ui.add(
+                                                egui::Label::new(root_text).sense(egui::Sense::click()),
+                                            );
+                                            attach_paste_requirement_menu(&root_response, self, Vec::new());
+                                        });
+                                        render_module_children(
+                                            self,
+                                            ui,
+                                            &root.children,
+                                            &[],
+                                            force_open,
+                                            tree.validated,
                                         );
-                                    }
-                                    // `Sense::click()` — see the no-submodules
-                                    // branch of `render_tree_node` for why a
-                                    // plain `ui.label` can't host a context menu.
-                                    let root_response =
-                                        ui.add(egui::Label::new(root_text).sense(egui::Sense::click()));
-                                    attach_paste_requirement_menu(&root_response, self, Vec::new());
-                                });
-                                render_module_children(self, ui, &root.children, &[], force_open);
+                                    });
                             });
 
                         ui.separator();
 
                         egui::ScrollArea::vertical()
                             .id_salt("tree_pane_selection")
-                            .max_height(bottom_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 render_selected_module_pane(self, ui, tree, force_open);
@@ -821,6 +859,11 @@ impl GuiApp {
         // `self.editor` ends below, same reasoning as every other
         // deferred-click flag in this function.
         let mut navigate_clicked: Option<gui_core::EntryPath> = None;
+        // The same, for the one link here that points at a module rather
+        // than a leaf entry — a `Submodule` dependency. Modules have no
+        // `EntryPath` of their own (see that type's variants), so they go
+        // through `select_module` instead of `select`.
+        let mut navigate_module_clicked: Option<Vec<EntryName>> = None;
         {
             let EditorState::NewRequirement(form) = &mut self.editor else {
                 return;
@@ -947,6 +990,14 @@ impl GuiApp {
                         if ui.text_edit_singleline(&mut form.title).changed() {
                             form.edited = true;
                         }
+                        if ui
+                            .button(icons::REGENERATE_TITLE)
+                            .on_hover_text("Regenerate title from identifier")
+                            .clicked()
+                        {
+                            form.title = title_case_from_name(&form.name);
+                            form.edited = true;
+                        }
                     });
                     // Folded into every field's id_salt below so each
                     // distinct requirement gets its own remembered box size
@@ -1001,36 +1052,109 @@ impl GuiApp {
                 let mut remove_dependency: Option<usize> = None;
                 let mut dependency_edited = false;
                 for (i, dep) in form.dependencies.iter_mut().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
                     if read_only {
-                        // Only `LocalRequirement` names another entry in
-                        // this same project — `Remote` points outside it
+                        // `LocalRequirement` and `Submodule` are the two
+                        // variants naming something else inside this same
+                        // project, so both get a link to it, each behind a
+                        // "Requirement:"/"Submodule:" label denoting the
+                        // dependency's kind — `Remote` points outside it
                         // (nothing here to navigate to) and `Submodules`
-                        // names no single entry at all, so both stay plain
-                        // labels.
-                        let target = match dep {
-                            DependencyDraft::LocalRequirement { path, .. } => form
-                                .editing_target
-                                .as_ref()
-                                .and_then(|t| {
+                        // names no single entry at all, so those two stay
+                        // plain labels.
+                        match dep {
+                            DependencyDraft::LocalRequirement { path, .. } => {
+                                let target = form.editing_target.as_ref().and_then(|t| {
                                     gui_core::resolve_reference_path(
                                         &ReferencePath(path.clone()),
                                         &t.modules,
                                         "requirements",
                                     )
-                                }),
-                            _ => None,
-                        };
-                        if let Some(target) = target {
-                            if ui.link(dep.to_string()).clicked() {
-                                navigate_clicked = Some(gui_core::EntryPath::Requirement(target));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Requirement:");
+                                    if let Some(target) = target {
+                                        if ui.link(dep.brief()).clicked() {
+                                            navigate_clicked =
+                                                Some(gui_core::EntryPath::Requirement(target));
+                                        }
+                                    } else {
+                                        ui.label(dep.brief());
+                                    }
+                                });
                             }
-                        } else {
-                            ui.label(dep.to_string());
+                            DependencyDraft::Submodule { name } => {
+                                // A submodule dependency names a *direct
+                                // child* module of this requirement's own
+                                // module by bare name, so there's no
+                                // reference path to parse — "does it
+                                // resolve" is a lookup in the tree instead,
+                                // and a name with no such child stays a
+                                // plain label (same treatment an
+                                // unparseable `LocalRequirement` path gets
+                                // above). Modules aren't `EntryPath`s, so
+                                // this navigates via `select_module` rather
+                                // than `navigate_clicked` — see
+                                // `navigate_module_clicked` below.
+                                let target = form.editing_target.as_ref().and_then(|t| {
+                                    let tree = self.tree.as_ref()?;
+                                    direct_submodule_names(tree, &t.modules)
+                                        .iter()
+                                        .any(|child| child == name)
+                                        .then(|| {
+                                            let mut module = t.modules.clone();
+                                            module.push(EntryName(name.clone()));
+                                            module
+                                        })
+                                });
+                                // The "Submodule:" prefix stays a plain
+                                // label; the link itself shows the fully
+                                // qualified module path (this requirement's
+                                // own module plus the child's bare name),
+                                // not just the bare name, since several
+                                // sibling modules can share a child name.
+                                // Leading `/` matches the project-root-
+                                // relative `disk::ReferencePath` convention
+                                // other dependency kinds display.
+                                let full_path = form.editing_target.as_ref().map(|t| {
+                                    let joined = t
+                                        .modules
+                                        .iter()
+                                        .map(EntryName::as_str)
+                                        .chain(std::iter::once(name.as_str()))
+                                        .collect::<Vec<_>>()
+                                        .join("/");
+                                    format!("/{joined}")
+                                });
+                                let label_text = full_path.unwrap_or_else(|| name.clone());
+                                ui.horizontal(|ui| {
+                                    ui.label("Submodule:");
+                                    match target {
+                                        Some(module) => {
+                                            if ui.link(label_text).clicked() {
+                                                navigate_module_clicked = Some(module);
+                                            }
+                                        }
+                                        None => {
+                                            ui.label(label_text);
+                                        }
+                                    }
+                                });
+                            }
+                            DependencyDraft::Remote { .. } | DependencyDraft::Submodules => {
+                                ui.label(dep.brief());
+                            }
                         }
                     } else {
                         dependency_edited |= render_dependency_kind_dropdown(ui, i, dep);
-                        let (changed, auto, pick_clicked) =
-                            render_dependency_fields(ui, dep, self.tree.as_ref());
+                        let (changed, auto, pick_clicked) = render_dependency_fields(
+                            ui,
+                            dep,
+                            self.tree.as_ref(),
+                            &self.selected_module,
+                        );
                         dependency_edited |= changed;
                         if let Some(kind) = auto {
                             auto_commit_clicked = Some((DependencySlot::Existing(i), kind));
@@ -1054,6 +1178,9 @@ impl GuiApp {
                     ui.colored_label(egui::Color32::RED, error);
                 }
                 if !read_only {
+                    if !form.dependencies.is_empty() {
+                        ui.separator();
+                    }
                     if form.adding_dependency {
                         egui::Modal::new(egui::Id::new("add_dependency_dialog")).show(
                             ui.ctx(),
@@ -1072,6 +1199,7 @@ impl GuiApp {
                                     ui,
                                     &mut form.new_dependency,
                                     self.tree.as_ref(),
+                                    &self.selected_module,
                                 );
                                 if let Some(kind) = auto {
                                     auto_commit_clicked = Some((DependencySlot::New, kind));
@@ -1323,6 +1451,8 @@ impl GuiApp {
         }
         if let Some(target) = navigate_clicked {
             self.select(target);
+        } else if let Some(module) = navigate_module_clicked {
+            self.select_module(module);
         }
     }
 
@@ -1420,6 +1550,14 @@ impl GuiApp {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
                         if ui.text_edit_singleline(&mut form.title).changed() {
+                            form.edited = true;
+                        }
+                        if ui
+                            .button(icons::REGENERATE_TITLE)
+                            .on_hover_text("Regenerate title from identifier")
+                            .clicked()
+                        {
+                            form.title = title_case_from_name(&form.name);
                             form.edited = true;
                         }
                     });
@@ -1541,6 +1679,7 @@ impl GuiApp {
         let mut add_attachment_clicked = false;
         let mut remove_attachment: Option<PathBuf> = None;
         let mut open_picker: Option<PathPickerTarget> = None;
+        let mut refresh_stale_result_reference_clicked = false;
         {
             let EditorState::NewResult(form) = &mut self.editor else {
                 return;
@@ -1558,6 +1697,20 @@ impl GuiApp {
                 if read_only {
                     if ui.button("Edit").clicked() {
                         edit_clicked = true;
+                    }
+                    // Only when there's actually something for it to fix
+                    // — see `EntryDetail::Result::stale`'s own doc comment.
+                    if form.stale {
+                        let busy = form.pending_request.is_some();
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new((icons::UPDATE_STALE_REFERENCES, "Update Stale Reference")),
+                            )
+                            .clicked()
+                        {
+                            refresh_stale_result_reference_clicked = true;
+                        }
                     }
                 } else {
                     // See the Requirement form's own comment on why this
@@ -1641,6 +1794,14 @@ impl GuiApp {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
                         if ui.text_edit_singleline(&mut form.title).changed() {
+                            form.edited = true;
+                        }
+                        if ui
+                            .button(icons::REGENERATE_TITLE)
+                            .on_hover_text("Regenerate title from identifier")
+                            .clicked()
+                        {
+                            form.title = title_case_from_name(&form.name);
                             form.edited = true;
                         }
                     });
@@ -1770,6 +1931,9 @@ impl GuiApp {
         }
         if let Some(target) = open_picker {
             self.path_picker_dialog_opened(target);
+        }
+        if refresh_stale_result_reference_clicked {
+            self.refresh_stale_result_reference_clicked();
         }
     }
 
@@ -2419,6 +2583,79 @@ impl GuiApp {
         }
     }
 
+    /// The "Push" modal — opens in a confirm state (see `PushDialogState`'s
+    /// own doc comment), shows "Pushing…" while `Command::Push` is in
+    /// flight, then either the combined git output (success) or the error
+    /// (failure), with the confirm button still available on failure to
+    /// retry. No auto-close on success, unlike "Commit all changes" — the
+    /// whole point is showing the user push's status/output until they
+    /// dismiss it.
+    pub(crate) fn render_push_dialog(&mut self, ui: &mut egui::Ui) {
+        if self.push_dialog.is_none() {
+            return;
+        }
+
+        let mut close_clicked = false;
+        let mut push_clicked = false;
+        let screen_rect = ui.ctx().content_rect();
+        let width = screen_rect.width() * 0.6;
+        let max_height = (screen_rect.height() - 120.0).max(200.0);
+
+        egui::Modal::new(egui::Id::new("push_dialog")).show(ui.ctx(), |ui| {
+            let Some(dialog) = &self.push_dialog else {
+                return;
+            };
+            ui.set_width(width);
+            ui.heading("Push");
+            ui.separator();
+
+            if dialog.pushing {
+                ui.label("Pushing…");
+            } else if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            } else if let Some(output) = &dialog.output {
+                egui::ScrollArea::both()
+                    .max_height(max_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        ui.label(egui::RichText::new(output).monospace());
+                    });
+            } else {
+                ui.label("Push the current branch to its remote?");
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if dialog.output.is_none() {
+                    if ui
+                        .add_enabled(
+                            !dialog.pushing,
+                            egui::Button::new(if dialog.pushing { "Pushing…" } else { "Push" }),
+                        )
+                        .clicked()
+                    {
+                        push_clicked = true;
+                    }
+                }
+                let close_label = if dialog.output.is_some() || dialog.error.is_some() {
+                    "Close"
+                } else {
+                    "Cancel"
+                };
+                if ui.button(close_label).clicked() {
+                    close_clicked = true;
+                }
+            });
+        });
+
+        if push_clicked {
+            self.push_dialog_push_clicked();
+        } else if close_clicked {
+            self.push_dialog_closed();
+        }
+    }
+
     /// The path-picker modal — see `PathPickerDialogState`'s own doc
     /// comment on why this replaced a per-field `egui::ComboBox`: a
     /// `ComboBox` popup sizes itself to its content with no scrolling, so
@@ -2448,6 +2685,18 @@ impl GuiApp {
                 }
             });
             ui.text_edit_singleline(&mut dialog.filter);
+
+            if matches!(
+                dialog.target,
+                PathPickerTarget::Dependency(_) | PathPickerTarget::TestReference(_)
+            ) {
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut dialog.scope, PathPickerScope::All, "All");
+                    ui.radio_value(&mut dialog.scope, PathPickerScope::ThisModule, "This module");
+                    ui.radio_value(&mut dialog.scope, PathPickerScope::Submodules, "Submodules");
+                });
+            }
+
             let kind_segment = leaf_kind_segment(dialog.kind);
             let filter = dialog.filter.to_lowercase();
 
@@ -2455,7 +2704,7 @@ impl GuiApp {
                 .max_height(300.0)
                 .show(ui, |ui| {
                     let mut any_shown = false;
-                    for target in flatten_leaf_paths(tree, dialog.kind) {
+                    for target in scoped_leaf_paths(tree, dialog.kind, dialog.scope, &dialog.owning_module) {
                         let path_str = absolute_reference_path(&target, kind_segment);
                         if !filter.is_empty() && !path_str.to_lowercase().contains(&filter) {
                             continue;
@@ -2655,10 +2904,10 @@ impl GuiApp {
             // Kept in sync with `name` every frame while checked, same
             // "checkbox drives a derived field" idea as the Duplicate/
             // Recreate dialogs' own `regenerate_title` — here it's also
-            // visible live (not just applied at confirm) since the
-            // transform is a plain copy, cheap enough to just show.
+            // visible live (not just applied at confirm), cheap enough to
+            // just show.
             if regenerate_title {
-                title = name.clone();
+                title = title_case_from_name(&name);
             }
             ui.horizontal(|ui| {
                 ui.label("Title:");
@@ -3148,6 +3397,7 @@ fn render_tree_node(
     node: &TreeNode,
     module_path: &[EntryName],
     force_open: Option<bool>,
+    project_validated: bool,
 ) {
     // A module with no matching descendant module (filter active) is
     // skipped entirely, not just collapsed — see `module_matches_filter`'s
@@ -3198,7 +3448,7 @@ fn render_tree_node(
         // the separator. Pin the childless-module label (which would
         // otherwise fall back to the darker plain-label color) to that same
         // widget stroke color, so both halves of the tree agree.
-        let mut name_text = egui::RichText::new(node.name.as_str())
+        let mut name_text = egui::RichText::new(module_label(node, project_validated))
             .color(ui.visuals().widgets.inactive.fg_stroke.color);
         if is_current {
             name_text = name_text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
@@ -3216,6 +3466,7 @@ fn render_tree_node(
                         &node.children,
                         &this_module_path,
                         force_open,
+                        project_validated,
                     );
                 });
             attach_paste_requirement_menu(&header.header_response, app, this_module_path.clone());
@@ -3250,10 +3501,11 @@ fn render_module_children(
     children: &[TreeNode],
     module_path: &[EntryName],
     force_open: Option<bool>,
+    project_validated: bool,
 ) {
     for child in children {
         if child.kind == EntryKind::Module {
-            render_tree_node(app, ui, child, module_path, force_open);
+            render_tree_node(app, ui, child, module_path, force_open, project_validated);
         }
     }
 }
@@ -3309,7 +3561,7 @@ fn render_leaf_group(
     // match the filter.
     let response = egui::CollapsingHeader::new(header)
         .id_salt((title, module_path))
-        .default_open(false)
+        .default_open(kind == EntryKind::Requirement)
         .open(display.force_open)
         .show(ui, |ui| {
             for leaf in matching {
@@ -3341,11 +3593,10 @@ fn count_kind_recursive(node: &TreeNode, kind: EntryKind) -> usize {
         .sum()
 }
 
-/// Renders a requirement or test leaf — never a result: a result's own
-/// row is `render_result_leaf` instead, since its identity needs its
-/// owning requirement's name alongside `module_path`, which a bare
-/// `TreeNode`/`module_path` pair can't express (see `EntryPath`/
-/// `ResultPath`).
+/// Renders a requirement or test leaf. Results are never shown in this
+/// tree — they're nested under their owning requirement in the data model
+/// (see `disk::RequirementOnDisk::results`), but surfaced only in the
+/// requirement's own detail panel, not as tree rows.
 fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path: &[EntryName]) {
     // Both arms need to end up the same type for the one shared
     // `selectable_label` call below — `Atoms` is that common type (a
@@ -3422,42 +3673,6 @@ fn render_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, module_path
                 ui.close();
             }
         });
-    }
-    // A requirement's results are nested under it now (on disk and in the
-    // tree — see `disk::RequirementOnDisk::results`), rendered as an
-    // indented sub-list rather than their own flat "results" group.
-    if node.kind == EntryKind::Requirement && !node.children.is_empty() {
-        ui.indent((module_path, &node.name, "results"), |ui| {
-            for result_node in &node.children {
-                render_result_leaf(app, ui, result_node, &target);
-            }
-        });
-    }
-}
-
-/// A result's own row, nested under its owning requirement
-/// (`requirement`) — see `render_leaf`'s own doc comment on why this isn't
-/// just another `render_leaf` call.
-fn render_result_leaf(app: &mut GuiApp, ui: &mut egui::Ui, node: &TreeNode, requirement: &LogicalPath) {
-    let is_open = matches!(
-        &app.selection,
-        Some(gui_core::EntryPath::Result(p)) if &p.requirement == requirement && p.name == node.name
-    );
-    let mut name_text = egui::RichText::new(node.name.as_str());
-    if is_open {
-        name_text = name_text.color(theme_colors::module_current_color(ui.visuals().dark_mode));
-    }
-    let response = ui.selectable_label(false, name_text);
-    if response.clicked() {
-        let target = gui_core::EntryPath::Result(gui_core::ResultPath {
-            requirement: requirement.clone(),
-            name: node.name.clone(),
-        });
-        if app.editor_has_unsaved_edits() {
-            app.unsaved_form_dialog_opened(PendingNavigation::Select(target));
-        } else {
-            app.select(target);
-        }
     }
 }
 
@@ -3576,7 +3791,8 @@ fn render_dependency_kind_dropdown(ui: &mut egui::Ui, id_source: usize, dep: &mu
         .selected_text(match dep {
             DependencyDraft::LocalRequirement { .. } => "Local",
             DependencyDraft::Remote { .. } => "Remote",
-            DependencyDraft::Submodules => "Submodules",
+            DependencyDraft::Submodules => "All submodules",
+            DependencyDraft::Submodule { .. } => "Submodule",
         })
         .show_ui(ui, |ui| {
             if ui
@@ -3603,11 +3819,21 @@ fn render_dependency_kind_dropdown(ui: &mut egui::Ui, id_source: usize, dep: &mu
                 changed = true;
             }
             if ui
-                .selectable_label(matches!(dep, DependencyDraft::Submodules), "Submodules")
+                .selectable_label(matches!(dep, DependencyDraft::Submodules), "All submodules")
                 .clicked()
                 && !matches!(dep, DependencyDraft::Submodules)
             {
                 *dep = DependencyDraft::Submodules;
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(dep, DependencyDraft::Submodule { .. }), "Submodule")
+                .clicked()
+                && !matches!(dep, DependencyDraft::Submodule { .. })
+            {
+                *dep = DependencyDraft::Submodule {
+                    name: String::new(),
+                };
                 changed = true;
             }
         });
@@ -3640,10 +3866,19 @@ fn render_dependency_kind_picker(ui: &mut egui::Ui, dep: &mut DependencyDraft) -
         return true;
     }
     if ui
-        .radio(matches!(dep, DependencyDraft::Submodules), "Submodules")
+        .radio(matches!(dep, DependencyDraft::Submodules), "All submodules")
         .clicked()
     {
         *dep = DependencyDraft::Submodules;
+        return true;
+    }
+    if ui
+        .radio(matches!(dep, DependencyDraft::Submodule { .. }), "Submodule")
+        .clicked()
+    {
+        *dep = DependencyDraft::Submodule {
+            name: String::new(),
+        };
         return true;
     }
     false
@@ -3678,6 +3913,7 @@ fn render_dependency_fields(
     ui: &mut egui::Ui,
     dep: &mut DependencyDraft,
     tree: Option<&TreeSnapshot>,
+    current_module: &[EntryName],
 ) -> (bool, Option<AutoCommitKind>, bool) {
     match dep {
         DependencyDraft::LocalRequirement { path, commit } => {
@@ -3733,6 +3969,41 @@ fn render_dependency_fields(
             (changed, auto, false)
         }
         DependencyDraft::Submodules => (false, None, false),
+        DependencyDraft::Submodule { name } => {
+            let mut changed = false;
+            let submodules = tree
+                .map(|tree| direct_submodule_names(tree, current_module))
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.label("Submodule:");
+                if submodules.is_empty() {
+                    // No tree loaded yet, or this module has no
+                    // submodules — fall back to a hand-typed field rather
+                    // than an empty, unusable dropdown (same graceful
+                    // degrade `LocalRequirement`'s "Pick…" button follows
+                    // when `tree` is `None`).
+                    changed |= ui.text_edit_singleline(name).changed();
+                } else {
+                    egui::ComboBox::new("submodule_dependency_name", "")
+                        .selected_text(if name.is_empty() {
+                            "(choose a submodule)"
+                        } else {
+                            name.as_str()
+                        })
+                        .show_ui(ui, |ui| {
+                            for candidate in &submodules {
+                                if ui.selectable_label(name == candidate, candidate).clicked()
+                                    && name != candidate
+                                {
+                                    *name = candidate.clone();
+                                    changed = true;
+                                }
+                            }
+                        });
+                }
+            });
+            (changed, None, false)
+        }
     }
 }
 
@@ -3883,6 +4154,8 @@ mod test {
             name: name(name_str),
             kind,
             status: EntryStatus::Unvalidated,
+            requirement_count: 0,
+            requirements_met: 0,
             children: Vec::new(),
         }
     }
@@ -3892,6 +4165,8 @@ mod test {
             name: name(name_str),
             kind: EntryKind::Module,
             status: EntryStatus::Unvalidated,
+            requirement_count: 0,
+            requirements_met: 0,
             children,
         }
     }
@@ -3931,6 +4206,7 @@ mod test {
             ),
             can_undo: false,
             can_redo: false,
+            validated: false,
         };
 
         let requirements = flatten_leaf_paths(&tree, EntryKind::Requirement);
@@ -3950,6 +4226,7 @@ mod test {
             ),
             can_undo: false,
             can_redo: false,
+            validated: false,
         };
 
         let requirements = flatten_leaf_paths(&tree, EntryKind::Requirement);
@@ -3975,6 +4252,7 @@ mod test {
             ),
             can_undo: false,
             can_redo: false,
+            validated: false,
         };
 
         assert_eq!(flatten_leaf_paths(&tree, EntryKind::Test), Vec::new());
@@ -4002,6 +4280,7 @@ mod test {
             ),
             can_undo: false,
             can_redo: false,
+            validated: false,
         };
 
         let requirements = flatten_leaf_paths(&tree, EntryKind::Requirement);
@@ -4016,6 +4295,181 @@ mod test {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn scoped_leaf_paths_with_all_scope_matches_flatten_leaf_paths() {
+        let tree = TreeSnapshot {
+            root: module(
+                "Capstone",
+                vec![
+                    module("setup", vec![leaf(EntryKind::Requirement, "nested")]),
+                    leaf(EntryKind::Requirement, "root_level"),
+                ],
+            ),
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        };
+
+        assert_eq!(
+            scoped_leaf_paths(&tree, EntryKind::Requirement, PathPickerScope::All, &[]),
+            flatten_leaf_paths(&tree, EntryKind::Requirement)
+        );
+    }
+
+    #[test]
+    fn scoped_leaf_paths_this_module_excludes_the_parent_and_submodules() {
+        let tree = TreeSnapshot {
+            root: module(
+                "Capstone",
+                vec![
+                    module(
+                        "setup",
+                        vec![
+                            leaf(EntryKind::Requirement, "direct"),
+                            module("deeper", vec![leaf(EntryKind::Requirement, "nested")]),
+                        ],
+                    ),
+                    leaf(EntryKind::Requirement, "root_level"),
+                ],
+            ),
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        };
+
+        let requirements = scoped_leaf_paths(
+            &tree,
+            EntryKind::Requirement,
+            PathPickerScope::ThisModule,
+            &[name("setup")],
+        );
+
+        assert_eq!(
+            requirements,
+            vec![LogicalPath {
+                modules: vec![name("setup")],
+                name: name("direct"),
+            }]
+        );
+    }
+
+    #[test]
+    fn scoped_leaf_paths_submodules_excludes_the_module_itself_and_unrelated_modules() {
+        let tree = TreeSnapshot {
+            root: module(
+                "Capstone",
+                vec![
+                    module(
+                        "setup",
+                        vec![
+                            leaf(EntryKind::Requirement, "direct"),
+                            module("deeper", vec![leaf(EntryKind::Requirement, "nested")]),
+                        ],
+                    ),
+                    leaf(EntryKind::Requirement, "root_level"),
+                ],
+            ),
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        };
+
+        let requirements = scoped_leaf_paths(
+            &tree,
+            EntryKind::Requirement,
+            PathPickerScope::Submodules,
+            &[name("setup")],
+        );
+
+        assert_eq!(
+            requirements,
+            vec![LogicalPath {
+                modules: vec![name("setup"), name("deeper")],
+                name: name("nested"),
+            }]
+        );
+    }
+
+    #[test]
+    fn scoped_leaf_paths_with_an_empty_owning_module_treats_this_module_as_the_project_root() {
+        let tree = TreeSnapshot {
+            root: module(
+                "Capstone",
+                vec![
+                    module("setup", vec![leaf(EntryKind::Requirement, "nested")]),
+                    leaf(EntryKind::Requirement, "root_level"),
+                ],
+            ),
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        };
+
+        assert_eq!(
+            scoped_leaf_paths(&tree, EntryKind::Requirement, PathPickerScope::ThisModule, &[]),
+            vec![LogicalPath::root(name("root_level"))]
+        );
+        assert_eq!(
+            scoped_leaf_paths(&tree, EntryKind::Requirement, PathPickerScope::Submodules, &[]),
+            vec![LogicalPath {
+                modules: vec![name("setup")],
+                name: name("nested"),
+            }]
+        );
+    }
+
+    #[test]
+    fn direct_submodule_names_lists_only_module_children_of_the_project_root() {
+        let tree = TreeSnapshot {
+            root: module(
+                "Capstone",
+                vec![
+                    module("alpha", Vec::new()),
+                    module("beta", Vec::new()),
+                    leaf(EntryKind::Requirement, "root_level"),
+                ],
+            ),
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        };
+
+        assert_eq!(
+            direct_submodule_names(&tree, &[]),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn direct_submodule_names_walks_down_to_a_nested_module() {
+        let tree = TreeSnapshot {
+            root: module(
+                "Capstone",
+                vec![module("setup", vec![module("nested", Vec::new())])],
+            ),
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        };
+
+        assert_eq!(
+            direct_submodule_names(&tree, &[name("setup")]),
+            vec!["nested".to_string()]
+        );
+    }
+
+    #[test]
+    fn direct_submodule_names_is_empty_for_an_unknown_module_path() {
+        let tree = TreeSnapshot {
+            root: module("Capstone", vec![module("alpha", Vec::new())]),
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        };
+
+        assert!(direct_submodule_names(&tree, &[name("nonexistent")]).is_empty());
     }
 
     #[test]

@@ -174,6 +174,32 @@ mod test {
     }
 
     #[test]
+    fn round_trips_a_named_submodule_dependency() -> Result<(), Box<dyn std::error::Error>> {
+        let mut requirement = minimal_requirement();
+        requirement.definition.dependency = Some(
+            crate::requirement::types::DependencyReferenceKind::SubmoduleV1(
+                crate::util::EntryName("alpha".to_string()),
+            ),
+        );
+
+        let tempdir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-submodule-dependency-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        save_requirement_stage(&StdFilesystem, &tempdir, &requirement)?;
+        let reloaded = load_requirement_stage(&StdFilesystem, &FixedGit, &tempdir)?;
+
+        assert!(matches!(
+            reloaded.definition.dependency,
+            Some(crate::requirement::types::DependencyReferenceKind::SubmoduleV1(name)) if name.as_str() == "alpha"
+        ));
+
+        std::fs::remove_dir_all(&tempdir).ok();
+        Ok(())
+    }
+
+    #[test]
     fn reports_io_errors_saving_requirement_ron() {
         use syscalls::FaultInjectingFilesystem;
 

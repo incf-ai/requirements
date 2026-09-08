@@ -111,6 +111,10 @@ pub enum DependencyReferenceKind {
     RequirementReferenceV1(LocalGitReference),
     RemoteReferenceV1(RemoteGitReference),
     Submodules,
+    /// A single direct child submodule of this requirement's own module —
+    /// unlike the bare `Submodules` variant (which means "all of them"),
+    /// this names one specific submodule by its own directory name.
+    SubmoduleV1(EntryName),
 }
 
 /// A fully loaded `requirements/<stage>/` folder: the parsed `requirement.ron`

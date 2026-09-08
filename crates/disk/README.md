@@ -123,6 +123,9 @@ written.
       — a stage in a *different* git repository.
     - the bare `Submodules` variant, meaning "depends on all submodules
       being complete" rather than one specific requirement.
+    - `DependencyReferenceKind::SubmoduleV1(EntryName)` — depends on one
+      specific direct child submodule (by its own directory name) of this
+      requirement's own module being complete, rather than all of them.
   - `LocalGitReference { path: ReferencePath, commit: String }` —
     **path convention**: a leading `/` means the path is relative to the
     *project root*; no leading slash means relative to the *current

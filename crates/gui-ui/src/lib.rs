@@ -144,6 +144,12 @@ pub struct GuiApp {
     /// than one of these in flight to track. See
     /// `refresh_open_requirement_met_status`.
     met_status_request: Option<RequestId>,
+    /// The result-level counterpart to `met_status_request` — which
+    /// `GetResultReferenceIsStale` request is refreshing the open result
+    /// form's `stale` field after a `Validate` completed. Same stale-reply
+    /// guard and "only one can be open at a time" reasoning. See
+    /// `refresh_open_result_stale_status`.
+    result_stale_request: Option<RequestId>,
     /// The "Attachments…" modal — `Some` while it's open, for the module
     /// it was opened against (see `new_entry_module_path`, the same
     /// "current module" notion the create forms use).
@@ -194,6 +200,12 @@ pub struct GuiApp {
     /// Which `GetDiff` request `diff_dialog` is waiting on — same
     /// stale-reply guard shape as `changed_files_request`.
     diff_request: Option<RequestId>,
+    /// The "Push" modal — `Some` while it's open. See `PushDialogState`'s
+    /// own doc comment.
+    push_dialog: Option<PushDialogState>,
+    /// Which `Push` request `push_dialog` is waiting on — same stale-reply
+    /// guard shape as `commit_all_request`.
+    push_request: Option<RequestId>,
     /// The tree's right-click Copy/Paste "clipboard" for requirements —
     /// `(the source's own name, its full content)`, `None` until a Copy
     /// has actually completed. Purely local to `gui-ui`: nothing is sent
@@ -774,6 +786,19 @@ pub struct DiffDialogState {
     pub error: Option<String>,
 }
 
+/// The "Push" confirm/status modal — opened in a confirm state (nothing
+/// sent to `gui-core` yet) by the toolbar button; only actually pushes
+/// once the user clicks "Push" inside it, since unlike Save/Commit this
+/// reaches a shared remote. `output`/`error` are mutually exclusive, both
+/// `None` until the push completes, and neither is cleared back to `None`
+/// on Close — the dialog is simply dropped and rebuilt fresh next click.
+#[derive(Debug, Default)]
+pub struct PushDialogState {
+    pub pushing: bool,
+    pub output: Option<String>,
+    pub error: Option<String>,
+}
+
 /// The path-picker modal's state — open (`Some`) for exactly as long as
 /// it's showing. Replaces what used to be a per-field `egui::ComboBox`
 /// (one each for the Result form's `requirement_path`/`test_path`, and the
@@ -791,6 +816,25 @@ pub struct PathPickerDialogState {
     pub kind: EntryKind,
     pub target: PathPickerTarget,
     pub filter: String,
+    pub scope: PathPickerScope,
+    /// The module path of the requirement this picker was opened for —
+    /// `ThisModule`/`Submodules` filter relative to this. Only meaningful
+    /// for `Dependency`/`TestReference` targets, the only ones that show
+    /// the scope radios; left empty for the Result form's targets, which
+    /// have no owning module of their own.
+    pub owning_module: Vec<EntryName>,
+}
+
+/// How far `render_path_picker_dialog`'s list is narrowed relative to
+/// `PathPickerDialogState::owning_module` — see that field's own doc
+/// comment. Only ever set away from `All` for the `Dependency`/
+/// `TestReference` targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathPickerScope {
+    #[default]
+    All,
+    ThisModule,
+    Submodules,
 }
 
 /// What a given in-flight `RequestId` corresponds to in the UI, so its
@@ -833,6 +877,7 @@ impl GuiApp {
             new_project_dialog: None,
             detail_request: None,
             met_status_request: None,
+            result_stale_request: None,
             attachments_dialog: None,
             pools_request: None,
             sidebar_pools: None,
@@ -845,6 +890,8 @@ impl GuiApp {
             commit_all_request: None,
             diff_dialog: None,
             diff_request: None,
+            push_dialog: None,
+            push_request: None,
             requirement_clipboard: None,
             copy_requirement_request: None,
             paste_requirement_request: None,
@@ -991,6 +1038,7 @@ impl GuiApp {
             // comment on why that's safe even mid-edit.
             Outcome::Validate(result) => {
                 self.refresh_open_requirement_met_status();
+                self.refresh_open_result_stale_status();
                 self.refresh_open_module_summary();
                 // If this is the validation `validate_before_save_dialog`
                 // itself kicked off (not a plain toolbar "Validate"
@@ -1075,6 +1123,9 @@ impl GuiApp {
                 }
             }
             Outcome::UpdateResult(result) => self.apply_update_result(request, result),
+            Outcome::RefreshStaleResultReference(result) => {
+                self.apply_refresh_stale_result_reference_result(request, result)
+            }
             Outcome::AddModule(result) => self.apply_create_result(request, result),
             Outcome::RemoveRequirement(removed) => {
                 let is_recreate_pending = matches!(&self.recreate_requirement_dialog, Some(d) if d.pending_request == Some(request) && !d.deleted);
@@ -1227,6 +1278,14 @@ impl GuiApp {
                     form.met_status = status;
                 }
             }
+            // Same stale-reply guard and "re-check `self.editor` at apply
+            // time" nuance as `RequirementMetStatus` above.
+            Outcome::ResultReferenceIsStale(stale) if self.result_stale_request == Some(request) => {
+                self.result_stale_request = None;
+                if let EditorState::NewResult(form) = &mut self.editor {
+                    form.stale = stale;
+                }
+            }
             Outcome::ModulePools(pools) if self.pools_request == Some(request) => {
                 self.apply_module_pools(pools);
             }
@@ -1244,6 +1303,9 @@ impl GuiApp {
             }
             Outcome::CommitAll(result) if self.commit_all_request == Some(request) => {
                 self.apply_commit_all_result(result.map_err(|e| e.to_string()));
+            }
+            Outcome::Push(result) if self.push_request == Some(request) => {
+                self.apply_push_result(result.map_err(|e| e.to_string()));
             }
             Outcome::GetDiff(result) if self.diff_request == Some(request) => {
                 self.apply_diff_result(result.map_err(|e| e.to_string()));
@@ -1597,6 +1659,24 @@ impl GuiApp {
         self.send_command(Command::GetRequirementMetStatus { target, request });
     }
 
+    /// The result-level counterpart to `refresh_open_requirement_met_status`
+    /// — re-fetches just the currently-open result's `stale` field after a
+    /// `Validate` completes. A no-op if nothing's open, or what's open
+    /// isn't a result. Same "narrower than a full `GetEntryDetail`, so it
+    /// can't clobber the rest of the form" reasoning.
+    fn refresh_open_result_stale_status(&mut self) {
+        let EditorState::NewResult(form) = &self.editor else {
+            return;
+        };
+        let Some(target) = form.editing_target.clone() else {
+            return;
+        };
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        self.result_stale_request = Some(request);
+        self.send_command(Command::GetResultReferenceIsStale { target, request });
+    }
+
     /// The module/project page's counterpart to
     /// `refresh_open_requirement_met_status` — a `Validate` can change the
     /// met/unmet and pass/fail/incomplete counts an open page's `summary`
@@ -1639,6 +1719,29 @@ impl GuiApp {
             form.error = None;
         }
         self.send_command(Command::RefreshStaleTestReferences { target, request });
+    }
+
+    /// The Result viewer's "Update Stale Reference" button (`form.stale`
+    /// gates whether it's even shown) — the result-level counterpart to
+    /// `refresh_stale_test_references_clicked`, same "reuse `pending_
+    /// request`/`error`, only ever shown in the read-only viewer" reasoning.
+    fn refresh_stale_result_reference_clicked(&mut self) {
+        let target = {
+            let EditorState::NewResult(form) = &self.editor else {
+                return;
+            };
+            let Some(target) = form.editing_target.clone() else {
+                return;
+            };
+            target
+        };
+        let request = self.next_request_id();
+        self.pending.insert(request, PendingKind::Generic);
+        if let EditorState::NewResult(form) = &mut self.editor {
+            form.pending_request = Some(request);
+            form.error = None;
+        }
+        self.send_command(Command::RefreshStaleResultReference { target, request });
     }
 
     fn undo_clicked(&mut self) {
@@ -2162,7 +2265,8 @@ impl GuiApp {
             return;
         }
         let tests = form.tests.clone();
-        let name = default_result_name(&today_iso_date(), &target.name, &tests[0]);
+        let name = default_result_name(&today_iso_date(), &tests[0]);
+        let title = title_case_from_name(&name);
         self.create_result_dialog = Some(CreateResultDialogState {
             requirement: target.clone(),
             requirement_commit: String::new(),
@@ -2171,7 +2275,7 @@ impl GuiApp {
             test_index: 0,
             test_commit: String::new(),
             test_commit_pending: None,
-            title: name.clone(),
+            title,
             name,
             regenerate_title: true,
             status: gui_core::StatusV1::default(),
@@ -2292,12 +2396,9 @@ impl GuiApp {
             return;
         };
         // Same "regenerate at confirm time, not live" shape as
-        // `duplicate_requirement_confirmed`'s own `regenerate_title` — the
-        // identifier here is already presented as a sensible title in its
-        // own right, so this is a plain copy rather than a `title_case_
-        // from_name`-style transform.
+        // `duplicate_requirement_confirmed`'s own `regenerate_title`.
         let title = if dialog.regenerate_title {
-            name.clone()
+            title_case_from_name(&name)
         } else {
             dialog.title.trim().to_string()
         };
@@ -2372,10 +2473,25 @@ impl GuiApp {
     /// reopening for a different field shouldn't carry over whatever was
     /// typed into a previous, unrelated search.
     fn path_picker_dialog_opened(&mut self, target: PathPickerTarget) {
+        let owning_module = match target {
+            PathPickerTarget::Dependency(_) | PathPickerTarget::TestReference(_) => {
+                match &self.editor {
+                    EditorState::NewRequirement(form) => form
+                        .editing_target
+                        .as_ref()
+                        .map(|t| t.modules.clone())
+                        .unwrap_or_else(|| self.new_entry_module_path()),
+                    _ => Vec::new(),
+                }
+            }
+            PathPickerTarget::ResultRequirementPath | PathPickerTarget::ResultTestPath => Vec::new(),
+        };
         self.path_picker_dialog = Some(PathPickerDialogState {
             kind: target.kind(),
             target,
             filter: String::new(),
+            scope: PathPickerScope::default(),
+            owning_module,
         });
     }
 
@@ -2603,6 +2719,7 @@ impl GuiApp {
                 test_path,
                 test_commit,
                 attachments,
+                stale,
                 original,
             })) => EditorState::NewResult(ResultFormState {
                 name: target.name.as_str().to_string(),
@@ -2611,6 +2728,7 @@ impl GuiApp {
                 requirement_commit,
                 test_path,
                 test_commit,
+                stale,
                 status: original.status.clone(),
                 original,
                 editing_target: Some(target),
@@ -2770,6 +2888,45 @@ impl GuiApp {
                 dialog.committing = false;
                 dialog.error = Some(message);
             }
+        }
+    }
+
+    /// Opens the "Push" modal in its confirm state — sends nothing to
+    /// `gui-core` yet, since pushing reaches a shared remote and needs an
+    /// explicit second click inside the modal (see `PushDialogState`'s doc
+    /// comment).
+    fn push_button_clicked(&mut self) {
+        self.push_dialog = Some(PushDialogState::default());
+    }
+
+    fn push_dialog_closed(&mut self) {
+        self.push_dialog = None;
+    }
+
+    fn push_dialog_push_clicked(&mut self) {
+        let Some(dialog) = &mut self.push_dialog else {
+            return;
+        };
+        dialog.pushing = true;
+        dialog.error = None;
+        let request = self.next_request_id();
+        self.push_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::Push { request });
+    }
+
+    /// Leaves the dialog open either way, showing the push output on success
+    /// or the error on failure (with the "Push" button still available to
+    /// retry), rather than auto-closing on success like "Commit all changes"
+    /// does — the whole point here is showing the user push's status/output.
+    fn apply_push_result(&mut self, result: Result<String, String>) {
+        let Some(dialog) = &mut self.push_dialog else {
+            return;
+        };
+        dialog.pushing = false;
+        match result {
+            Ok(output) => dialog.output = Some(output),
+            Err(message) => dialog.error = Some(message),
         }
     }
 
@@ -3086,6 +3243,7 @@ impl GuiApp {
                     DependencyDraft::LocalRequirement { commit: field, .. } => *field = commit,
                     DependencyDraft::Remote { commit: field, .. } => *field = commit,
                     DependencyDraft::Submodules => {}
+                    DependencyDraft::Submodule { .. } => {}
                 }
                 // Only an already-added row is part of the form's real,
                 // submitted content — same distinction the "Add
@@ -4372,6 +4530,47 @@ impl GuiApp {
         });
     }
 
+    /// Applies a `RefreshStaleResultReference` reply — the result-level
+    /// counterpart to `apply_refresh_stale_test_references_result`, same
+    /// "stale-reply guard, always safe to re-fetch, `gui-core` already
+    /// revalidated" reasoning.
+    fn apply_refresh_stale_result_reference_result(
+        &mut self,
+        request: RequestId,
+        result: Result<(), gui_core::RefreshStaleTestReferencesError>,
+    ) {
+        let target = {
+            let EditorState::NewResult(form) = &mut self.editor else {
+                return;
+            };
+            if form.pending_request != Some(request) {
+                return;
+            }
+            form.pending_request = None;
+            match result {
+                Ok(()) => {
+                    form.error = None;
+                    form.editing_target.clone()
+                }
+                Err(err) => {
+                    form.error = Some(err.to_string());
+                    None
+                }
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.dirty = true;
+        let detail_request = self.next_request_id();
+        self.pending.insert(detail_request, PendingKind::Generic);
+        self.detail_request = Some(detail_request);
+        self.send_command(Command::GetEntryDetail {
+            target: EntryPath::Result(target),
+            request: detail_request,
+        });
+    }
+
     /// The Exit button / File -> Exit / window close handler. See
     /// README's "Exit" section, "Stage 1: prompt to save, bounded so it
     /// cannot hang."
@@ -4557,6 +4756,7 @@ impl eframe::App for GuiApp {
         self.render_attachments_dialog(ui);
         self.render_commit_all_dialog(ui);
         self.render_diff_dialog(ui);
+        self.render_push_dialog(ui);
         self.render_path_picker_dialog(ui);
         self.render_exit_dialog(ui);
         #[cfg(all(feature = "debug-panel", debug_assertions))]
@@ -4587,6 +4787,55 @@ pub(crate) fn flatten_leaf_paths(tree: &TreeSnapshot, kind: EntryKind) -> Vec<Lo
     // already produced.
     out.sort_by_key(|target| target.modules.len());
     out
+}
+
+/// Narrows `flatten_leaf_paths`'s full-tree list to `scope`, relative to
+/// `owning_module` (the requirement the picker was opened for — see
+/// `PathPickerDialogState::owning_module`). `ThisModule` matches only items
+/// whose module path is exactly `owning_module`; `Submodules` matches items
+/// nested at any depth strictly below it.
+pub(crate) fn scoped_leaf_paths(
+    tree: &TreeSnapshot,
+    kind: EntryKind,
+    scope: PathPickerScope,
+    owning_module: &[EntryName],
+) -> Vec<LogicalPath> {
+    flatten_leaf_paths(tree, kind)
+        .into_iter()
+        .filter(|target| match scope {
+            PathPickerScope::All => true,
+            PathPickerScope::ThisModule => target.modules == owning_module,
+            PathPickerScope::Submodules => {
+                target.modules.len() > owning_module.len()
+                    && target.modules[..owning_module.len()] == *owning_module
+            }
+        })
+        .collect()
+}
+
+/// Direct child submodule names of the module at `module_path`, in tree
+/// order — sourced for the `SubmoduleV1` dependency's name picker, which
+/// (unlike `LocalRequirement`'s project-wide path picker) only ever offers
+/// one specific module's own immediate children, matching
+/// `DependencyReferenceKind::SubmoduleV1`'s scope. Empty if `module_path`
+/// doesn't resolve or the module has no submodules.
+pub(crate) fn direct_submodule_names(tree: &TreeSnapshot, module_path: &[EntryName]) -> Vec<String> {
+    let mut node = &tree.root;
+    for name in module_path {
+        match node
+            .children
+            .iter()
+            .find(|child| child.kind == EntryKind::Module && &child.name == name)
+        {
+            Some(child) => node = child,
+            None => return Vec::new(),
+        }
+    }
+    node.children
+        .iter()
+        .filter(|child| child.kind == EntryKind::Module)
+        .map(|child| child.name.as_str().to_string())
+        .collect()
 }
 
 fn collect_leaf_paths(
@@ -4648,15 +4897,13 @@ fn module_display_name(tree: Option<&TreeSnapshot>, path: &[EntryName]) -> Strin
 }
 
 /// The Create Result dialog's own identifier prefill (see
-/// `GuiApp::create_result_clicked`) — `<today's date> [<requirement's own
-/// name>] [<test's own name>]`, e.g. `2026-01-31 [vscode] [demonstration]`.
-/// `test_ref.path` is a reference-path string (`/tests/smoke`, or a nested
-/// `/modules/.../tests/smoke`), so only its last `/`-separated segment (the
-/// test's own leaf name) is used, matching `requirement_name`'s already-bare
-/// `EntryName`.
-fn default_result_name(today: &str, requirement_name: &EntryName, test_ref: &TestRefDraft) -> String {
+/// `GuiApp::create_result_clicked`) — `<today's date> <test's own name>`,
+/// e.g. `2026-01-31 demonstration`. `test_ref.path` is a reference-path
+/// string (`/tests/smoke`, or a nested `/modules/.../tests/smoke`), so only
+/// its last `/`-separated segment (the test's own leaf name) is used.
+fn default_result_name(today: &str, test_ref: &TestRefDraft) -> String {
     let test_name = test_ref.path.rsplit('/').next().unwrap_or(&test_ref.path);
-    format!("{today} [{}] [{test_name}]", requirement_name.as_str())
+    format!("{today} {test_name}")
 }
 
 /// Today's UTC calendar date as `YYYY-MM-DD`, zero-padded — used only for
@@ -4966,10 +5213,13 @@ mod test {
                 name: disk_entry_name("Project"),
                 kind: EntryKind::Module,
                 status: gui_core::EntryStatus::Unvalidated,
+                requirement_count: 0,
+                requirements_met: 0,
                 children: Vec::new(),
             },
             can_undo: false,
             can_redo: false,
+            validated: false,
         };
         app.apply_event(Event::TreeChanged(snapshot));
 
@@ -5496,6 +5746,8 @@ mod test {
             name: disk_entry_name(name),
             kind: EntryKind::Requirement,
             status: gui_core::EntryStatus::Unvalidated,
+            requirement_count: 0,
+            requirements_met: 0,
             children: Vec::new(),
         }
     }
@@ -5505,6 +5757,8 @@ mod test {
             name: disk_entry_name(name),
             kind: EntryKind::Module,
             status: gui_core::EntryStatus::Unvalidated,
+            requirement_count: 0,
+            requirements_met: 0,
             children,
         }
     }
@@ -5607,6 +5861,7 @@ mod test {
             root: module_tree_node("Project", Vec::new()),
             can_undo: false,
             can_redo: false,
+            validated: false,
         }));
 
         // `TreeChanged` itself always fires a sidebar-pools fetch for the
@@ -5628,6 +5883,7 @@ mod test {
             root: module_tree_node("Project", Vec::new()),
             can_undo: false,
             can_redo: false,
+            validated: false,
         }));
 
         let pending_before = app.pending.len();
@@ -5648,6 +5904,7 @@ mod test {
             ),
             can_undo: false,
             can_redo: false,
+            validated: false,
         }));
 
         app.paste_requirement_clicked(vec![disk_entry_name("sub")]);
@@ -5689,6 +5946,7 @@ mod test {
             root: module_tree_node("Project", vec![requirement_tree_node("definition")]),
             can_undo: false,
             can_redo: false,
+            validated: false,
         }));
         let pending_before = app.pending.len();
 
@@ -5717,6 +5975,7 @@ mod test {
             root: module_tree_node("Project", vec![requirement_tree_node("definition")]),
             can_undo: false,
             can_redo: false,
+            validated: false,
         }));
 
         app.duplicate_requirement_clicked(LogicalPath::root(disk_entry_name("definition")));
@@ -6592,10 +6851,13 @@ mod test {
                 name: disk_entry_name("Capstone"),
                 kind: EntryKind::Module,
                 status: gui_core::EntryStatus::Unvalidated,
+                requirement_count: 0,
+                requirements_met: 0,
                 children: Vec::new(),
             },
             can_undo: false,
             can_redo: false,
+            validated: false,
         }));
 
         let EditorState::ExistingModule(form) = &app.editor else {
@@ -6907,6 +7169,43 @@ mod test {
         complete_smoke_test_detail(&mut app);
         app.editor_edit_clicked();
         complete_smoke_test_detail(&mut app);
+        app
+    }
+
+    fn complete_design_result_detail(app: &mut GuiApp) {
+        let request = app.detail_request.unwrap();
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::EntryDetail(Some(gui_core::EntryDetail::Result {
+                title: "Design".to_string(),
+                requirement: LogicalPath::root(disk_entry_name("design")),
+                requirement_commit: "c1".to_string(),
+                test_path: "/tests/smoke".to_string(),
+                test_commit: "t1".to_string(),
+                attachments: Vec::new(),
+                stale: false,
+                original: Box::new(gui_core::ResultDraft::new(
+                    "Design",
+                    "c1",
+                    gui_core::ReferencePath("/tests/smoke".to_string()),
+                    "t1",
+                )),
+            })),
+        });
+    }
+
+    /// Result-form analogue of `app_editing_a_requirement` — same two-step
+    /// round trip, landing on `EditorState::NewResult` with
+    /// `editing_target: Some(_)`, `read_only: false`.
+    fn app_editing_a_result() -> GuiApp {
+        let mut app = test_app();
+        app.select(gui_core::EntryPath::Result(gui_core::ResultPath {
+            requirement: LogicalPath::root(disk_entry_name("design")),
+            name: disk_entry_name("design"),
+        }));
+        complete_design_result_detail(&mut app);
+        app.editor_edit_clicked();
+        complete_design_result_detail(&mut app);
         app
     }
 
@@ -7332,6 +7631,79 @@ mod test {
     }
 
     #[test]
+    fn push_button_clicked_opens_the_dialog_in_a_confirm_state() {
+        let mut app = test_app();
+
+        app.push_button_clicked();
+
+        let dialog = app.push_dialog.as_ref().unwrap();
+        assert!(!dialog.pushing);
+        assert!(dialog.output.is_none());
+        assert!(dialog.error.is_none());
+        // Nothing sent to gui-core yet — confirm state only.
+        assert!(app.push_request.is_none());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn push_dialog_closed_clears_the_dialog() {
+        let mut app = test_app();
+        app.push_button_clicked();
+
+        app.push_dialog_closed();
+
+        assert!(app.push_dialog.is_none());
+    }
+
+    #[test]
+    fn push_dialog_push_clicked_sends_push_and_sets_pushing() {
+        let mut app = test_app();
+        app.push_button_clicked();
+
+        app.push_dialog_push_clicked();
+
+        assert!(app.push_dialog.as_ref().unwrap().pushing);
+        assert!(app.push_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn apply_push_result_ok_shows_the_output_and_leaves_the_dialog_open() {
+        let mut app = test_app();
+        app.push_button_clicked();
+        app.push_dialog_push_clicked();
+        let request = app.push_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::Push(Ok("pushed to origin/main".to_string())),
+        });
+
+        let dialog = app.push_dialog.as_ref().unwrap();
+        assert!(!dialog.pushing);
+        assert_eq!(dialog.output.as_deref(), Some("pushed to origin/main"));
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn apply_push_result_err_shows_the_error_and_leaves_the_dialog_open() {
+        let mut app = test_app();
+        app.push_button_clicked();
+        app.push_dialog_push_clicked();
+        let request = app.push_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::Push(Err(gui_core::PushError::NoProjectPath)),
+        });
+
+        let dialog = app.push_dialog.as_ref().unwrap();
+        assert!(!dialog.pushing);
+        assert!(dialog.output.is_none());
+        assert!(dialog.error.is_some());
+    }
+
+    #[test]
     fn a_failed_pool_change_reports_the_error_inline() {
         let mut app = test_app();
         app.attachments_dialog_opened();
@@ -7647,6 +8019,157 @@ mod test {
         app.apply_event(Event::Completed {
             request,
             outcome: Outcome::RefreshStaleTestReferences(Ok(())),
+        });
+
+        // Still closed — the reply didn't resurrect a form the user
+        // already navigated away from.
+        assert!(matches!(app.editor, EditorState::None));
+    }
+
+    #[test]
+    fn refresh_stale_result_reference_clicked_sends_the_command_and_tracks_it_as_pending() {
+        let mut app = app_editing_a_result();
+
+        app.refresh_stale_result_reference_clicked();
+
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.pending_request.is_some());
+        assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn refresh_stale_result_reference_clicked_does_nothing_for_a_creation_mode_form() {
+        let mut app = test_app();
+        app.new_result_clicked();
+
+        app.refresh_stale_result_reference_clicked();
+
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        // No `editing_target` — nothing to send a command against.
+        assert!(form.pending_request.is_none());
+    }
+
+    #[test]
+    fn a_successful_result_refresh_marks_dirty_and_refetches_entry_detail() {
+        let mut app = app_editing_a_result();
+        app.refresh_stale_result_reference_clicked();
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = form.pending_request.unwrap();
+        assert!(!app.dirty);
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RefreshStaleResultReference(Ok(())),
+        });
+
+        assert!(app.dirty);
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.pending_request.is_none());
+        assert!(form.error.is_none());
+        // Re-fetches the full detail — same "always re-fetch rather than
+        // trust stale local state" convention `select_from_history` uses.
+        assert!(app.detail_request.is_some());
+    }
+
+    #[test]
+    fn a_failed_result_refresh_shows_the_error_and_does_not_refetch() {
+        let mut app = app_editing_a_result();
+        app.refresh_stale_result_reference_clicked();
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = form.pending_request.unwrap();
+        let stale_detail_request = app.detail_request;
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RefreshStaleResultReference(Err(
+                gui_core::RefreshStaleTestReferencesError::NotValidated,
+            )),
+        });
+
+        assert!(!app.dirty);
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.pending_request.is_none());
+        assert!(form.error.is_some());
+        // No re-fetch on failure — nothing on disk/in the draft actually
+        // changed.
+        assert_eq!(app.detail_request, stale_detail_request);
+    }
+
+    #[test]
+    fn a_stale_result_refresh_reply_is_ignored_after_the_form_is_closed() {
+        let mut app = app_editing_a_result();
+        app.refresh_stale_result_reference_clicked();
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        let request = form.pending_request.unwrap();
+        app.editor_cancel_clicked();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::RefreshStaleResultReference(Ok(())),
+        });
+
+        // Still closed — the reply didn't resurrect a form the user
+        // already navigated away from.
+        assert!(matches!(app.editor, EditorState::None));
+    }
+
+    #[test]
+    fn validate_completion_refreshes_the_open_results_stale_status() {
+        let mut app = app_editing_a_result();
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(!form.stale);
+
+        app.apply_event(Event::Completed {
+            request: 999,
+            outcome: Outcome::Validate(Ok(())),
+        });
+        let request = app
+            .result_stale_request
+            .expect("Validate should have requested a stale-status refresh");
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::ResultReferenceIsStale(true),
+        });
+
+        let EditorState::NewResult(form) = &app.editor else {
+            unreachable!()
+        };
+        assert!(form.stale);
+        assert!(app.result_stale_request.is_none());
+    }
+
+    #[test]
+    fn a_stale_result_reference_is_stale_reply_is_ignored_after_the_form_is_closed() {
+        let mut app = app_editing_a_result();
+        app.apply_event(Event::Completed {
+            request: 999,
+            outcome: Outcome::Validate(Ok(())),
+        });
+        let request = app
+            .result_stale_request
+            .expect("Validate should have requested a stale-status refresh");
+        app.editor_cancel_clicked();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::ResultReferenceIsStale(true),
         });
 
         // Still closed — the reply didn't resurrect a form the user

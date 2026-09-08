@@ -7,8 +7,8 @@ use syscalls::{Filesystem, Git};
 use crate::LogicalPath;
 use crate::convert::export::export_project;
 use crate::draft::{ModuleDraft, ProjectDraft, ResultDraft};
-use crate::lookup::{get_module, get_requirement, get_test};
-use crate::path::parse_reference_path;
+use crate::lookup::{get_module, get_requirement, get_result, get_test};
+use crate::path::{ResultPath, parse_reference_path};
 
 /// The result of successfully validating a `ProjectDraft` — see
 /// `crates/logical/README.md`'s "Draft vs. validated." Just a wrapper
@@ -212,6 +212,53 @@ impl ValidatedProject {
         )
     }
 
+    /// The commits `result`'s own `requirement_commit`/`test_commit`
+    /// *should* be pinned to right now: its owning requirement's current
+    /// `commit`, and its own `test_path` reference's target test's current
+    /// `commit`. `None` if `result`, its owning requirement, or its test
+    /// reference doesn't resolve, or either side hasn't been saved yet (no
+    /// current commit to refresh to) — same "nothing current to correct
+    /// to" reasoning as `refreshed_test_references`.
+    fn current_result_commits(&self, result: &ResultPath) -> Option<(String, String)> {
+        let req = get_requirement(&self.0.tree, &result.requirement)?;
+        let req_commit = req.commit.as_deref()?;
+        let existing = get_result(&self.0.tree, result)?;
+        let target = parse_reference_path(&existing.test_path, &result.requirement.modules, "tests").ok()?;
+        let test = get_test(&self.0.tree, &target)?;
+        let test_commit = test.commit.as_deref()?;
+        Some((req_commit.to_string(), test_commit.to_string()))
+    }
+
+    /// Whether `result`'s own recorded `requirement_commit`/`test_commit`
+    /// still match `current_result_commits` — the Result viewer's own
+    /// "Update Stale Reference" button gate, the result-level counterpart
+    /// to `requirement_unmet_reason`'s `TestUnmetReason::StaleReference`.
+    /// `false` (not stale) whenever there's no current commit to compare
+    /// against at all — same cases `current_result_commits` returns `None`
+    /// for.
+    pub fn result_reference_is_stale(&self, result: &ResultPath) -> bool {
+        let Some((req_commit, test_commit)) = self.current_result_commits(result) else {
+            return false;
+        };
+        let Some(existing) = get_result(&self.0.tree, result) else {
+            return false;
+        };
+        existing.requirement_commit != req_commit || existing.test_commit != test_commit
+    }
+
+    /// A corrected copy of `result` with `requirement_commit`/`test_commit`
+    /// refreshed to `current_result_commits` — the "Update Stale
+    /// Reference" button's own computation, the result-level counterpart
+    /// to `refreshed_test_references`. `None` under the same conditions
+    /// `current_result_commits` returns `None` for.
+    pub fn refreshed_result(&self, result: &ResultPath) -> Option<ResultDraft> {
+        let (req_commit, test_commit) = self.current_result_commits(result)?;
+        let mut refreshed = get_result(&self.0.tree, result)?.clone();
+        refreshed.requirement_commit = req_commit;
+        refreshed.test_commit = test_commit;
+        Some(refreshed)
+    }
+
     /// The transitive closure of local (`RequirementReferenceV1`)
     /// dependency targets reachable from `requirement`, in DFS-discovery
     /// order, deduplicated. `RemoteReferenceV1` and `Submodules`
@@ -261,6 +308,23 @@ impl ValidatedProject {
             return false;
         };
         self.all_requirements_met_in(root, module)
+    }
+
+    /// Every requirement in the entire (transitive) subtree of one specific
+    /// direct child submodule (`name`) of `requirement`'s own module is
+    /// met — the `SubmoduleV1` counterpart to
+    /// `all_requirements_met_in_subtree`'s bare-`Submodules` evaluation.
+    /// Same query-time-only status: this isn't folded into
+    /// `is_requirement_met`/`requirement_unmet_reason`, matching how the
+    /// bare `Submodules` variant is (and isn't) handled today.
+    pub fn all_requirements_met_in_named_submodule(
+        &self,
+        requirement: &LogicalPath,
+        name: &disk::EntryName,
+    ) -> bool {
+        let mut module = requirement.modules.clone();
+        module.push(name.clone());
+        self.all_requirements_met_in_subtree(&module)
     }
 
     fn all_requirements_met_in(&self, module: &ModuleDraft, prefix: &[disk::EntryName]) -> bool {
@@ -595,6 +659,81 @@ mod test {
         let project = validated(project_with_current_requirement_and_test());
         let unknown = LogicalPath::root(disk::EntryName("nonexistent".to_string()));
         assert!(project.refreshed_test_references(&unknown).is_none());
+    }
+
+    fn result_path() -> ResultPath {
+        ResultPath {
+            requirement: requirement_path(),
+            name: disk::EntryName("definition".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_current_result_is_not_reference_stale() {
+        let mut project = project_with_current_requirement_and_test();
+        add_result_to(&mut project.tree, "definition", "definition", passing_result());
+
+        let project = validated(project);
+        assert!(!project.result_reference_is_stale(&result_path()));
+        let refreshed = project.refreshed_result(&result_path()).unwrap();
+        assert_eq!(refreshed.requirement_commit, "c1");
+        assert_eq!(refreshed.test_commit, "t1");
+    }
+
+    #[test]
+    fn a_result_pinned_to_an_old_requirement_commit_is_reference_stale() {
+        let mut project = project_with_current_requirement_and_test();
+        let mut result = passing_result();
+        result.requirement_commit = "stale".to_string();
+        add_result_to(&mut project.tree, "definition", "definition", result);
+
+        let project = validated(project);
+        assert!(project.result_reference_is_stale(&result_path()));
+        let refreshed = project.refreshed_result(&result_path()).unwrap();
+        assert_eq!(refreshed.requirement_commit, "c1");
+        assert_eq!(refreshed.test_commit, "t1");
+    }
+
+    #[test]
+    fn a_result_pinned_to_an_old_test_commit_is_reference_stale() {
+        let mut project = project_with_current_requirement_and_test();
+        let mut result = passing_result();
+        result.test_commit = "stale".to_string();
+        add_result_to(&mut project.tree, "definition", "definition", result);
+
+        let project = validated(project);
+        assert!(project.result_reference_is_stale(&result_path()));
+        let refreshed = project.refreshed_result(&result_path()).unwrap();
+        assert_eq!(refreshed.requirement_commit, "c1");
+        assert_eq!(refreshed.test_commit, "t1");
+    }
+
+    #[test]
+    fn refreshing_a_result_with_an_unresolvable_test_reference_returns_none() {
+        let mut project = project_with_current_requirement_and_test();
+        let mut result = passing_result();
+        result.test_path = ReferencePath("/tests/nonexistent".to_string());
+        add_result_to(&mut project.tree, "definition", "definition", result);
+
+        // Not calling `validate()` — a result referencing a nonexistent
+        // test is itself a validation error, same "reach a
+        // `ValidatedProject` without a real validate() pass" precedent
+        // `refreshed_test_references_leaves_an_unresolved_reference_unchanged`
+        // documents.
+        let project = ValidatedProject::new(project);
+        assert!(!project.result_reference_is_stale(&result_path()));
+        assert!(project.refreshed_result(&result_path()).is_none());
+    }
+
+    #[test]
+    fn refreshed_result_returns_none_for_an_unknown_result() {
+        let project = validated(project_with_current_requirement_and_test());
+        let unknown = ResultPath {
+            requirement: requirement_path(),
+            name: disk::EntryName("nonexistent".to_string()),
+        };
+        assert!(!project.result_reference_is_stale(&unknown));
+        assert!(project.refreshed_result(&unknown).is_none());
     }
 
     #[test]
@@ -979,6 +1118,55 @@ mod test {
         assert!(
             !project.all_requirements_met_in_subtree(&[disk::EntryName("nonexistent".to_string())])
         );
+    }
+
+    #[test]
+    fn all_requirements_met_in_named_submodule_delegates_to_the_named_child() {
+        let mut project = create_project("Capstone");
+        project.tree.add_module("embeddings").unwrap();
+        let submodule = project
+            .tree
+            .modules
+            .get_mut(&disk::EntryName("embeddings".to_string()))
+            .unwrap();
+        let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
+        requirement.commit = Some("c1".to_string());
+        submodule
+            .add_requirement("definition", requirement)
+            .unwrap();
+        let mut root_requirement_draft = RequirementDraft::new("Root");
+        root_requirement_draft.requirement_text = "Text".to_string();
+        project
+            .tree
+            .add_requirement("root_requirement", root_requirement_draft)
+            .unwrap();
+
+        let project = validated(project);
+        let root_requirement = LogicalPath::root(disk::EntryName("root_requirement".to_string()));
+        // The submodule's own requirement has no tests, so it's not met —
+        // this must reflect that, not `root_requirement`'s own status.
+        assert!(!project.all_requirements_met_in_named_submodule(
+            &root_requirement,
+            &disk::EntryName("embeddings".to_string())
+        ));
+    }
+
+    #[test]
+    fn all_requirements_met_in_named_submodule_is_false_for_an_unknown_submodule() {
+        let mut project = create_project("Capstone");
+        let mut root_requirement_draft = RequirementDraft::new("Root");
+        root_requirement_draft.requirement_text = "Text".to_string();
+        project
+            .tree
+            .add_requirement("root_requirement", root_requirement_draft)
+            .unwrap();
+        let project = validated(project);
+        let root_requirement = LogicalPath::root(disk::EntryName("root_requirement".to_string()));
+        assert!(!project.all_requirements_met_in_named_submodule(
+            &root_requirement,
+            &disk::EntryName("nonexistent".to_string())
+        ));
     }
 
     #[test]

@@ -252,6 +252,19 @@ pub trait Git {
     /// anything, so calling this doesn't change what a subsequent
     /// `commit_all` would sweep up.
     fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError>;
+
+    /// Pushes `dir`'s current branch to its configured upstream (`git
+    /// push`, no explicit remote/branch — relies on the repo's own
+    /// tracking branch). Returns the combined stdout+stderr text on
+    /// success as a human-readable status to show the user — git's
+    /// ref-update summary ("main -> main", "Everything up-to-date", etc.)
+    /// is printed almost entirely to stderr even when the push succeeds.
+    /// Defaults to a no-op success so fakes that don't care about pushing
+    /// don't need their own override, same reasoning as
+    /// `is_repository`/`init_repository`'s defaults above.
+    fn push(&self, _dir: &Path) -> Result<String, PushError> {
+        Ok(String::new())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -314,6 +327,17 @@ pub enum CommitAllError {
 
 #[derive(Debug, Error)]
 pub enum DiffError {
+    #[error("failed to run git: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("git exited with {status}: {stderr}")]
+    CommandFailed { status: ExitStatus, stderr: String },
+}
+
+#[derive(Debug, Error)]
+pub enum PushError {
     #[error("failed to run git: {source}")]
     Spawn {
         #[source]
@@ -571,6 +595,25 @@ impl Git for SystemGit {
 
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+
+    fn push(&self, dir: &Path) -> Result<String, PushError> {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .arg("push")
+            .output()
+            .map_err(|source| PushError::Spawn { source })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(PushError::CommandFailed {
+                status: output.status,
+                stderr: stderr.into_owned(),
+            });
+        }
+
+        Ok(format!("{stdout}{stderr}"))
+    }
 }
 
 /// Wraps another `Git`, letting tests force `commit_for_path` on specific
@@ -623,6 +666,10 @@ impl<G: Git> Git for FaultInjectingGit<G> {
 
     fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError> {
         self.inner.diff(dir, path)
+    }
+
+    fn push(&self, dir: &Path) -> Result<String, PushError> {
+        self.inner.push(dir)
     }
 }
 
@@ -1238,6 +1285,88 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "commit everything");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_push_sends_new_commits_to_the_configured_upstream() {
+        let remote_dir = std::env::temp_dir().join(format!(
+            "syscalls-git-push-remote-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(&remote_dir)
+                .args(["init", "--quiet", "--bare"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let dir = scratch_git_repo("push-success");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["remote", "add", "origin", remote_dir.to_str().unwrap()]);
+        let branch = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Establishes the upstream tracking branch as fixture setup — the
+        // second, unadorned push below is the actual call under test.
+        run(&["push", "--quiet", "-u", "origin", &branch]);
+
+        std::fs::write(dir.join("second.txt"), "more").unwrap();
+        run(&["add", "second.txt"]);
+        run(&["commit", "--quiet", "-m", "second"]);
+        let local_head = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        SystemGit.push(&dir).unwrap();
+
+        let remote_head = String::from_utf8(
+            Command::new("git")
+                .current_dir(&remote_dir)
+                .args(["rev-parse", &branch])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(remote_head, local_head);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_push_without_an_upstream_reports_command_failed() {
+        let dir = scratch_git_repo("push-no-upstream");
+
+        let err = SystemGit.push(&dir).unwrap_err();
+        assert!(matches!(err, PushError::CommandFailed { .. }));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

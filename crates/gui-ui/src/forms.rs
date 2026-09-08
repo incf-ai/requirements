@@ -55,6 +55,10 @@ pub enum DependencyDraft {
     /// requirement in the current module's entire submodule subtree is
     /// met (see `logical`'s README on "Validation questions — answered").
     Submodules,
+    /// `DependencyReferenceKind::SubmoduleV1` — one specific direct child
+    /// submodule (by its own directory name) of this requirement's own
+    /// module, rather than all of them.
+    Submodule { name: String },
 }
 
 impl DependencyDraft {
@@ -72,6 +76,9 @@ impl DependencyDraft {
                 commit: remote.commit,
             },
             DependencyReferenceKind::Submodules => DependencyDraft::Submodules,
+            DependencyReferenceKind::SubmoduleV1(name) => DependencyDraft::Submodule {
+                name: name.0,
+            },
         }
     }
 
@@ -95,6 +102,9 @@ impl DependencyDraft {
                 })
             }
             DependencyDraft::Submodules => DependencyReferenceKind::Submodules,
+            DependencyDraft::Submodule { name } => {
+                DependencyReferenceKind::SubmoduleV1(EntryName(name.clone()))
+            }
         }
     }
 }
@@ -119,7 +129,23 @@ impl std::fmt::Display for DependencyDraft {
                 write!(f, "{url} @ {commit}")
             }
             DependencyDraft::Remote { url, path, commit } => write!(f, "{url}{path} @ {commit}"),
-            DependencyDraft::Submodules => write!(f, "Submodules (all submodules must be met)"),
+            DependencyDraft::Submodules => write!(f, "All submodules (must all be met)"),
+            DependencyDraft::Submodule { name } => write!(f, "Submodule: {name}"),
+        }
+    }
+}
+
+impl DependencyDraft {
+    /// Same as `Display`, but without the trailing `@ <commit>` — for the
+    /// read-only viewer's clickable dependency list, where the pinned
+    /// commit is implementation detail rather than something the reader
+    /// needs to see alongside the name.
+    pub fn brief(&self) -> String {
+        match self {
+            DependencyDraft::LocalRequirement { path, .. } => path.clone(),
+            DependencyDraft::Remote { url, path, .. } => format!("{url}{path}"),
+            DependencyDraft::Submodules => self.to_string(),
+            DependencyDraft::Submodule { name } => name.clone(),
         }
     }
 }
@@ -503,6 +529,13 @@ pub struct ResultFormState {
     pub requirement_commit: String,
     pub test_path: String,
     pub test_commit: String,
+    /// Whether `requirement_commit`/`test_commit` are out of date against
+    /// the requirement's/test's *current* commits — see
+    /// `gui_core::EntryDetail::Result`'s own `stale` field. `false` in
+    /// create mode (nothing saved yet to be stale) and while a fetch is
+    /// in flight; gates the read-only viewer's "Update Stale Reference"
+    /// button.
+    pub stale: bool,
     pub status: StatusV1,
     /// See `RequirementFormState::original`'s own doc comment — same
     /// reasoning, preserving `attachment_refs` (there's no UI to edit that
@@ -530,6 +563,7 @@ impl Default for ResultFormState {
             requirement_commit: String::new(),
             test_path: String::new(),
             test_commit: String::new(),
+            stale: false,
             status: StatusV1::default(),
             original: Box::new(ResultDraft::new(
                 String::new(),
@@ -761,6 +795,31 @@ mod test {
     }
 
     #[test]
+    fn named_submodule_dependency_round_trips_through_core() {
+        let core = DependencyReferenceKind::SubmoduleV1(EntryName("alpha".to_string()));
+        let draft = DependencyDraft::from_core(core);
+        assert_eq!(
+            draft,
+            DependencyDraft::Submodule {
+                name: "alpha".to_string()
+            }
+        );
+        assert!(matches!(
+            draft.to_core(),
+            DependencyReferenceKind::SubmoduleV1(name) if name.0 == "alpha"
+        ));
+    }
+
+    #[test]
+    fn named_submodule_dependency_display_and_brief() {
+        let draft = DependencyDraft::Submodule {
+            name: "alpha".to_string(),
+        };
+        assert_eq!(draft.to_string(), "Submodule: alpha");
+        assert_eq!(draft.brief(), "alpha");
+    }
+
+    #[test]
     fn the_default_dependency_draft_is_an_empty_local_requirement() {
         assert_eq!(
             DependencyDraft::default(),
@@ -782,11 +841,14 @@ mod test {
             commit: "abc123".to_string(),
         });
         form.dependencies.push(DependencyDraft::Submodules);
+        form.dependencies.push(DependencyDraft::Submodule {
+            name: "alpha".to_string(),
+        });
 
         let Command::AddRequirement { requirement, .. } = form.build_command(Vec::new(), 1) else {
             panic!("expected AddRequirement");
         };
-        assert_eq!(requirement.dependencies.len(), 2);
+        assert_eq!(requirement.dependencies.len(), 3);
         assert!(matches!(
             &requirement.dependencies[0],
             DependencyReferenceKind::RequirementReferenceV1(local) if local.path.0 == "/requirements/discovery"
@@ -794,6 +856,10 @@ mod test {
         assert!(matches!(
             &requirement.dependencies[1],
             DependencyReferenceKind::Submodules
+        ));
+        assert!(matches!(
+            &requirement.dependencies[2],
+            DependencyReferenceKind::SubmoduleV1(name) if name.0 == "alpha"
         ));
     }
 

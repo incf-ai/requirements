@@ -75,7 +75,8 @@ enum Command {
         requirement: String,
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        /// Left empty, this is autopopulated from `--name`.
+        #[arg(long, default_value = "")]
         title: String,
         #[arg(long)]
         requirement_commit: String,
@@ -111,6 +112,18 @@ enum Command {
         path: Option<String>,
         #[arg(long)]
         commit: String,
+    },
+    /// Depends on one specific direct child submodule of `--module` being
+    /// complete, rather than a specific requirement — see
+    /// `DependencyReferenceKind::SubmoduleV1`.
+    LinkSubmoduleDependency {
+        #[arg(long, default_value = "")]
+        module: String,
+        #[arg(long)]
+        requirement: String,
+        /// The direct child submodule's own directory name.
+        #[arg(long)]
+        name: String,
     },
     Validate,
     IsMet {
@@ -351,6 +364,25 @@ fn run_command(
                             commit,
                         },
                     ));
+                Ok(())
+            })?;
+            Ok("linked".to_string())
+        }
+        Command::LinkSubmoduleDependency {
+            module,
+            requirement,
+            name,
+        } => {
+            mutate(fs, git, dir, |draft| {
+                let target = find_module_mut(&mut draft.tree, &module)
+                    .ok_or_else(|| ErrorKind::ModuleNotFound(module.clone()))?;
+                let requirement = target
+                    .requirements
+                    .get_mut(&EntryName(requirement.clone()))
+                    .ok_or(ErrorKind::RequirementNotFound(requirement))?;
+                requirement
+                    .dependencies
+                    .push(DependencyReferenceKind::SubmoduleV1(EntryName(name)));
                 Ok(())
             })?;
             Ok("linked".to_string())
@@ -941,6 +973,94 @@ mod test {
     }
 
     #[test]
+    fn link_submodule_dependency_on_an_existing_submodule_resolves() {
+        let dir = fresh_temp_dir("submodule-dependency-existing");
+        run_ok(&dir, &["create-project", "--name", "Demo"]);
+        run_ok(&dir, &["add-module", "--name", "alpha"]);
+        run_ok(
+            &dir,
+            &[
+                "add-requirement",
+                "--name",
+                "definition",
+                "--text",
+                "Text",
+                "--title",
+                "Definition",
+            ],
+        );
+        run_ok(
+            &dir,
+            &[
+                "link-submodule-dependency",
+                "--requirement",
+                "definition",
+                "--name",
+                "alpha",
+            ],
+        );
+
+        assert_eq!(run_ok(&dir, &["validate"]), "ok");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_submodule_dependency_on_a_missing_submodule_fails_validation() {
+        let dir = fresh_temp_dir("submodule-dependency-missing");
+        run_ok(&dir, &["create-project", "--name", "Demo"]);
+        run_ok(
+            &dir,
+            &[
+                "add-requirement",
+                "--name",
+                "definition",
+                "--text",
+                "Text",
+                "--title",
+                "Definition",
+            ],
+        );
+        run_ok(
+            &dir,
+            &[
+                "link-submodule-dependency",
+                "--requirement",
+                "definition",
+                "--name",
+                "nonexistent",
+            ],
+        );
+
+        assert!(run_err(&dir, &["validate"]).contains("nonexistent"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_submodule_dependency_with_a_missing_requirement_errors() {
+        let dir = fresh_temp_dir("submodule-dependency-missing-requirement");
+        run_ok(&dir, &["create-project", "--name", "Demo"]);
+        run_ok(&dir, &["add-module", "--name", "alpha"]);
+
+        assert!(
+            run_err(
+                &dir,
+                &[
+                    "link-submodule-dependency",
+                    "--requirement",
+                    "nonexistent",
+                    "--name",
+                    "alpha",
+                ],
+            )
+            .contains("nonexistent")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn link_remote_dependency_against_a_real_local_git_repo_resolves() {
         let remote_dir = fresh_temp_dir("remote-repo-head");
         init_git_repo(&remote_dir);
@@ -1228,6 +1348,50 @@ mod test {
         run_ok(&dir, &add_result_args);
 
         assert!(run_err(&dir, &add_result_args).contains("already exists"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_result_without_title_autopopulates_from_name() {
+        let dir = fresh_temp_dir("result-title-default");
+        run_ok(&dir, &["create-project", "--name", "Demo"]);
+        run_ok(
+            &dir,
+            &[
+                "add-requirement",
+                "--name",
+                "definition",
+                "--text",
+                "Text",
+                "--title",
+                "Definition",
+            ],
+        );
+        run_ok(
+            &dir,
+            &[
+                "add-result",
+                "--name",
+                "some_result",
+                "--requirement",
+                "definition",
+                "--requirement-commit",
+                "deadbeef",
+                "--test-path",
+                "/tests/generic_test",
+                "--test-commit",
+                "deadbeef",
+                "--status",
+                "pass",
+            ],
+        );
+
+        let result_ron = std::fs::read_to_string(
+            dir.join("requirements/definition/results/some_result/result.ron"),
+        )
+        .unwrap();
+        assert!(result_ron.contains(r#"title: "Some Result""#));
 
         std::fs::remove_dir_all(&dir).ok();
     }

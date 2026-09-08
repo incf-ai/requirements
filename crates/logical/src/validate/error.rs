@@ -66,6 +66,14 @@ pub enum UnresolvedTarget {
     Requirement(LogicalPath),
     #[error("test {0}")]
     Test(LogicalPath),
+    #[error(
+        "submodule `{name}` (of module {})",
+        parent.last().map(EntryName::as_str).unwrap_or("<project root>")
+    )]
+    Submodule {
+        parent: Vec<EntryName>,
+        name: EntryName,
+    },
     #[error("local attachment `{path}` of {entity}", path = path.display())]
     LocalAttachment { entity: LogicalPath, path: PathBuf },
     #[error(
@@ -147,6 +155,26 @@ mod test {
             message: "connection refused".to_string(),
         };
         assert!(err.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn unresolved_target_submodule_names_the_missing_child_and_its_parent() {
+        let target = UnresolvedTarget::Submodule {
+            parent: vec![EntryName("embeddings".to_string())],
+            name: EntryName("nonexistent".to_string()),
+        };
+        let message = target.to_string();
+        assert!(message.contains("nonexistent"));
+        assert!(message.contains("embeddings"));
+    }
+
+    #[test]
+    fn unresolved_target_submodule_names_the_root_when_parent_is_empty() {
+        let target = UnresolvedTarget::Submodule {
+            parent: vec![],
+            name: EntryName("nonexistent".to_string()),
+        };
+        assert!(target.to_string().contains("<project root>"));
     }
 
     #[test]

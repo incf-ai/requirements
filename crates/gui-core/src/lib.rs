@@ -175,6 +175,16 @@ pub enum Command {
         target: ResultPath,
         request: RequestId,
     },
+    /// Rewrites `target`'s own `requirement_commit`/`test_commit` to its
+    /// owning requirement's and referenced test's *current* commits — the
+    /// Result viewer's "Update Stale Reference" button, the result-level
+    /// counterpart to `RefreshStaleTestReferences`. Same "needs a
+    /// `Validated` project, implicitly revalidates on success" shape as
+    /// that command — see its own doc comment.
+    RefreshStaleResultReference {
+        target: ResultPath,
+        request: RequestId,
+    },
     AddModule {
         /// The *parent* module's path — the new module is created as a
         /// child named `name` underneath it, mirroring `AddRequirement`'s
@@ -315,6 +325,14 @@ pub enum Command {
         target: LogicalPath,
         request: RequestId,
     },
+    /// A result's current `EntryDetail::Result::stale` — the on-demand,
+    /// single-field counterpart to `GetRequirementMetStatus`, same "refresh
+    /// just this after `Validate`, without a full `EntryDetail` round trip
+    /// that could clobber the rest of an open form" reasoning.
+    GetResultReferenceIsStale {
+        target: ResultPath,
+        request: RequestId,
+    },
     DependencyChain {
         target: LogicalPath,
         request: RequestId,
@@ -376,6 +394,13 @@ pub enum Command {
     /// `mutation_in_flight`.
     CommitAll {
         message: String,
+        request: RequestId,
+    },
+    /// Pushes the project's working directory to its remote (`git push`,
+    /// no explicit remote/branch — see `syscalls::Git::push`). Touches no
+    /// in-memory project state, same as `CommitAll`, so it isn't gated by
+    /// `mutation_in_flight` either.
+    Push {
         request: RequestId,
     },
     /// Every reference in the project that would break if `target` were
@@ -440,6 +465,7 @@ pub enum Outcome {
     AddResult(Result<(), AddChildError>),
     UpdateResult(Result<(), UpdateChildError>),
     RemoveResult(bool),
+    RefreshStaleResultReference(Result<(), RefreshStaleTestReferencesError>),
     AddModule(Result<(), AddChildError>),
     RemoveModule(bool),
     RenameModule(Result<(), RenameModuleError>),
@@ -458,6 +484,7 @@ pub enum Outcome {
     RemoveResultAttachment(bool),
     EntryDetail(Option<EntryDetail>),
     RequirementMetStatus(RequirementMetStatus),
+    ResultReferenceIsStale(bool),
     DependencyChain(Vec<LogicalPath>),
     /// `None` means the module itself wasn't found.
     ModulePools(Option<ModulePools>),
@@ -471,6 +498,7 @@ pub enum Outcome {
     GetChangedFiles(Result<Vec<PathBuf>, GetChangedFilesError>),
     GetDiff(Result<String, GetDiffError>),
     CommitAll(Result<(), CommitAllError>),
+    Push(Result<String, PushError>),
     FindReferences(Vec<ReferenceSite>),
     RepairReferences(Result<(), ReferenceRepairError>),
     /// A command that needs a loaded project arrived when `state` is
@@ -531,6 +559,16 @@ pub enum CommitAllError {
     NoProjectPath,
     #[error(transparent)]
     Commit(#[from] syscalls::CommitAllError),
+}
+
+/// `Push`'s own error type — same "no project on disk yet" failure mode
+/// as `CommitAllError`, plus `syscalls`'s own `git push` failure.
+#[derive(Debug, thiserror::Error)]
+pub enum PushError {
+    #[error("no project is loaded on disk to push")]
+    NoProjectPath,
+    #[error(transparent)]
+    Push(#[from] syscalls::PushError),
 }
 
 /// `add_requirement`/`add_test`/`add_result`/`add_module` all need
@@ -774,6 +812,14 @@ pub enum EntryDetail {
         test_path: String,
         test_commit: String,
         attachments: Vec<PathBuf>,
+        /// Whether this result's own `requirement_commit`/`test_commit`
+        /// still match the requirement's/test's *current* commits — see
+        /// `logical::ValidatedProject::result_reference_is_stale`. Always
+        /// `false` against an unvalidated `Draft` (nothing current to
+        /// compare against yet), same "not an error, just not there yet"
+        /// spirit as `RequirementMetStatus::Unvalidated`; gates the Result
+        /// viewer's own "Update Stale Reference" button.
+        stale: bool,
         /// See `EntryDetail::Requirement`'s own `original` doc comment —
         /// same reasoning, for `ResultDraft` (notably including `status`,
         /// which nothing in `gui-ui` even shows a control for today).
@@ -834,6 +880,13 @@ pub struct TreeSnapshot {
     pub root: TreeNode,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Whether this snapshot was built from a `Validated` project — gates
+    /// whether `TreeNode::requirement_count`/`requirements_met` are
+    /// meaningful to display (same "nothing to say yet" spirit as
+    /// `RequirementMetStatus::Unvalidated`), since a freshly-loaded
+    /// `Draft`'s counts would otherwise read as "0% met" rather than "not
+    /// checked yet".
+    pub validated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -841,6 +894,14 @@ pub struct TreeNode {
     pub name: EntryName,
     pub kind: EntryKind,
     pub status: EntryStatus,
+    /// For a `Module` node: total requirement count across this module's
+    /// whole subtree (itself plus every nested submodule), mirroring
+    /// `accumulate_module_summary`'s recursive walk. Only meaningful when
+    /// the owning `TreeSnapshot::validated` is true; `0` otherwise.
+    pub requirement_count: usize,
+    /// Same subtree scope as `requirement_count`, counting only those with
+    /// `EntryStatus::Met`.
+    pub requirements_met: usize,
     pub children: Vec<TreeNode>,
 }
 

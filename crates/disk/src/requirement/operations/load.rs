@@ -183,6 +183,25 @@ mod test {
     }
 
     #[test]
+    fn loads_a_named_submodule_dependency() -> Result<(), Error> {
+        let dir = valid_stage_dir("submodule-dependency");
+        std::fs::write(
+            dir.join("requirement.ron"),
+            "RequirementDefinitionV1(title: \"Title\", dependency: SubmoduleV1(\"alpha\"))",
+        )
+        .unwrap();
+
+        let requirement = load_requirement_stage(&StdFilesystem, &FixedGit, &dir)?;
+        assert!(matches!(
+            requirement.definition.dependency,
+            Some(DependencyReferenceKind::SubmoduleV1(name)) if name.as_str() == "alpha"
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
     fn missing_requirement_ron_is_reported() {
         let dir = valid_stage_dir("missing-ron");
         std::fs::remove_file(dir.join("requirement.ron")).unwrap();

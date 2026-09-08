@@ -46,6 +46,11 @@ pub enum ReferenceSiteKind {
     /// dependencies can't name an in-project entity, so they're never
     /// recorded here.
     RequirementDependency { index: usize },
+    /// `RequirementDraft.dependencies[index]` — always a `SubmoduleV1`
+    /// entry, naming a direct child submodule of the referrer's own
+    /// module. A separate site kind from `RequirementDependency` since it
+    /// repairs by rewriting an `EntryName`, not a `LocalGitReference`.
+    RequirementSubmoduleDependency { index: usize },
     /// `ResultDraft.test_path`/`test_commit`, on the result named
     /// `result_name` nested under the referrer requirement. A result's
     /// *requirement* is no longer a field that can go stale — it's
@@ -76,6 +81,8 @@ pub enum ReferenceRepairError {
     MissingIndex { referrer: LogicalPath, index: usize },
     #[error("referrer at `{referrer}` has a dependency at index {index} that isn't a local requirement reference")]
     NotALocalRequirementReference { referrer: LogicalPath, index: usize },
+    #[error("referrer at `{referrer}` has a dependency at index {index} that isn't a submodule dependency")]
+    NotASubmoduleDependency { referrer: LogicalPath, index: usize },
     #[error("`Repair` was requested but no new target was given")]
     RepairWithoutNewTarget,
     #[error(
@@ -166,22 +173,43 @@ fn walk_module(
             }
         }
         for (index, dependency) in requirement.dependencies.iter().enumerate() {
-            let DependencyReferenceKind::RequirementReferenceV1(local) = dependency else {
-                continue;
-            };
-            if let Ok(resolved) = parse_reference_path(&local.path, current_module, "requirements")
-                && matches_target(
-                    &resolved,
-                    &local.path,
-                    current_module,
-                    EntityKind::Requirement,
-                    target,
-                )
-            {
-                sites.push(ReferenceSite {
-                    referrer: referrer.clone(),
-                    kind: ReferenceSiteKind::RequirementDependency { index },
-                });
+            match dependency {
+                DependencyReferenceKind::RequirementReferenceV1(local) => {
+                    if let Ok(resolved) =
+                        parse_reference_path(&local.path, current_module, "requirements")
+                        && matches_target(
+                            &resolved,
+                            &local.path,
+                            current_module,
+                            EntityKind::Requirement,
+                            target,
+                        )
+                    {
+                        sites.push(ReferenceSite {
+                            referrer: referrer.clone(),
+                            kind: ReferenceSiteKind::RequirementDependency { index },
+                        });
+                    }
+                }
+                DependencyReferenceKind::SubmoduleV1(name) => {
+                    // Module renames are always same-parent in this
+                    // codebase (no reparent operation exists), so this
+                    // dependency's implicit target — `current_module` plus
+                    // this one child name — only ever needs an exact
+                    // match, unlike `matches_target`'s prefix-based
+                    // descendant logic for paths that can dip further in.
+                    if let ReferenceTarget::Module(old_module_path) = target {
+                        let mut implicit_target = current_module.clone();
+                        implicit_target.push(name.clone());
+                        if old_module_path == &implicit_target {
+                            sites.push(ReferenceSite {
+                                referrer: referrer.clone(),
+                                kind: ReferenceSiteKind::RequirementSubmoduleDependency { index },
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         for (result_name, result) in &requirement.results {
@@ -268,6 +296,7 @@ fn site_index(kind: &ReferenceSiteKind) -> usize {
     match kind {
         ReferenceSiteKind::RequirementTestReference { index } => *index,
         ReferenceSiteKind::RequirementDependency { index } => *index,
+        ReferenceSiteKind::RequirementSubmoduleDependency { index } => *index,
         _ => 0,
     }
 }
@@ -300,6 +329,9 @@ pub fn apply_reference_actions(
             }
             ReferenceSiteKind::RequirementDependency { index } => {
                 apply_to_requirement_dependency(project, site, *index, *action, old_target, new_target)?
+            }
+            ReferenceSiteKind::RequirementSubmoduleDependency { index } => {
+                apply_to_requirement_submodule_dependency(project, site, *index, *action, new_target)?
             }
             ReferenceSiteKind::ResultTestRef { result_name } => {
                 apply_to_result(project, site, result_name, *action, old_target, new_target)?
@@ -425,6 +457,74 @@ fn apply_to_requirement_dependency(
         let (path, commit) = repaired.expect("computed above for a non-Remove action");
         requirement.dependencies[index] =
             DependencyReferenceKind::RequirementReferenceV1(LocalGitReference { path, commit });
+    }
+    Ok(())
+}
+
+/// Applies a `RequirementSubmoduleDependency` action. Unlike
+/// `apply_to_requirement_dependency`, there's no `LocalGitReference`/commit
+/// to recompute — `Repair` just rewrites the stored `EntryName` to the
+/// renamed submodule's own new final segment. Module renames are always
+/// same-parent in this codebase (no reparent operation exists — see
+/// `crates/gui-core/src/actor.rs`'s `rename_module`), so `new_target` is
+/// rejected with `TargetMismatch` unless it names a `Module` one segment
+/// longer than the referrer's own module path, with that same path as its
+/// prefix.
+fn apply_to_requirement_submodule_dependency(
+    project: &mut ProjectDraft,
+    site: &ReferenceSite,
+    index: usize,
+    action: ReferenceAction,
+    new_target: Option<&ReferenceTarget>,
+) -> Result<(), ReferenceRepairError> {
+    let referrer_modules = site.referrer.modules.clone();
+    let new_name = if action == ReferenceAction::Repair {
+        {
+            let dependency = get_module(&project.tree, &referrer_modules)
+                .and_then(|module| module.requirements.get(&site.referrer.name))
+                .and_then(|requirement| requirement.dependencies.get(index))
+                .ok_or_else(|| ReferenceRepairError::MissingIndex {
+                    referrer: site.referrer.clone(),
+                    index,
+                })?;
+            if !matches!(dependency, DependencyReferenceKind::SubmoduleV1(_)) {
+                return Err(ReferenceRepairError::NotASubmoduleDependency {
+                    referrer: site.referrer.clone(),
+                    index,
+                });
+            }
+        }
+        let new_target = new_target.ok_or(ReferenceRepairError::RepairWithoutNewTarget)?;
+        let ReferenceTarget::Module(new_path) = new_target else {
+            return Err(ReferenceRepairError::TargetMismatch);
+        };
+        if new_path.len() != referrer_modules.len() + 1
+            || new_path[..referrer_modules.len()] != referrer_modules[..]
+        {
+            return Err(ReferenceRepairError::TargetMismatch);
+        }
+        Some(new_path[referrer_modules.len()].clone())
+    } else {
+        None
+    };
+
+    let module = get_module_mut(&mut project.tree, &referrer_modules)
+        .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+    let requirement = module
+        .requirements
+        .get_mut(&site.referrer.name)
+        .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+    if index >= requirement.dependencies.len() {
+        return Err(ReferenceRepairError::MissingIndex {
+            referrer: site.referrer.clone(),
+            index,
+        });
+    }
+    if action == ReferenceAction::Remove {
+        requirement.dependencies.remove(index);
+    } else {
+        let name = new_name.expect("computed above for a non-Remove action");
+        requirement.dependencies[index] = DependencyReferenceKind::SubmoduleV1(name);
     }
     Ok(())
 }
@@ -640,6 +740,64 @@ mod test {
         );
     }
 
+    // ---- find_references: named submodule dependencies ----
+
+    #[test]
+    fn find_references_finds_a_named_submodule_dependency_on_rename_of_that_exact_submodule() {
+        let mut project = create_project("Project");
+        project.tree.add_module("alpha").unwrap();
+        let mut dependent = requirement("Text");
+        dependent
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(entry("alpha")));
+        project.tree.add_requirement("dependent", dependent).unwrap();
+
+        let sites = find_references(&project, &ReferenceTarget::Module(vec![entry("alpha")]));
+        assert_eq!(
+            sites,
+            vec![ReferenceSite {
+                referrer: root_path("dependent"),
+                kind: ReferenceSiteKind::RequirementSubmoduleDependency { index: 0 },
+            }]
+        );
+    }
+
+    #[test]
+    fn find_references_does_not_flag_a_named_submodule_dependency_for_an_unrelated_module_rename() {
+        let mut project = create_project("Project");
+        project.tree.add_module("alpha").unwrap();
+        project.tree.add_module("other").unwrap();
+        let mut dependent = requirement("Text");
+        dependent
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(entry("alpha")));
+        project.tree.add_requirement("dependent", dependent).unwrap();
+
+        let sites = find_references(&project, &ReferenceTarget::Module(vec![entry("other")]));
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn find_references_does_not_flag_a_named_submodule_dependency_for_its_own_ancestor_module_rename() {
+        // `dependent` lives inside `embeddings` and names its own direct
+        // child submodule `alpha` — renaming `embeddings` itself (an
+        // ancestor of the referrer, not the named submodule) doesn't touch
+        // the stored name at all, since it's always resolved relative to
+        // wherever the referrer currently lives.
+        let mut project = create_project("Project");
+        project.tree.add_module("embeddings").unwrap();
+        let embeddings = project.tree.modules.get_mut(&entry("embeddings")).unwrap();
+        embeddings.add_module("alpha").unwrap();
+        let mut dependent = requirement("Text");
+        dependent
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(entry("alpha")));
+        embeddings.add_requirement("dependent", dependent).unwrap();
+
+        let sites = find_references(&project, &ReferenceTarget::Module(vec![entry("embeddings")]));
+        assert!(sites.is_empty());
+    }
+
     // ---- find_references: module targets, including the self-heal cases ----
 
     #[test]
@@ -820,6 +978,32 @@ mod test {
         ));
     }
 
+    #[test]
+    fn remove_clears_a_named_submodule_dependency_from_the_list() {
+        let mut project = create_project("Project");
+        project.tree.add_module("alpha").unwrap();
+        let mut dependent = requirement("Text");
+        dependent
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(entry("alpha")));
+        project.tree.add_requirement("dependent", dependent).unwrap();
+
+        let old_target = ReferenceTarget::Module(vec![entry("alpha")]);
+        let sites = find_references(&project, &old_target);
+        apply_reference_actions(&mut project, &old_target, None, &[(sites[0].clone(), ReferenceAction::Remove)])
+            .unwrap();
+
+        assert!(
+            project
+                .tree
+                .requirements
+                .get(&entry("dependent"))
+                .unwrap()
+                .dependencies
+                .is_empty()
+        );
+    }
+
     // ---- apply_reference_actions: Repair ----
 
     #[test]
@@ -931,6 +1115,36 @@ mod test {
         assert!(matches!(
             &project.tree.requirements.get(&entry("dependent")).unwrap().dependencies[0],
             DependencyReferenceKind::RequirementReferenceV1(local) if local.path.0 == "/requirements/renamed_base"
+        ));
+    }
+
+    #[test]
+    fn repair_rewrites_a_named_submodule_dependency() {
+        let mut project = create_project("Project");
+        project.tree.add_module("renamed_alpha").unwrap();
+        let mut dependent = requirement("Text");
+        dependent
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(entry("alpha")));
+        project.tree.add_requirement("dependent", dependent).unwrap();
+
+        let old_target = ReferenceTarget::Module(vec![entry("alpha")]);
+        let new_target = ReferenceTarget::Module(vec![entry("renamed_alpha")]);
+        let site = ReferenceSite {
+            referrer: root_path("dependent"),
+            kind: ReferenceSiteKind::RequirementSubmoduleDependency { index: 0 },
+        };
+        apply_reference_actions(
+            &mut project,
+            &old_target,
+            Some(&new_target),
+            &[(site, ReferenceAction::Repair)],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &project.tree.requirements.get(&entry("dependent")).unwrap().dependencies[0],
+            DependencyReferenceKind::SubmoduleV1(name) if name.as_str() == "renamed_alpha"
         ));
     }
 
@@ -1110,6 +1324,115 @@ mod test {
         )
         .unwrap_err();
         assert!(matches!(err, ReferenceRepairError::NotALocalRequirementReference { .. }));
+    }
+
+    #[test]
+    fn not_a_submodule_dependency_is_an_error_when_repairing() {
+        let mut project = create_project("Project");
+        project.tree.add_module("renamed_alpha").unwrap();
+        let mut dependent = requirement("Text");
+        dependent.dependencies.push(requirement_dep("/requirements/base", "abc"));
+        project.tree.add_requirement("dependent", dependent).unwrap();
+
+        let site = ReferenceSite {
+            referrer: root_path("dependent"),
+            kind: ReferenceSiteKind::RequirementSubmoduleDependency { index: 0 },
+        };
+        let err = apply_reference_actions(
+            &mut project,
+            &ReferenceTarget::Module(vec![entry("alpha")]),
+            Some(&ReferenceTarget::Module(vec![entry("renamed_alpha")])),
+            &[(site, ReferenceAction::Repair)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReferenceRepairError::NotASubmoduleDependency { .. }));
+    }
+
+    #[test]
+    fn repair_with_a_missing_submodule_dependency_index_is_an_error() {
+        let mut project = create_project("Project");
+        project.tree.add_requirement("dependent", requirement("Text")).unwrap();
+        project.tree.add_module("renamed_alpha").unwrap();
+
+        let site = ReferenceSite {
+            referrer: root_path("dependent"),
+            kind: ReferenceSiteKind::RequirementSubmoduleDependency { index: 5 },
+        };
+        let err = apply_reference_actions(
+            &mut project,
+            &ReferenceTarget::Module(vec![entry("alpha")]),
+            Some(&ReferenceTarget::Module(vec![entry("renamed_alpha")])),
+            &[(site, ReferenceAction::Repair)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReferenceRepairError::MissingIndex { .. }));
+    }
+
+    #[test]
+    fn missing_index_is_an_error_for_a_submodule_dependency_remove() {
+        let mut project = create_project("Project");
+        project.tree.add_requirement("dependent", requirement("Text")).unwrap();
+
+        let site = ReferenceSite {
+            referrer: root_path("dependent"),
+            kind: ReferenceSiteKind::RequirementSubmoduleDependency { index: 5 },
+        };
+        let err = apply_reference_actions(
+            &mut project,
+            &ReferenceTarget::Module(vec![entry("alpha")]),
+            None,
+            &[(site, ReferenceAction::Remove)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReferenceRepairError::MissingIndex { .. }));
+    }
+
+    #[test]
+    fn repair_of_a_submodule_dependency_without_a_new_target_is_an_error() {
+        let mut project = create_project("Project");
+        project.tree.add_module("alpha").unwrap();
+        let mut dependent = requirement("Text");
+        dependent
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(entry("alpha")));
+        project.tree.add_requirement("dependent", dependent).unwrap();
+
+        let site = ReferenceSite {
+            referrer: root_path("dependent"),
+            kind: ReferenceSiteKind::RequirementSubmoduleDependency { index: 0 },
+        };
+        let err = apply_reference_actions(
+            &mut project,
+            &ReferenceTarget::Module(vec![entry("alpha")]),
+            None,
+            &[(site, ReferenceAction::Repair)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReferenceRepairError::RepairWithoutNewTarget));
+    }
+
+    #[test]
+    fn repair_of_a_submodule_dependency_is_a_target_mismatch_when_new_target_is_not_a_module() {
+        let mut project = create_project("Project");
+        project.tree.add_requirement("renamed_base", requirement("Text")).unwrap();
+        let mut dependent = requirement("Text");
+        dependent
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(entry("alpha")));
+        project.tree.add_requirement("dependent", dependent).unwrap();
+
+        let site = ReferenceSite {
+            referrer: root_path("dependent"),
+            kind: ReferenceSiteKind::RequirementSubmoduleDependency { index: 0 },
+        };
+        let err = apply_reference_actions(
+            &mut project,
+            &ReferenceTarget::Module(vec![entry("alpha")]),
+            Some(&ReferenceTarget::Requirement(root_path("renamed_base"))),
+            &[(site, ReferenceAction::Repair)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReferenceRepairError::TargetMismatch));
     }
 
     #[test]

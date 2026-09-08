@@ -255,6 +255,10 @@ impl syscalls::Git for FixedGit {
             "diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1,1 +1,2 @@\n-old line\n+new line\n+another line\n"
         ))
     }
+
+    fn push(&self, _dir: &Path) -> Result<String, syscalls::PushError> {
+        Ok("pushed to origin/main".to_string())
+    }
 }
 
 impl syscalls::RemoteGit for FixedGit {
@@ -1484,6 +1488,89 @@ fn closing_the_diff_dialog_leaves_the_commit_all_dialog_open() {
 }
 
 #[test]
+fn push_button_opens_the_confirm_dialog() {
+    let dir = scratch_copy_of_test_project("push-opens");
+    let mut harness = commit_all_harness(&dir);
+
+    harness.get_by_role_and_label(Role::Button, "Push…").click();
+    harness.step();
+    harness.step();
+
+    // The dialog's own heading, "Push" — distinct from the toolbar
+    // button's "Push…" label (see `render_push_dialog`'s own doc
+    // comment on why the two differ).
+    assert!(harness.query_by_role_and_label(Role::Label, "Push").is_some());
+    assert!(
+        harness
+            .query_by_label("Push the current branch to its remote?")
+            .is_some()
+    );
+    // Confirm state only — nothing sent to `gui-core` yet, so the commit-
+    // all dialog (which the same toolbar row also opens) was untouched.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Commit all changes")
+            .is_none()
+    );
+
+    drop(harness);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cancel_button_closes_the_push_dialog_without_pushing() {
+    let dir = scratch_copy_of_test_project("push-cancel");
+    let mut harness = commit_all_harness(&dir);
+
+    harness.get_by_role_and_label(Role::Button, "Push…").click();
+    harness.step();
+    harness.step();
+    assert!(harness.query_by_role_and_label(Role::Label, "Push").is_some());
+
+    // `.click_accesskit()` — same "dialog can sit past the simulated
+    // viewport" reasoning as the commit-all dialog's own Cancel button.
+    harness
+        .get_by_role_and_label(Role::Button, "Cancel")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    assert!(harness.query_by_role_and_label(Role::Label, "Push").is_none());
+
+    drop(harness);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn clicking_push_shows_the_output() {
+    let dir = scratch_copy_of_test_project("push-click");
+    let mut harness = commit_all_harness(&dir);
+
+    harness.get_by_role_and_label(Role::Button, "Push…").click();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Button, "Push")
+        .click_accesskit();
+    harness.step();
+
+    // `FixedGit::push`'s own fixed reply (see its doc comment) — a real
+    // round trip through `Command::Push`, proving the click sent the
+    // request and the reply rendered.
+    wait_until(&mut harness, |h| {
+        h.query_by_label_contains("pushed to origin/main").is_some()
+    });
+    // The confirm/push button is gone once output is showing — only
+    // "Close" remains (see `render_push_dialog`'s own doc comment).
+    assert!(harness.query_by_role_and_label(Role::Button, "Push").is_none());
+    assert!(harness.query_by_role_and_label(Role::Button, "Close").is_some());
+
+    drop(harness);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn opening_a_real_project_populates_the_tree() {
     let mut harness = harness();
     harness.step();
@@ -1594,15 +1681,10 @@ fn right_click_copy_then_paste_duplicates_a_requirement_into_another_module() {
         h.query_by_role_and_label(Role::Button, "requirements (1)")
             .is_some()
     });
-    // "Expand All" only reached the groups that existed *when it was
-    // clicked* (back in `open_test_project`, before this paste) — beta's
-    // own "requirements" group is brand new and starts collapsed like any
-    // other (`render_leaf_group`'s `default_open(false)`), so its leaf
-    // isn't actually rendered/queryable until it's opened.
-    harness
-        .get_by_role_and_label(Role::Button, "requirements (1)")
-        .click();
-    harness.step();
+    // Beta's own "requirements" group is brand new, but "requirements"
+    // groups start expanded by default (`render_leaf_group`'s
+    // `default_open(kind == EntryKind::Requirement)`), so its leaf is
+    // already rendered/queryable without an extra click to open it.
     assert!(
         harness
             .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
@@ -1673,6 +1755,47 @@ fn right_click_recreate_renames_a_requirement_and_regenerates_its_title() {
         .click();
     harness.step();
     wait_until(&mut harness, |h| h.query_by_label("Scratchreq Renamed").is_some());
+}
+
+#[test]
+fn the_edit_form_title_field_has_a_button_that_regenerates_it_from_the_identifier() {
+    let mut harness = harness();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+    open_leaf_for_editing(&mut harness, "\u{e32c} scratchreq", "Edit Requirement");
+
+    // Title starts out as whatever `create_scratch_requirement` typed
+    // ("Scratch Requirement"), independent of the identifier
+    // ("scratchreq") — clicking the regenerate button next to the Title
+    // field should overwrite it with `title_case_from_name("scratchreq")`
+    // regardless, same glyph (`\u{e094}`, `icons::REGENERATE_TITLE`) as
+    // `icons::UPDATE_STALE_REFERENCES` uses elsewhere. The title field is
+    // a live `TextEdit`, not a `Label`, so look it up by its current
+    // value like the recreate-dialog's own name field does above.
+    assert!(
+        harness
+            .get_all(By::new().role(Role::TextInput).value("Scratch Requirement"))
+            .next()
+            .is_some()
+    );
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e094}")
+        .click();
+    harness.step();
+    harness.step();
+
+    assert!(
+        harness
+            .get_all(By::new().role(Role::TextInput).value("Scratchreq"))
+            .next()
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_all(By::new().role(Role::TextInput).value("Scratch Requirement"))
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1836,12 +1959,13 @@ fn right_click_duplicate_prompts_for_a_name_then_creates_the_copy() {
     // The default-checked "Regenerate title from new name" should have
     // overwritten the copy's title (originally "Scratch Requirement",
     // carried over unchanged from the source) with one derived from the
-    // new name instead.
+    // new name instead — `title_case_from_name` title-cases every
+    // whitespace-separated word, not just the leading one.
     harness
         .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq copy")
         .click();
     harness.step();
-    wait_until(&mut harness, |h| h.query_by_label("Scratchreq copy").is_some());
+    wait_until(&mut harness, |h| h.query_by_label("Scratchreq Copy").is_some());
 }
 
 #[test]
@@ -1983,13 +2107,10 @@ fn pasting_the_same_requirement_twice_dedupes_the_seconds_name() {
         h.query_by_role_and_label(Role::Button, "requirements (2)")
             .is_some()
     });
-    // See the sibling test's comment on why this group needs its own,
-    // separate expand click — it's brand new, so `open_test_project`'s
-    // one-time "Expand All" never reached it.
-    harness
-        .get_by_role_and_label(Role::Button, "requirements (2)")
-        .click();
-    harness.step();
+    // "requirements" groups start expanded by default
+    // (`render_leaf_group`'s `default_open(kind ==
+    // EntryKind::Requirement)`), so this brand-new group's leaves are
+    // already reachable without an extra click to open it.
     assert!(
         harness
             .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
@@ -2049,19 +2170,14 @@ fn pasting_via_the_requirements_leaf_group_header_targets_the_current_module() {
         .click_accesskit();
     harness.step();
 
+    // "requirements" groups start expanded by default
+    // (`render_leaf_group`'s `default_open(kind ==
+    // EntryKind::Requirement)`), so once the paste lands there's no need
+    // for an extra click to open it before its leaf is queryable.
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Button, "requirements (1)")
+        h.query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
             .is_some()
     });
-    harness
-        .get_by_role_and_label(Role::Button, "requirements (1)")
-        .click();
-    harness.step();
-    assert!(
-        harness
-            .query_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
-            .is_some()
-    );
 }
 
 #[test]
@@ -2081,11 +2197,10 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
     // The tree loaded at all — "beta" (a childless module, so a plain
     // `Label` rather than a collapsible `CollapsingHeader`, see
     // `render_tree_node`'s two branches) is a convenient proof of that.
-    // Every leaf group folder ("requirements"/"test procedures") starts
-    // collapsed — see `render_leaf_group`'s own `default_open(false)` —
-    // so none of their children (a requirement's own nested results
-    // included, since those render immediately under it once its group is
-    // open — see `render_leaf`'s own doc comment) are reachable yet.
+    // The "requirements" leaf group folder starts expanded (see
+    // `render_leaf_group`'s own `default_open(kind ==
+    // EntryKind::Requirement)`) so its children are reachable
+    // immediately, but "test procedures" still starts collapsed.
     assert!(
         harness
             .query_by_role_and_label(Role::Label, "beta")
@@ -2096,7 +2211,7 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
     assert!(
         harness
             .query_by_role_and_label(Role::Button, "\u{e32c} design")
-            .is_none()
+            .is_some()
     );
 
     // "Expand All" reveals it, proving the leaf was only hidden by the
@@ -2146,12 +2261,12 @@ fn the_tree_groups_leaves_under_requirements_and_test_procedures_folders() {
     );
 
     // "design"'s own nested result (also named "design" in the fixture)
-    // renders right under it, indented — plain text with no status
-    // glyph, unlike its owning requirement's row.
+    // is deliberately not shown as a tree row — results are only reachable
+    // from their owning requirement's detail panel.
     assert!(
         harness
             .query_by_role_and_label(Role::Button, "design")
-            .is_some()
+            .is_none()
     );
 }
 
@@ -3165,6 +3280,73 @@ fn the_update_stale_references_button_appears_only_for_a_stale_reference_and_fix
 }
 
 #[test]
+fn the_update_stale_reference_button_appears_only_for_a_stale_result_and_fixes_it() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    // Same navigation `editing_an_existing_result_can_add_a_local_
+    // attachment` uses to reach a result's viewer: open "design", then
+    // follow its one result's link ("Design" is the result's own `title`,
+    // distinct from the requirement's name "design").
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} design")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Design (Incomplete)")
+            .is_some()
+    });
+    harness
+        .get_by_role_and_label(Role::Label, "Design (Incomplete)")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Result").is_some()
+    });
+
+    // Before validating, nothing is known to be stale yet — the button
+    // must not show for a result read against an `Unvalidated` project.
+    assert!(
+        harness
+            .query_by_label_contains("Update Stale Reference")
+            .is_none()
+    );
+
+    harness
+        .get_by_role_and_label(Role::Button, "Validate")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_label_contains("pending").is_none()
+    });
+
+    // `test_project`'s own fixture pins "design"'s result to commits
+    // baked into its `result.ron` at fixture-authoring time — genuinely
+    // stale against this repo's real, ever-advancing git history, same
+    // "real fact, not a canned one" spirit as the requirement-level stale-
+    // reference tests above.
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e094} Update Stale Reference")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_label_contains("pending").is_none()
+    });
+    // Same "the fix's own completion briefly reintroduces a `pending`
+    // entry via the re-fetch that follows it" reasoning as the
+    // requirement-level test above — wait on the button actually being
+    // gone rather than a fixed frame count.
+    wait_until(&mut harness, |h| {
+        h.query_by_label_contains("Update Stale Reference").is_none()
+    });
+
+    // `apply_refresh_stale_result_reference_result` marks `dirty` on
+    // success, same as any other real edit.
+    assert!(harness.query_by_label_contains("unsaved changes").is_some());
+}
+
+#[test]
 fn selecting_an_existing_requirement_opens_its_read_only_viewer() {
     let mut harness = harness();
     harness.step();
@@ -3752,16 +3934,17 @@ fn a_requirements_dependency_can_be_viewed_removed_and_a_new_one_added() {
     open_test_project(&mut harness);
 
     // Viewer first — "integration" has one real dependency in
-    // `test_project` (on "design", see `requirement.ron`); its
-    // summary text (`DependencyDraft`'s own `Display` impl) should be
-    // visible as plain read-only text, no `TextInput`/Remove button.
+    // `test_project` (on "design", see `requirement.ron`); its brief
+    // summary text (`DependencyDraft::brief`, no pinned commit — that's
+    // implementation detail in the read-only viewer, see that method's
+    // own doc comment) should be visible as a clickable link, no
+    // `TextInput`/Remove button.
     harness
         .get_by_role_and_label(Role::Button, "\u{e32c} integration")
         .click();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_label("requirements/design @ 9f8e7d6c5b4a3928170695847362514031201f0e")
-            .is_some()
+        h.query_by_label("requirements/design").is_some()
     });
     assert!(
         harness
@@ -3903,6 +4086,204 @@ fn a_requirements_dependency_can_be_viewed_removed_and_a_new_one_added() {
         h.query_by_label("\u{e18a} unsaved changes").is_some()
     });
     assert!(harness.query_by_label("\u{e18a} unsaved changes").is_some());
+}
+
+#[test]
+fn a_submodule_dependencys_link_navigates_to_that_module() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    // "design" (project root) depends on "beta" here rather than "alpha" —
+    // `modules/alpha/requirements/spec` already depends back on "design"
+    // (see its own `requirement.ron`), so naming "alpha" would create a
+    // dependency cycle; "beta" has no requirements of its own, so nothing
+    // to cycle back through. This only exercises `UpdateRequirement`
+    // against the in-memory draft (never `Validate`/`Save` to disk), so —
+    // like the dependency add/remove test above — it's safe to run
+    // against the real `test_project` fixture rather than a scratch copy.
+    open_leaf_for_editing(&mut harness, "\u{e32c} design", "Edit Requirement");
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+    harness.step();
+
+    fn composer<'h>(harness: &'h Harness<'_, GuiApp>) -> egui_kittest::Node<'h> {
+        harness
+            .get_by_role_and_label(Role::Label, "Add Dependency")
+            .parent()
+            .expect("dependency composer modal container not found")
+    }
+    composer(&harness)
+        .get_by_role_and_label(Role::RadioButton, "Submodule")
+        .click_accesskit();
+    harness.step();
+
+    composer(&harness)
+        .get_by_value("(choose a submodule)")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_all_by_role_and_label(Role::Button, "beta")
+        .last()
+        .expect("submodule dropdown option 'beta' not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    // "design"'s own requirement text is empty on disk (same rule the
+    // dependency add/remove test above already documents) — fill it in
+    // so Save doesn't reject an empty main text.
+    let requirement_text_field = harness
+        .get_all_by_role(Role::MultilineTextInput)
+        .next()
+        .expect("requirement text field not found");
+    requirement_text_field.focus();
+    requirement_text_field.type_text("Some requirement text.");
+    harness.step();
+
+    harness
+        .get_all_by_role_and_label(Role::Button, "Save")
+        .nth(1)
+        .expect("form Save button not found")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Requirement").is_some()
+    });
+
+    // Back in the read-only viewer: the new dependency shows as a
+    // "Submodule:" label next to a clickable link showing the submodule's
+    // fully qualified, leading-`/` path (not `DependencyDraft::brief`'s
+    // "Submodule: beta" form, which would be redundant with the leading
+    // label — see `render_requirement_form`'s own comment on this).
+    // "design" lives at the project root, so "beta"'s fully qualified path
+    // is just "/beta" here. Scoped to the row's own container (`.parent()`
+    // of the "Submodule:" label) rather than a bare
+    // `harness.get_by_label("/beta")` since that'd still be unambiguous
+    // here, but matches the pattern the rest of this test follows.
+    // `Role::Label` rather than `Role::Link` — a real `ui.link()` reports
+    // as `Role::Label` in this accesskit conversion, same as the
+    // pre-existing `LocalRequirement` dependency link above (confirmed
+    // empirically: neither shows up under `Role::Link`).
+    let dependency_row = harness
+        .get_by_role_and_label(Role::Label, "Submodule:")
+        .parent()
+        .expect("submodule dependency row not found");
+    dependency_row.get_by_label("/beta").click();
+    harness.step();
+
+    // Clicking it opens "beta"'s own module page, the same destination
+    // its tree row's "Set as current module" button would — modules have
+    // no `EntryPath` of their own, so this goes through `select_module`
+    // rather than the leaf-navigation `select` every other dependency
+    // link above uses.
+    wait_until(&mut harness, |h| {
+        h.query_all_by_label("Module: beta").next().is_some()
+    });
+    assert!(harness.query_all_by_label("Module: beta").next().is_some());
+}
+
+#[test]
+fn adding_a_named_submodule_dependency_offers_the_current_modules_own_submodules() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    // "design" lives at the project root, whose own direct submodules are
+    // "alpha" and "beta" (see
+    // `requirement_form_dependency_picker_scopes_by_this_module_and_submodules`'s
+    // own comment on this fixture's module layout) — "alpha_child" (nested
+    // under "alpha") must NOT be offered, since a named-submodule
+    // dependency only ever names a *direct* child.
+    open_leaf_for_editing(&mut harness, "\u{e32c} design", "Edit Requirement");
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    fn composer<'h>(harness: &'h Harness<'_, GuiApp>) -> egui_kittest::Node<'h> {
+        harness
+            .get_by_role_and_label(Role::Label, "Add Dependency")
+            .parent()
+            .expect("dependency composer modal container not found")
+    }
+    composer(&harness)
+        .get_by_role_and_label(Role::RadioButton, "Submodule")
+        .click_accesskit();
+    harness.step();
+
+    // The sidebar tree (expanded by `open_test_project`) already has its
+    // own "alpha"/"alpha_child"/"beta" module-row buttons, so the popup's
+    // own options can't be told apart from those by label alone — count
+    // before and after opening the popup instead. "alpha_child" (nested
+    // under "alpha", not a direct child of the project root) must not
+    // gain a second entry; "alpha"/"beta" (the root's own direct
+    // submodules) must.
+    let alpha_before = harness.query_all_by_role_and_label(Role::Button, "alpha").count();
+    let alpha_child_before = harness
+        .query_all_by_role_and_label(Role::Button, "alpha_child")
+        .count();
+    let beta_before = harness.query_all_by_role_and_label(Role::Button, "beta").count();
+
+    composer(&harness)
+        .get_by_value("(choose a submodule)")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    assert_eq!(
+        harness.query_all_by_role_and_label(Role::Button, "alpha").count(),
+        alpha_before + 1
+    );
+    assert_eq!(
+        harness.query_all_by_role_and_label(Role::Button, "beta").count(),
+        beta_before + 1
+    );
+    assert_eq!(
+        harness
+            .query_all_by_role_and_label(Role::Button, "alpha_child")
+            .count(),
+        alpha_child_before
+    );
+
+    // The popup's own entry is whichever "alpha" button wasn't there
+    // before it opened — the newly-added one is last in paint order.
+    harness
+        .get_all_by_role_and_label(Role::Button, "alpha")
+        .last()
+        .expect("submodule dropdown option 'alpha' not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    assert!(composer(&harness).query_by_value("alpha").is_some());
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    // Back in edit mode with the row added but not yet saved — the
+    // freshly-added dependency isn't rendered as a summary string until
+    // Save returns to the read-only viewer, so check its kind dropdown
+    // instead, mirroring how the existing-row assertions elsewhere in this
+    // file confirm a field's live value rather than a rendered summary.
+    assert!(harness.get_all_by_value("Submodule").next().is_some());
 }
 
 #[test]
@@ -4420,9 +4801,12 @@ fn path_picker_dialog_shows_no_matches_for_an_unmatched_filter() {
 
     assert!(harness.query_by_label("No matches.").is_some());
     // Confirms the list itself is actually empty, not just coincidentally
-    // missing that one label — the modal's own row for "design" is
-    // gone (only the tree's own leaf button for it can still match).
-    assert_eq!(harness.get_all_by_label("design").count(), 1);
+    // missing that one label — no node bare-labelled "design" remains at
+    // all: the modal's own row is filtered out, the tree's own leaf
+    // button carries a status-glyph prefix ("\u{e32c} design", not a bare
+    // match), and results (which would otherwise nest a bare-named row
+    // under it) don't get their own tree row any more.
+    assert_eq!(harness.query_all_by_label("design").count(), 0);
 }
 
 #[test]
@@ -4585,10 +4969,10 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
     let identifier_field = fields.first().expect("result identifier field not found");
     let title_field = fields.get(1).expect("result title field not found");
 
-    // Prefilled as `<today> [<requirement name>] [<test name>]` (see
+    // Prefilled as `<today> <test name>` (see
     // `GuiApp::create_result_clicked`/`default_result_name`) — checked
-    // structurally (a `YYYY-MM-DD` date, then the two bracketed names)
-    // rather than against a hardcoded date, which would go stale.
+    // structurally (a `YYYY-MM-DD` date, then the test name) rather than
+    // against a hardcoded date, which would go stale.
     let prefilled = identifier_field
         .value()
         .expect("identifier field has no value");
@@ -4601,12 +4985,13 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
             .char_indices()
             .all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() })
     );
-    assert_eq!(rest, "[scratchreq] [smoke]");
+    assert_eq!(rest, "smoke");
 
     // "Generate title from identifier" is checked by default, same as
     // the Duplicate/Recreate dialogs' own "Regenerate title" checkbox —
-    // and, since it's checked, the title field already mirrors the
-    // identifier and is disabled rather than independently editable.
+    // and, since it's checked, the title field already mirrors a
+    // title-cased version of the identifier and is disabled rather than
+    // independently editable.
     assert_eq!(
         harness
             .get_by_role_and_label(Role::CheckBox, "Generate title from identifier")
@@ -4614,7 +4999,10 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
             .toggled(),
         Some(Toggled::True)
     );
-    assert_eq!(title_field.value().as_deref(), Some(prefilled.as_str()));
+    assert_eq!(
+        title_field.value().as_deref(),
+        Some(logical::draft::title_case_from_name(&prefilled).as_str())
+    );
     assert!(title_field.accesskit_node().is_disabled());
 
     identifier_field.focus();
@@ -4634,7 +5022,10 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
         .value()
         .expect("identifier field has no value");
     assert!(edited_identifier.ends_with(" (edited)"));
-    assert_eq!(title_field.value().as_deref(), Some(edited_identifier.as_str()));
+    assert_eq!(
+        title_field.value().as_deref(),
+        Some(logical::draft::title_case_from_name(&edited_identifier).as_str())
+    );
 
     harness
         .get_by_role_and_label(Role::Button, "Create result")
@@ -4815,16 +5206,15 @@ fn result_form_requirement_path_picker_fills_the_field() {
     harness.step();
     open_test_project(&mut harness);
 
-    // Baseline count of "design"-labelled nodes before the form even
-    // opens: the "design" requirement's own tree leaf, plus its nested
-    // result (also named "design" in the fixture — see `render_leaf`'s
-    // own doc comment on why a result renders right under its
-    // requirement). Compared against the post-pick count below to prove
-    // the picked value actually landed in the form, since the field is a
-    // read-only label now (not a `text_edit`), so `get_all_by_value`
-    // doesn't apply to it the way it does to the still-editable
-    // `test_path` field's own picker test.
-    let design_label_count_before = harness.get_all_by_label("design").count();
+    // Baseline count of bare "design"-labelled nodes before the form even
+    // opens: zero — the "design" requirement's own tree leaf carries a
+    // status-glyph prefix ("\u{e32c} design", not a bare match), and
+    // results don't get their own tree row. Compared against the
+    // post-pick count below to prove the picked value actually landed in
+    // the form, since the field is a read-only label now (not a
+    // `text_edit`), so `get_all_by_value` doesn't apply to it the way it
+    // does to the still-editable `test_path` field's own picker test.
+    let design_label_count_before = harness.query_all_by_label("design").count();
 
     harness
         .get_by_role_and_label(Role::Button, "New Result")
@@ -4860,14 +5250,11 @@ fn result_form_requirement_path_picker_fills_the_field() {
     // modal row's text is `LogicalPath`'s own `Display` (bare "design"
     // for a root-level entry — no "modules/..." prefix, unlike the tree's
     // own leaf button, which additionally prefixes a status glyph —
-    // "\u{e32c} design" — so the two don't collide). More than one
-    // matching "design" node turns up under `get_all_by_label` at this
-    // point (the tree's own requirement leaf button and its nested result
-    // leaf — see `design_label_count_before` above — plus the modal row
-    // itself while it's open); the modal row is always drawn last (the
-    // modal renders last in `ui()`), so `.last()` reliably picks it
-    // regardless of how many other "design"-labelled nodes exist —
-    // `.next()`/`.first()` would silently exercise the wrong widget.
+    // "\u{e32c} design" — so the two don't collide). `.last()` is used
+    // rather than `.next()`/`.first()` on principle, in case some other
+    // "design"-labelled node is ever added alongside the modal row while
+    // it's open — the modal renders last in `ui()`, so its row is always
+    // the last match regardless.
     harness
         .get_all_by_label("design")
         .last()
@@ -4962,19 +5349,19 @@ fn path_picker_dialogs_filter_field_narrows_the_list() {
     harness.step();
 
     // `test_project` has (at least) two root-level requirements —
-    // "design" and "external" — so both show unfiltered, each with
-    // two matches by label (the tree's own leaf button, plus the modal's
-    // own row — see the previous test's own comment on why every leaf
-    // name matches twice).
-    assert_eq!(harness.get_all_by_label("design").count(), 2);
-    assert_eq!(harness.get_all_by_label("external").count(), 2);
+    // "design" and "external" — so both show unfiltered, each with one
+    // match by label: the modal's own row. The tree's own leaf button
+    // doesn't count (it carries a status-glyph prefix, not a bare match —
+    // see the next test's own comment).
+    assert_eq!(harness.get_all_by_label("design").count(), 1);
+    assert_eq!(harness.get_all_by_label("external").count(), 1);
 
     // The modal's own filter field is its one `Role::TextInput` (the
     // dialog carries no other text field) — narrowing it to "ext" should
-    // drop the modal's own "design" row, leaving only the tree's own
-    // leaf button still matching (one match, not two), while "external"
-    // keeps both (its modal row still matches, on top of its own tree
-    // leaf).
+    // drop the modal's own "design" row entirely (no bare-labelled
+    // "design" node remains, hence `query_all` rather than `get_all` to
+    // avoid panicking on zero matches), while "external"'s modal row
+    // still matches.
     let filter_field = harness
         .get_all_by_role(Role::TextInput)
         .last()
@@ -4983,8 +5370,198 @@ fn path_picker_dialogs_filter_field_narrows_the_list() {
     filter_field.type_text("ext");
     harness.step();
 
+    assert_eq!(harness.query_all_by_label("design").count(), 0);
+    assert_eq!(harness.get_all_by_label("external").count(), 1);
+}
+
+#[test]
+fn result_form_path_pickers_show_no_scope_radios() {
+    // The scope radios (All/This module/Submodules) only make sense for
+    // the requirement form's own Dependency/TestReference pickers, which
+    // have a real "owning module" to scope relative to — a not-yet-saved
+    // result has none, so its two pickers (requirement path, then test
+    // path) keep the old unscoped behavior with no radios at all.
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "New Result")
+        .click();
+    harness.step();
+
+    harness
+        .get_all_by_role_and_label(Role::Button, "Pick…")
+        .next()
+        .expect("requirement path picker not found")
+        .click();
+    harness.step();
+    harness.step();
+
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Pick a requirement")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::RadioButton, "This module")
+            .is_none()
+    );
+}
+
+#[test]
+fn requirement_form_dependency_picker_scopes_by_this_module_and_submodules() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    // Select "alpha" as the current module so its own leaves ("spec",
+    // "alpha_test") render in the bottom pane. With "Expand All" already
+    // run by `open_test_project`, the top tree pane's "not current" glyph
+    // buttons are, in order, alpha, alpha_child, beta (see
+    // `switching_selected_module_updates_the_bottom_pane`'s own comment on
+    // this exact ordering), so alpha's is the first.
+    harness
+        .get_all_by_role_and_label(Role::Button, "\u{E24A}")
+        .next()
+        .expect("alpha's module button not found")
+        .click();
+    harness.step();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_all_by_label("Module: alpha").next().is_some()
+    });
+
+    // "spec" is alpha's own real requirement
+    // (`test_project/modules/alpha/requirements/spec`) — open it for
+    // editing so the picker's owning module is `["alpha"]`.
+    open_leaf_for_editing(&mut harness, "\u{e32c} spec", "Edit Requirement");
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add dependency")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Label, "Add Dependency")
+        .parent()
+        .expect("dependency composer modal container not found")
+        .get_all_by_role_and_label(Role::Button, "Pick…")
+        .next()
+        .expect("dependency composer Pick button not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    // The radio queries below are scoped to the path-picker modal itself
+    // (via its "Pick a requirement" heading, same technique as the
+    // composer-scoped "Pick…" lookup above) rather than the whole
+    // document — the dependency composer sitting underneath it (still
+    // mounted, just covered) has its own unrelated `DependencyDraft` kind
+    // picker with an "All submodules" radio of its own (see
+    // `render_dependency_kind_picker`); the queries below stay scoped to
+    // the path-picker modal to keep this test independent of that.
+
+    // "All" (the default): every requirement in the project shows —
+    // root-level ones and alpha's own nested "spec" alike. The modal row's
+    // text is `LogicalPath`'s own `Display`, which prefixes nested entries
+    // with their module path ("modules/alpha/spec"), unlike the bare
+    // root-level "design".
+    assert!(
+        harness
+            .get_by_role_and_label(Role::Label, "Pick a requirement")
+            .parent()
+            .expect("path picker modal container not found")
+            .get_by_role_and_label(Role::RadioButton, "All")
+            .accesskit_node()
+            .toggled()
+            == Some(Toggled::True)
+    );
     assert_eq!(harness.get_all_by_label("design").count(), 1);
-    assert_eq!(harness.get_all_by_label("external").count(), 2);
+    assert_eq!(harness.get_all_by_label("modules/alpha/spec").count(), 1);
+
+    // "This module": only alpha's own "spec" remains — the root-level
+    // "design" disappears.
+    harness
+        .get_by_role_and_label(Role::Label, "Pick a requirement")
+        .parent()
+        .expect("path picker modal container not found")
+        .get_by_role_and_label(Role::RadioButton, "This module")
+        .click_accesskit();
+    harness.step();
+
+    assert_eq!(harness.query_all_by_label("design").count(), 0);
+    assert_eq!(harness.get_all_by_label("modules/alpha/spec").count(), 1);
+
+    // "Submodules": alpha's own "spec" now disappears too (it's *in*
+    // alpha, not a submodule below it) — alpha's own child module
+    // (`alpha_child`) has no requirements of its own, so nothing at all
+    // matches.
+    harness
+        .get_by_role_and_label(Role::Label, "Pick a requirement")
+        .parent()
+        .expect("path picker modal container not found")
+        .get_by_role_and_label(Role::RadioButton, "Submodules")
+        .click_accesskit();
+    harness.step();
+
+    assert_eq!(harness.query_all_by_label("modules/alpha/spec").count(), 0);
+    assert_eq!(harness.query_all_by_label("design").count(), 0);
+    assert!(harness.query_by_label("No matches.").is_some());
+}
+
+#[test]
+fn requirement_form_test_reference_picker_shows_scope_radios_and_scopes_by_this_module() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    harness
+        .get_all_by_role_and_label(Role::Button, "\u{E24A}")
+        .next()
+        .expect("alpha's module button not found")
+        .click();
+    harness.step();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_all_by_label("Module: alpha").next().is_some()
+    });
+
+    open_leaf_for_editing(&mut harness, "\u{e32c} spec", "Edit Requirement");
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add test procedure")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Label, "Add Test Procedure")
+        .parent()
+        .expect("test reference composer modal container not found")
+        .get_all_by_role_and_label(Role::Button, "Pick…")
+        .next()
+        .expect("test reference composer Pick button not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    // "smoke" is a real root-level test; "alpha_test" is alpha's own.
+    // Both show under the default "All" scope.
+    assert_eq!(harness.get_all_by_label("smoke").count(), 1);
+    assert_eq!(harness.get_all_by_label("modules/alpha/alpha_test").count(), 1);
+
+    harness
+        .get_by_role_and_label(Role::RadioButton, "This module")
+        .click_accesskit();
+    harness.step();
+
+    // Only alpha's own "alpha_test" remains — the root-level "smoke"
+    // disappears.
+    assert_eq!(harness.query_all_by_label("smoke").count(), 0);
+    assert_eq!(harness.get_all_by_label("modules/alpha/alpha_test").count(), 1);
 }
 
 #[test]
@@ -4993,17 +5570,41 @@ fn editing_an_existing_result_can_add_a_local_attachment() {
     harness.step();
     open_test_project(&mut harness);
 
-    // Unlike a requirement leaf, a result's tree label carries no status
-    // glyph prefix (see `render_tree_node` — only `EntryKind::Requirement`
-    // gets one), so the button's label is the bare name — unambiguous
-    // here even though `test_project` also has a requirement named
-    // "design" (a real gui-core bug this test caught: `select` used
-    // to send `GetEntryDetail` with no `kind`, and the core resolved by
-    // trying requirement/test/result pools in a fixed order, so clicking
-    // this exact result silently opened the *requirement* named
-    // "design" instead — fixed by having `select`/`render_tree_node`
-    // pass the clicked node's own `EntryKind` through).
-    open_leaf_for_editing(&mut harness, "design", "Edit Result");
+    // Results no longer get their own tree row — the only path to one is
+    // via its owning requirement's viewer/form, which lists each result as
+    // a `ui.link` reading "{title} ({status:?})" (see `view.rs`'s
+    // `Results:` section) — though egui_kittest reports its accesskit
+    // role as `Label`, not `Link`, hence the query role below. Open the
+    // "design" requirement first, then follow its one result's link —
+    // "Design" is the result's `title` field in the fixture, distinct
+    // from the requirement's own name "design".
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} design")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Design (Incomplete)")
+            .is_some()
+    });
+    harness
+        .get_by_role_and_label(Role::Label, "Design (Incomplete)")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "Edit").is_some()
+    });
+    // One more `step()` than usual before this click: the Result viewer
+    // just landed off a nested navigation (requirement viewer -> result
+    // viewer) two `wait_until`s deep, and clicking "Edit" immediately
+    // (real pointer coordinates, not `click_accesskit`) misses — the
+    // layout is still one frame behind where the button's rect settles.
+    harness.step();
+    harness.get_by_role_and_label(Role::Button, "Edit").click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Edit Result")
+            .is_some()
+    });
 
     // Field order among `Role::TextInput` nodes in edit mode: the status
     // bar's own zoom field(0) and the left pane's own filter field(1) —

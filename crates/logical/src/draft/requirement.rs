@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use disk::{AttachmentReferenceKind, DependencyReferenceKind, EntryName, TestReferenceKind};
 
-use crate::draft::module::AddNamedChildError;
+use crate::draft::module::{AddNamedChildError, UpdateNamedChildError, title_case_from_name};
 use crate::draft::result::ResultDraft;
 use crate::pool::{AddPoolFileError, add_pool_file};
 
@@ -65,12 +65,35 @@ impl RequirementDraft {
         self.attachments.remove(path)
     }
 
-    pub fn add_result(&mut self, name: &str, result: ResultDraft) -> Result<(), AddNamedChildError> {
+    /// See `ModuleDraft::add_requirement`'s doc comment — same title
+    /// autopopulation, from the result's own name rather than its owning
+    /// requirement's.
+    pub fn add_result(&mut self, name: &str, mut result: ResultDraft) -> Result<(), AddNamedChildError> {
+        if result.title.trim().is_empty() {
+            result.title = title_case_from_name(name);
+        }
         crate::draft::module::add_named(&mut self.results, name, result)
     }
 
     pub fn remove_result(&mut self, name: &str) -> Option<ResultDraft> {
         self.results.remove(&EntryName(name.to_string()))
+    }
+
+    /// See `ModuleDraft::update_requirement`'s doc comment — same title
+    /// autopopulation apply to editing an existing result, not just
+    /// creating one. Unlike requirement/test text, a result has no
+    /// "must not be empty" field to enforce here.
+    pub fn update_result(&mut self, name: &EntryName, mut result: ResultDraft) -> Result<(), UpdateNamedChildError> {
+        if result.title.trim().is_empty() {
+            result.title = title_case_from_name(name.as_str());
+        }
+        match self.results.entry(name.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                e.insert(result);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Vacant(_) => Err(UpdateNamedChildError::NotFound),
+        }
     }
 }
 
@@ -138,5 +161,58 @@ mod test {
     fn remove_result_is_none_when_absent() {
         let mut requirement = RequirementDraft::new("Title");
         assert!(requirement.remove_result("definition").is_none());
+    }
+
+    fn blank_title_result_draft() -> ResultDraft {
+        ResultDraft::new(
+            "",
+            "abc",
+            disk::ReferencePath("tests/generic_test".to_string()),
+            "def",
+        )
+    }
+
+    #[test]
+    fn add_result_autopopulates_an_empty_title_from_the_name() {
+        let mut requirement = RequirementDraft::new("Title");
+        requirement
+            .add_result("some_result", blank_title_result_draft())
+            .unwrap();
+        assert_eq!(
+            requirement
+                .results
+                .get(&EntryName("some_result".to_string()))
+                .unwrap()
+                .title,
+            "Some Result"
+        );
+    }
+
+    #[test]
+    fn update_result_replaces_content_and_autopopulates_an_empty_title() {
+        let mut requirement = RequirementDraft::new("Title");
+        requirement
+            .add_result("some_result", minimal_result_draft())
+            .unwrap();
+        requirement
+            .update_result(&EntryName("some_result".to_string()), blank_title_result_draft())
+            .unwrap();
+        assert_eq!(
+            requirement
+                .results
+                .get(&EntryName("some_result".to_string()))
+                .unwrap()
+                .title,
+            "Some Result"
+        );
+    }
+
+    #[test]
+    fn update_result_is_not_found_when_absent() {
+        let mut requirement = RequirementDraft::new("Title");
+        let err = requirement
+            .update_result(&EntryName("definition".to_string()), minimal_result_draft())
+            .unwrap_err();
+        assert!(matches!(err, UpdateNamedChildError::NotFound));
     }
 }

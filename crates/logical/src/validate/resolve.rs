@@ -148,6 +148,19 @@ impl<'a> Context<'a> {
                     // Satisfaction is query-time (see "Validation questions
                     // — answered" #3) — nothing to resolve here.
                 }
+                DependencyReferenceKind::SubmoduleV1(name) => {
+                    let exists = get_module(self.root, &path.modules)
+                        .is_some_and(|module| module.modules.contains_key(name));
+                    if !exists {
+                        self.record_unresolved(
+                            UnresolvedTarget::Submodule {
+                                parent: path.modules.clone(),
+                                name: name.clone(),
+                            },
+                            path.clone(),
+                        );
+                    }
+                }
             }
         }
 
@@ -624,6 +637,51 @@ mod test {
             .unwrap();
 
         assert!(validate(project, &FixedRemoteGit).is_ok());
+    }
+
+    #[test]
+    fn a_named_submodule_dependency_on_an_existing_submodule_is_accepted() {
+        let mut project = create_project("Capstone");
+        project.tree.add_module("alpha").unwrap();
+        let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
+        requirement.commit = Some("c1".to_string());
+        requirement
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(EntryName(
+                "alpha".to_string(),
+            )));
+        project
+            .tree
+            .add_requirement("definition", requirement)
+            .unwrap();
+
+        assert!(validate(project, &FixedRemoteGit).is_ok());
+    }
+
+    #[test]
+    fn a_named_submodule_dependency_on_a_missing_submodule_is_unresolved() {
+        let mut project = create_project("Capstone");
+        let mut requirement = RequirementDraft::new("Definition");
+        requirement.requirement_text = "Text".to_string();
+        requirement.commit = Some("c1".to_string());
+        requirement
+            .dependencies
+            .push(DependencyReferenceKind::SubmoduleV1(EntryName(
+                "nonexistent".to_string(),
+            )));
+        project
+            .tree
+            .add_requirement("definition", requirement)
+            .unwrap();
+
+        let errors = validate(project, &FixedRemoteGit).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            ValidationError::UnresolvedReference { .. }
+        ));
+        assert!(errors[0].to_string().contains("nonexistent"));
     }
 
     #[test]

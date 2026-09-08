@@ -31,6 +31,7 @@ pub const NEW_RESULT: &str = egui_phosphor::regular::CHART_BAR;
 pub const NEW_MODULE: &str = egui_phosphor::regular::FOLDER_PLUS;
 pub const ATTACHMENTS: &str = egui_phosphor::regular::PAPERCLIP;
 pub const COMMIT_ALL: &str = egui_phosphor::regular::GIT_COMMIT;
+pub const PUSH: &str = egui_phosphor::regular::CLOUD_ARROW_UP;
 pub const CLEAR: &str = egui_phosphor::regular::ERASER;
 
 // Menu bar (`render_menu_bar`'s File menu).
@@ -43,6 +44,12 @@ pub const SAVE_AS: &str = egui_phosphor::regular::FLOPPY_DISK_BACK;
 /// `UNDO`'s single counter-clockwise arrow, a circular two-arrow "sync"
 /// glyph reads more like "bring this up to date" than "undo".
 pub const UPDATE_STALE_REFERENCES: &str = egui_phosphor::regular::ARROWS_CLOCKWISE;
+
+// Requirement/Test/Result editor forms.
+/// Next to each form's Title field, in edit mode only — regenerates the
+/// title from the current Identifier via `title_case_from_name`. Same
+/// "resync from source" glyph family as `UPDATE_STALE_REFERENCES`.
+pub const REGENERATE_TITLE: &str = egui_phosphor::regular::ARROWS_CLOCKWISE;
 
 // Pre-existing ad hoc glyphs, migrated to the same icon set — see each
 // call site in `view.rs` for why these aren't colored like `status_icon`

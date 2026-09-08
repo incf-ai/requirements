@@ -11,11 +11,11 @@ use tokio::sync::mpsc;
 
 use crate::tree::{
     build_tree_snapshot, dependency_chain, find_references, get_entry_detail, get_module_pools, get_module_summary,
-    get_requirement_met_status, resolve_module_mut,
+    get_requirement_met_status, get_result_reference_is_stale, resolve_module_mut,
 };
 use crate::{
     AddChildError, AddLocalPoolError, AddPoolChildError, AddPoolFileError, Command, CommitAllError, EntryKind, Event,
-    GetChangedFilesError, GetDiffError, LogicalPath, Outcome, ProjectState, RedoError, ReferencePath,
+    GetChangedFilesError, GetDiffError, LogicalPath, Outcome, ProjectState, PushError, RedoError, ReferencePath,
     RefreshStaleTestReferencesError, RenameModuleError, RenameProjectError, RequestId, ResolveLocalCommitError, SaveError,
     UndoError, UpdateChildError,
 };
@@ -249,6 +249,9 @@ where
             } => self.add_result(requirement, name, result, request),
             Command::UpdateResult { target, result, request } => self.update_result(target, result, request),
             Command::RemoveResult { target, request } => self.remove_result(target, request),
+            Command::RefreshStaleResultReference { target, request } => {
+                self.refresh_stale_result_reference(target, request)
+            }
             Command::AddModule { module, name, request } => self.add_module(module, name, request),
             Command::RemoveModule { target, request } => self.remove_module(target, request),
             Command::RenameModule {
@@ -290,6 +293,9 @@ where
             Command::GetRequirementMetStatus { target, request } => {
                 self.spawn_read(request, move |state| get_requirement_met_status(&state, &target))
             }
+            Command::GetResultReferenceIsStale { target, request } => {
+                self.spawn_read(request, move |state| get_result_reference_is_stale(&state, &target))
+            }
             Command::DependencyChain { target, request } => {
                 self.spawn_read(request, move |state| dependency_chain(&state, &target))
             }
@@ -304,6 +310,7 @@ where
             Command::GetChangedFiles { request } => self.spawn_get_changed_files(request),
             Command::GetDiff { path, request } => self.spawn_get_diff(path, request),
             Command::CommitAll { message, request } => self.spawn_commit_all(message, request),
+            Command::Push { request } => self.spawn_push(request),
             Command::FindReferences { target, request } => {
                 self.spawn_read(request, move |state| find_references(&state, &target))
             }
@@ -486,10 +493,11 @@ where
 
     /// Shared shape for every `update_*` command: resolve the target
     /// module, then hand it to `f` to replace the named entry — `f` is
-    /// responsible for the `NotFound` check (each kind's own `BTreeMap`),
-    /// there's no `logical`-level "update" call to delegate to, unlike
-    /// `add_*`/`remove_*`. Only fires `TreeChanged` when `f` actually
-    /// changed something, same reasoning as `remove_from_module`.
+    /// responsible for the `NotFound` check, typically by delegating to a
+    /// `logical`-level `update_*` method (`ModuleDraft::update_requirement`/
+    /// `update_test`, `RequirementDraft::update_result`) that owns it. Only
+    /// fires `TreeChanged` when `f` actually changed something, same
+    /// reasoning as `remove_from_module`.
     fn update_in_module(
         &mut self,
         request: RequestId,
@@ -641,6 +649,88 @@ where
         });
     }
 
+    /// See `Command::RefreshStaleResultReference`'s own doc comment — same
+    /// "read the still-`Validated` project's current commits before
+    /// mutating it in place, then immediately revalidate" shape as
+    /// `refresh_stale_test_references`, just targeting a result's own
+    /// `requirement_commit`/`test_commit` instead of a requirement's
+    /// `tests` list.
+    fn refresh_stale_result_reference(&mut self, target: logical::ResultPath, request: RequestId) {
+        let Some(ProjectState::Validated(validated)) = &self.state else {
+            self.complete(
+                request,
+                Outcome::RefreshStaleResultReference(Err(RefreshStaleTestReferencesError::NotValidated)),
+            );
+            return;
+        };
+        let Some(refreshed_result) = validated.refreshed_result(&target) else {
+            self.complete(
+                request,
+                Outcome::RefreshStaleResultReference(Err(RefreshStaleTestReferencesError::Update(
+                    UpdateChildError::NotFound,
+                ))),
+            );
+            return;
+        };
+
+        let logical::ResultPath { requirement, name } = target;
+        let logical::LogicalPath { modules, name: requirement_name } = requirement;
+        let undo_snapshot = self.snapshot_state();
+        self.ensure_draft();
+        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
+            unreachable!("ensure_draft leaves state as Draft")
+        };
+        let result = match resolve_module_mut(&mut draft.tree, &modules) {
+            None => Err(UpdateChildError::ModuleNotFound),
+            Some(target_module) => match target_module.requirements.get_mut(&requirement_name) {
+                Some(requirement) => {
+                    if let std::collections::btree_map::Entry::Occupied(mut entry) = requirement.results.entry(name)
+                    {
+                        entry.insert(refreshed_result);
+                        Ok(())
+                    } else {
+                        Err(UpdateChildError::NotFound)
+                    }
+                }
+                None => Err(UpdateChildError::NotFound),
+            },
+        };
+        if let Err(err) = result {
+            self.complete(
+                request,
+                Outcome::RefreshStaleResultReference(Err(RefreshStaleTestReferencesError::Update(err))),
+            );
+            self.push_tree_changed();
+            return;
+        }
+        if let Some(undo_snapshot) = undo_snapshot {
+            self.commit_undo_snapshot(undo_snapshot);
+        }
+
+        // Same "an edit just demoted to `Draft`; revalidate immediately so
+        // this doesn't read as having wiped the whole project's validation
+        // results" reasoning as `refresh_stale_test_references`.
+        let ProjectState::Draft(draft) = self.state.take().expect("just confirmed Some(Draft) above") else {
+            unreachable!("ensure_draft leaves state as Draft")
+        };
+        self.mutation_in_flight = true;
+        let completions = self.completions.clone();
+        let remote_git = self.git.clone();
+        tokio::task::spawn_blocking(move || {
+            let restore = draft.clone();
+            let state = match logical::validate::validate(draft, &remote_git) {
+                Ok(validated) => ProjectState::Validated(validated),
+                Err(_) => ProjectState::Draft(restore),
+            };
+            let _ = completions.send(Completion {
+                request,
+                state: Some(state),
+                project_path: None,
+                outcome: Outcome::RefreshStaleResultReference(Ok(())),
+            });
+        });
+    }
+
     fn remove_requirement(&mut self, target: logical::LogicalPath, request: RequestId) {
         let logical::LogicalPath { modules, name } = target;
         self.remove_from_module(
@@ -733,12 +823,7 @@ where
                 let Some(requirement) = module.requirements.get_mut(&requirement_name) else {
                     return Err(UpdateChildError::NotFound);
                 };
-                if let std::collections::btree_map::Entry::Occupied(mut e) = requirement.results.entry(name) {
-                    e.insert(*result);
-                    Ok(())
-                } else {
-                    Err(UpdateChildError::NotFound)
-                }
+                requirement.update_result(&name, *result).map_err(UpdateChildError::from)
             },
             Outcome::UpdateResult,
         );
@@ -1237,6 +1322,20 @@ where
         });
     }
 
+    /// See `Command::Push`'s own doc comment.
+    fn spawn_push(&self, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(request, Outcome::Push(Err(PushError::NoProjectPath)));
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = Outcome::Push(git.push(&project_path).map_err(PushError::from));
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
     fn spawn_load_project(&mut self, path: PathBuf, request: RequestId) {
         let previous_state = self.state.take();
         self.mutation_in_flight = true;
@@ -1459,7 +1558,9 @@ mod test {
     use disk::{DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, TestReferenceKind};
     use logical::LogicalPath;
     use logical::draft::RequirementDraft;
-    use syscalls::{ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, DiffError, StdFilesystem};
+    use syscalls::{
+        ChangedPathsError, CommitAllError, CommitForPathError, CommitForRemoteError, DiffError, PushError, StdFilesystem,
+    };
 
     use logical::draft::AddNamedChildError;
 
@@ -1491,6 +1592,10 @@ mod test {
 
         fn diff(&self, _dir: &Path, path: &Path) -> Result<String, DiffError> {
             Ok(format!("diff for {}", path.display()))
+        }
+
+        fn push(&self, _dir: &Path) -> Result<String, PushError> {
+            Ok("pushed".to_string())
         }
     }
 
@@ -2796,6 +2901,163 @@ mod test {
     }
 
     #[tokio::test]
+    async fn refresh_stale_result_reference_without_validating_first_reports_not_validated() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        // Not validated in this session — no "current" requirement/test
+        // commits known to correct anything to.
+        commands
+            .send(Command::RefreshStaleResultReference {
+                target: logical::ResultPath {
+                    requirement: LogicalPath::root(entry_name("design")),
+                    name: entry_name("design"),
+                },
+                request: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 2).await,
+            Outcome::RefreshStaleResultReference(Err(RefreshStaleTestReferencesError::NotValidated))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_result_reference_on_a_nonexistent_entry_reports_not_found() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands.send(Command::Validate { request: 2 }).unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::Validate(Ok(()))));
+
+        commands
+            .send(Command::RefreshStaleResultReference {
+                target: logical::ResultPath {
+                    requirement: LogicalPath::root(entry_name("design")),
+                    name: entry_name("does_not_exist"),
+                },
+                request: 3,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 3).await,
+            Outcome::RefreshStaleResultReference(Err(RefreshStaleTestReferencesError::Update(
+                UpdateChildError::NotFound
+            )))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_result_reference_fixes_the_stale_reference() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        // A fresh result pinned to obviously wrong commits — deliberately
+        // not this repo's own real current commit, so the test doesn't
+        // depend on that hash, only on it being *different*.
+        // `FixedGit` always answers "deadbeef" for any path's *current*
+        // commit (see its own doc comment), so a genuinely stale pin here
+        // has to be anything else.
+        let stale_result = logical::draft::ResultDraft::new(
+            "Stale",
+            "obsolete-requirement-commit",
+            ReferencePath("/tests/smoke".to_string()),
+            "obsolete-test-commit",
+        );
+        commands
+            .send(Command::AddResult {
+                requirement: LogicalPath::root(entry_name("design")),
+                name: entry_name("scratch_result"),
+                result: Box::new(stale_result),
+                request: 2,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddResult(Ok(()))));
+
+        commands.send(Command::Validate { request: 3 }).unwrap();
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::Validate(Ok(()))));
+
+        let result_path = logical::ResultPath {
+            requirement: LogicalPath::root(entry_name("design")),
+            name: entry_name("scratch_result"),
+        };
+        commands
+            .send(Command::GetEntryDetail {
+                target: EntryPath::Result(result_path.clone()),
+                request: 4,
+            })
+            .unwrap();
+        match recv_completed(&mut events, 4).await {
+            Outcome::EntryDetail(Some(EntryDetail::Result {
+                stale,
+                requirement_commit,
+                test_commit,
+                ..
+            })) => {
+                assert!(stale);
+                assert_eq!(requirement_commit, "obsolete-requirement-commit");
+                assert_eq!(test_commit, "obsolete-test-commit");
+            }
+            other => panic!("expected EntryDetail(Some(Result)), got {other:?}"),
+        }
+
+        commands
+            .send(Command::RefreshStaleResultReference {
+                target: result_path.clone(),
+                request: 5,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 5).await,
+            Outcome::RefreshStaleResultReference(Ok(()))
+        ));
+
+        // Implicitly revalidated on success — see `refresh_stale_test_
+        // references_fixes_the_stale_reference`'s own comment on why no
+        // separate `Validate` call is needed before this re-fetch.
+        commands
+            .send(Command::GetEntryDetail {
+                target: EntryPath::Result(result_path),
+                request: 6,
+            })
+            .unwrap();
+        match recv_completed(&mut events, 6).await {
+            Outcome::EntryDetail(Some(EntryDetail::Result {
+                stale,
+                requirement_commit,
+                test_commit,
+                ..
+            })) => {
+                assert!(!stale);
+                assert_eq!(requirement_commit, "deadbeef");
+                assert_eq!(test_commit, "deadbeef");
+            }
+            other => panic!("expected EntryDetail(Some(Result)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn update_test_replaces_content() {
         let (commands, mut events) = spawn_test_actor();
 
@@ -2902,6 +3164,67 @@ mod test {
             Outcome::EntryDetail(Some(EntryDetail::Result { title, requirement, .. })) => {
                 assert_eq!(title, "Updated");
                 assert_eq!(requirement, LogicalPath::root(entry_name("design")));
+            }
+            other => panic!("expected EntryDetail(Some(Result)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_result_with_a_blank_title_autopopulates_it_from_the_name() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        let original = logical::draft::ResultDraft::new(
+            "Original",
+            "deadbeef",
+            ReferencePath("/tests/generic_test".to_string()),
+            "deadbeef",
+        );
+        commands
+            .send(Command::AddResult {
+                requirement: LogicalPath::root(entry_name("design")),
+                name: entry_name("scratch_result"),
+                result: Box::new(original),
+                request: 2,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddResult(Ok(()))));
+
+        let updated = logical::draft::ResultDraft::new(
+            "",
+            "cafef00d",
+            ReferencePath("/tests/generic_test".to_string()),
+            "cafef00d",
+        );
+        let result_path = logical::ResultPath {
+            requirement: LogicalPath::root(entry_name("design")),
+            name: entry_name("scratch_result"),
+        };
+        commands
+            .send(Command::UpdateResult {
+                target: result_path.clone(),
+                result: Box::new(updated),
+                request: 3,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::UpdateResult(Ok(()))));
+
+        commands
+            .send(Command::GetEntryDetail {
+                target: EntryPath::Result(result_path),
+                request: 4,
+            })
+            .unwrap();
+        match recv_completed(&mut events, 4).await {
+            Outcome::EntryDetail(Some(EntryDetail::Result { title, .. })) => {
+                assert_eq!(title, "Scratch Result");
             }
             other => panic!("expected EntryDetail(Some(Result)), got {other:?}"),
         }
@@ -3978,6 +4301,35 @@ mod test {
             })
             .unwrap();
         assert!(matches!(recv_completed(&mut events, 2).await, Outcome::CommitAll(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn push_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands.send(Command::Push { request: 1 }).unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::Push(Err(crate::PushError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn push_succeeds_against_a_loaded_project() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands.send(Command::Push { request: 2 }).unwrap();
+        match recv_completed(&mut events, 2).await {
+            Outcome::Push(Ok(output)) => assert_eq!(output, "pushed"),
+            other => panic!("expected Outcome::Push(Ok(_)), got {other:?}"),
+        }
     }
 
     #[tokio::test]

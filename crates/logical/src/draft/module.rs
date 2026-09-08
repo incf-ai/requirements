@@ -52,12 +52,14 @@ pub enum UpdateNamedChildError {
 }
 
 /// Turns a sanitized entry name like `foo_bar_baz` into a human display
-/// title, `Foo Bar Baz` — underscores become spaces, each word capitalized.
-/// Used to autopopulate an empty title when adding a requirement/test, and
-/// (via `logical::draft::title_case_from_name`) to regenerate a title after
-/// a rename/recreate.
+/// title, `Foo Bar Baz` — underscores and whitespace become word
+/// boundaries (a name may already contain spaces, e.g. a pasted `Foo copy
+/// 2` or a `<date> <test name>` result identifier), each word capitalized.
+/// Used to autopopulate an empty title when adding a requirement/test/
+/// result, and (via `logical::draft::title_case_from_name`) to regenerate a
+/// title after a rename/recreate/duplicate.
 pub fn title_case_from_name(name: &str) -> String {
-    name.split('_')
+    name.split(|c: char| c == '_' || c.is_whitespace())
         .filter(|segment| !segment.is_empty())
         .map(|segment| {
             let mut chars = segment.chars();
@@ -310,6 +312,29 @@ mod test {
                 .title,
             "Some Test"
         );
+    }
+
+    #[test]
+    fn title_case_from_name_splits_on_underscores() {
+        assert_eq!(title_case_from_name("foo_bar_baz"), "Foo Bar Baz");
+    }
+
+    #[test]
+    fn title_case_from_name_splits_on_whitespace() {
+        assert_eq!(title_case_from_name("2026-01-31 demonstration"), "2026-01-31 Demonstration");
+        assert_eq!(title_case_from_name("foo copy 2"), "Foo Copy 2");
+    }
+
+    #[test]
+    fn title_case_from_name_splits_on_mixed_underscores_and_whitespace() {
+        assert_eq!(title_case_from_name("foo_bar baz"), "Foo Bar Baz");
+    }
+
+    #[test]
+    fn title_case_from_name_collapses_repeated_separators() {
+        assert_eq!(title_case_from_name("foo__bar"), "Foo Bar");
+        assert_eq!(title_case_from_name("foo  bar"), "Foo Bar");
+        assert_eq!(title_case_from_name("_foo_"), "Foo");
     }
 
     #[test]

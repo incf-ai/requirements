@@ -59,6 +59,7 @@ pub(crate) fn build_tree_snapshot(state: &ProjectState, can_undo: bool, can_redo
         ),
         can_undo,
         can_redo,
+        validated: validated.is_some(),
     }
 }
 
@@ -70,17 +71,22 @@ fn build_tree_node(
     path_modules: &[EntryName],
 ) -> TreeNode {
     let mut children = Vec::new();
+    let mut requirement_count = 0usize;
+    let mut requirements_met = 0usize;
 
     for (child_name, child_module) in &module.modules {
         let mut child_path = path_modules.to_vec();
         child_path.push(child_name.clone());
-        children.push(build_tree_node(
+        let child_node = build_tree_node(
             child_name.clone(),
             EntryKind::Module,
             child_module,
             validated,
             &child_path,
-        ));
+        );
+        requirement_count += child_node.requirement_count;
+        requirements_met += child_node.requirements_met;
+        children.push(child_node);
     }
 
     for (req_name, requirement) in &module.requirements {
@@ -98,6 +104,10 @@ fn build_tree_node(
                 }
             }
         };
+        requirement_count += 1;
+        if status == EntryStatus::Met {
+            requirements_met += 1;
+        }
         // A result's place in the tree follows its place on disk now —
         // nested under its owning requirement — rather than flat
         // alongside it. Results don't have a "met" concept of their own
@@ -111,6 +121,8 @@ fn build_tree_node(
                 name: result_name.clone(),
                 kind: EntryKind::Result,
                 status: EntryStatus::Unvalidated,
+                requirement_count: 0,
+                requirements_met: 0,
                 children: Vec::new(),
             })
             .collect();
@@ -118,6 +130,8 @@ fn build_tree_node(
             name: req_name.clone(),
             kind: EntryKind::Requirement,
             status,
+            requirement_count: 0,
+            requirements_met: 0,
             children: result_children,
         });
     }
@@ -127,6 +141,8 @@ fn build_tree_node(
             name: test_name.clone(),
             kind: EntryKind::Test,
             status: EntryStatus::Unvalidated,
+            requirement_count: 0,
+            requirements_met: 0,
             children: Vec::new(),
         });
     }
@@ -135,6 +151,8 @@ fn build_tree_node(
         name,
         kind,
         status: EntryStatus::Unvalidated,
+        requirement_count,
+        requirements_met,
         children,
     }
 }
@@ -176,6 +194,7 @@ pub(crate) fn get_entry_detail(state: &ProjectState, target: &EntryPath) -> Outc
                 test_path: result.test_path.0.clone(),
                 test_commit: result.test_commit.clone(),
                 attachments: result.attachments.iter().cloned().collect(),
+                stale: result_reference_is_stale(state, target),
                 original: Box::new(result.clone()),
             }),
     };
@@ -202,6 +221,22 @@ fn requirement_met_status(state: &ProjectState, target: &LogicalPath) -> Require
             None => RequirementMetStatus::Met,
             Some(reason) => RequirementMetStatus::Unmet(reason),
         },
+    }
+}
+
+pub(crate) fn get_result_reference_is_stale(state: &ProjectState, target: &logical::ResultPath) -> Outcome {
+    Outcome::ResultReferenceIsStale(result_reference_is_stale(state, target))
+}
+
+/// The one place `Draft`/`Validated` gets turned into "is this result's
+/// pinned commit stale" — shared by `get_entry_detail`'s own `stale` field
+/// and `get_result_reference_is_stale` (`gui-ui`'s on-demand refresh after
+/// `Validate` completes), same "one answer, not two that could drift
+/// apart" reasoning as `requirement_met_status`.
+fn result_reference_is_stale(state: &ProjectState, target: &logical::ResultPath) -> bool {
+    match state {
+        ProjectState::Draft(_) => false,
+        ProjectState::Validated(validated) => validated.result_reference_is_stale(target),
     }
 }
 
