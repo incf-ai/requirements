@@ -248,6 +248,22 @@ mod test {
     }
 
     #[test]
+    fn reports_a_storage_full_error_creating_the_directory() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-project-save-create-dir-storage-full-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(&dir, std::io::ErrorKind::StorageFull);
+
+        let err = save_project(&fs, &FixedGit, &dir, &minimal_project()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::CreateDir { .. }));
+    }
+
+    #[test]
     fn reports_io_errors_saving_project_ron() {
         use syscalls::FaultInjectingFilesystem;
 
@@ -261,6 +277,24 @@ mod test {
             dir.join("project.ron"),
             std::io::ErrorKind::PermissionDenied,
         );
+
+        let err = save_project(&fs, &FixedGit, &dir, &minimal_project()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Definition(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reports_a_storage_full_error_saving_project_ron() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-project-save-definition-storage-full-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("project.ron"), std::io::ErrorKind::StorageFull);
 
         let err = save_project(&fs, &FixedGit, &dir, &minimal_project()).unwrap_err();
         assert!(matches!(err.0, ErrorKind::Definition(_)));

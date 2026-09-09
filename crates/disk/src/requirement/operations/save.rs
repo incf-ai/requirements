@@ -221,6 +221,27 @@ mod test {
     }
 
     #[test]
+    fn reports_a_storage_full_error_saving_requirement_ron() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = std::env::temp_dir().join(format!(
+            "disk-requirement-save-definition-storage-full-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(
+            dir.join("requirement.ron"),
+            std::io::ErrorKind::StorageFull,
+        );
+
+        let err = save_requirement_stage(&fs, &dir, &minimal_requirement()).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::Definition(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn reports_io_errors_saving_requirement_guidance() {
         use syscalls::FaultInjectingFilesystem;
 

@@ -159,6 +159,25 @@ mod test {
     }
 
     #[test]
+    fn malformed_project_ron_is_reported() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-project-load-malformed-ron-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.ron"), "not valid ron {{{").unwrap();
+
+        let err = load_project(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(
+            err.0,
+            ErrorKind::Definition(LoadRonError::Parse { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_failing_module_tree_load_is_reported() {
         let dir = std::env::temp_dir().join(format!(
             "disk-project-load-tree-error-{}-{}",

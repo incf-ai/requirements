@@ -173,6 +173,20 @@ mod test {
     }
 
     #[test]
+    fn malformed_test_ron_is_reported() {
+        let dir = valid_test_dir("malformed-ron");
+        std::fs::write(dir.join("test.ron"), "not valid ron {{{").unwrap();
+
+        let err = load_test(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(
+            err.0,
+            ErrorKind::Definition(LoadRonError::Parse { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn commit_lookup_errors_are_reported() {
         use syscalls::FaultInjectingGit;
 

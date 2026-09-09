@@ -132,6 +132,8 @@ enum ErrorKind {
     },
     #[error("migration destination {0} already exists")]
     DestinationAlreadyExists(PathBuf),
+    #[error("directory entry {0} has no final path component")]
+    MissingFileName(PathBuf),
 }
 
 #[derive(Debug, Error)]
@@ -178,7 +180,7 @@ fn upgrade_module(
                 continue;
             }
             let mut nested_module = current_module.to_vec();
-            nested_module.push(entry_name(&entry));
+            nested_module.push(entry_name(&entry)?);
             upgrade_module(fs, project_root, &entry, &nested_module, summary)?;
         }
     }
@@ -279,7 +281,7 @@ fn migrate_one_result(
 
     let dest_dir = requirement_dir
         .join("results")
-        .join(entry_name(result_dir).as_str());
+        .join(entry_name(result_dir)?.as_str());
     if fs.exists(&dest_dir) {
         return Err(ErrorKind::DestinationAlreadyExists(dest_dir));
     }
@@ -333,11 +335,11 @@ fn resolve_requirement_dir(
     let is_absolute = raw.0.starts_with('/');
     let trimmed = raw.0.trim_start_matches('/');
     let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.len() < 2 {
+    let Some(split_at) = segments.len().checked_sub(2) else {
         return Err(malformed());
-    }
+    };
 
-    let (module_segments, kind_and_name) = segments.split_at(segments.len() - 2);
+    let (module_segments, kind_and_name) = segments.split_at(split_at);
     if kind_and_name[0] != "requirements" {
         return Err(malformed());
     }
@@ -366,13 +368,11 @@ fn resolve_requirement_dir(
     Ok(dir.join("requirements").join(name))
 }
 
-fn entry_name(dir: &Path) -> EntryName {
-    EntryName(
-        dir.file_name()
-            .expect("directory has a file name")
-            .to_string_lossy()
-            .into_owned(),
-    )
+fn entry_name(dir: &Path) -> Result<EntryName, ErrorKind> {
+    let name = dir
+        .file_name()
+        .ok_or_else(|| ErrorKind::MissingFileName(dir.to_path_buf()))?;
+    Ok(EntryName(name.to_string_lossy().into_owned()))
 }
 
 fn read_dir_sorted(fs: &dyn Filesystem, dir: &Path) -> Result<Vec<PathBuf>, ErrorKind> {
@@ -392,7 +392,10 @@ fn copy_dir_recursive(fs: &dyn Filesystem, src: &Path, dst: &Path) -> Result<(),
         })?;
 
     for entry in read_dir_sorted(fs, src)? {
-        let dest_entry = dst.join(entry.file_name().expect("directory entry has a file name"));
+        let name = entry
+            .file_name()
+            .ok_or_else(|| ErrorKind::MissingFileName(entry.clone()))?;
+        let dest_entry = dst.join(name);
         if fs.is_dir(&entry) {
             copy_dir_recursive(fs, &entry, &dest_entry)?;
         } else {
@@ -655,6 +658,29 @@ mod test {
             r#"ResultsV1(
                 title: "Definition",
                 requirement_path: "not-a-path",
+                requirement_commit: "deadbeef",
+                test_path: "/tests/generic_test",
+                test_commit: "deadbeef",
+                status: Pass,
+            )"#,
+        )
+        .unwrap();
+
+        let err = upgrade_results_layout(&StdFilesystem, &dir).unwrap_err();
+        assert!(matches!(err.0, ErrorKind::MalformedRequirementPath { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_requirement_path_is_reported_rather_than_panicking() {
+        let dir = temp_dir("empty-path");
+        std::fs::create_dir_all(dir.join("results/definition/attachments")).unwrap();
+        std::fs::write(
+            dir.join("results/definition/result.ron"),
+            r#"ResultsV1(
+                title: "Definition",
+                requirement_path: "",
                 requirement_commit: "deadbeef",
                 test_path: "/tests/generic_test",
                 test_commit: "deadbeef",

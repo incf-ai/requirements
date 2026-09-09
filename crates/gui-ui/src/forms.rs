@@ -622,7 +622,7 @@ impl ResultFormState {
     /// is `self.requirement`, not the ambient "current module" every other
     /// `Add*` command takes — kept in the signature only so
     /// `GuiApp::editor_create_clicked` can dispatch to every form uniformly.
-    pub fn build_command(&self, _module: Vec<EntryName>, request: RequestId) -> Command {
+    pub fn build_command(&self, _module: Vec<EntryName>, request: RequestId) -> Option<Command> {
         let mut result = (*self.original).clone();
         result.title = self.title.clone();
         result.requirement_commit = self.requirement_commit.clone();
@@ -631,20 +631,17 @@ impl ResultFormState {
         result.status = self.status.clone();
         result.attachments = self.attachments.iter().cloned().collect();
         match &self.editing_target {
-            Some(target) => Command::UpdateResult {
+            Some(target) => Some(Command::UpdateResult {
                 target: target.clone(),
                 result: Box::new(result),
                 request,
-            },
-            None => Command::AddResult {
-                requirement: self
-                    .requirement
-                    .clone()
-                    .expect("Create is disabled until a requirement is picked"),
+            }),
+            None => Some(Command::AddResult {
+                requirement: self.requirement.clone()?,
                 name: EntryName(self.name.clone()),
                 result: Box::new(result),
                 request,
-            },
+            }),
         }
     }
 }
@@ -1047,7 +1044,7 @@ mod test {
             ..Default::default()
         };
 
-        let Command::UpdateResult { result, .. } = form.build_command(Vec::new(), 1) else {
+        let Command::UpdateResult { result, .. } = form.build_command(Vec::new(), 1).unwrap() else {
             panic!("expected UpdateResult");
         };
         assert_eq!(result.title, "New Title");

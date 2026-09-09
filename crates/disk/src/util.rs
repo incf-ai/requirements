@@ -204,12 +204,15 @@ impl EntryName {
     }
 
     /// The `EntryName` of `dir` itself, i.e. `dir`'s own final path component.
+    /// Falls back to an empty name for a path with no final component (e.g.
+    /// `.`, `/`, or `..`) rather than panicking — every current call site
+    /// passes a fresh `read_dir` entry, which always has one, but this stays
+    /// a graceful fallback rather than an asserted invariant.
     pub(crate) fn of(dir: &Path) -> Self {
         EntryName(
             dir.file_name()
-                .expect("directory has a file name")
-                .to_string_lossy()
-                .into_owned(),
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         )
     }
 }
@@ -474,9 +477,8 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "directory has a file name")]
-    fn entry_name_of_panics_without_a_file_name() {
-        EntryName::of(Path::new("/"));
+    fn entry_name_of_falls_back_to_empty_without_a_file_name() {
+        assert_eq!(EntryName::of(Path::new("/")), EntryName(String::new()));
     }
 
     #[test]

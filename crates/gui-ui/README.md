@@ -976,7 +976,7 @@ this workspace.
 
 `egui_kittest` (an [AccessKit](https://accesskit.dev/)-based headless
 harness, egui's own official test library) is a dev-dependency, exercised
-in `tests/interaction.rs` — 52 tests that run the real `eframe::App::ui`
+in `tests/interaction.rs` — 109 tests that run the real `eframe::App::ui`
 (plus 2 more, gated behind the `debug-panel` Cargo feature and
 `debug_assertions` together — see "Debug side panel" above — that run
 under a default `cargo test` dev-profile build already, and only drop out
@@ -1169,7 +1169,7 @@ egui's own internals take (layout, hit-testing, painting) aren't this
 crate's code to cover in the first place. The `disk`-crate-style 100%
 branch coverage bar makes sense for `logical`/`gui-core`'s decision-dense
 state machines; holding `gui-ui`'s *rendering* to the same bar would
-mostly mean writing tests whose only job is satisfying the metric. The 52
+mostly mean writing tests whose only job is satisfying the metric. The 109
 tests here are deliberately a functional smoke layer, growing toward
 covering every real state transition rather than every widget and dialog
 exhaustively at once.

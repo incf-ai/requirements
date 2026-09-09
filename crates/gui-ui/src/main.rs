@@ -14,11 +14,17 @@ fn main() {
         eprintln!("warning: {err}");
     }
 
-    let core = gui_core::CoreHandle::start();
+    let core = match gui_core::CoreHandle::start() {
+        Ok(core) => core,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
     let app = gui_ui::GuiApp::new(core, config, config_path, recent, recent_path);
 
     if let Err(err) = eframe::run_native(
-        "IncRMS",
+        "IncreRMS",
         eframe::NativeOptions::default(),
         Box::new(|cc| {
             gui_ui::install_icon_font(&cc.egui_ctx);

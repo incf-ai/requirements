@@ -1577,6 +1577,27 @@ mod test {
     }
 
     #[test]
+    fn create_project_reports_a_storage_full_error_saving_project_ron() {
+        use syscalls::FaultInjectingFilesystem;
+
+        let dir = fresh_temp_dir("save-storage-full-fault");
+        let mut fs = FaultInjectingFilesystem::new(StdFilesystem);
+        fs.inject(dir.join("project.ron"), std::io::ErrorKind::StorageFull);
+
+        let dir_str = dir.to_str().unwrap().to_string();
+        let err = run(
+            args(&["--dir", &dir_str, "create-project", "--name", "Demo"]),
+            &fs,
+            &FixedGit,
+            &FixedRemoteGit,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to save project"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn is_met_against_a_directory_with_no_project_reports_a_load_error() {
         let dir = fresh_temp_dir("is-met-missing-project");
         let err = run_err(&dir, &["is-met", "--requirement", "definition"]);

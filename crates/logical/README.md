@@ -1,9 +1,9 @@
 # logical
 
-**Status: design phase — nothing in `src/` reflects this plan yet.** The
-current `src/*.rs` files are an early sketch that predates `disk`'s current
-shape (they embed raw `Vec<u8>` template content, which `disk` deliberately
-no longer stores). This README is the plan for what replaces them.
+**Status: implemented.** The plan below is realized in `src/` — `draft/`,
+`validate/`, `convert/`, and `reference_repair.rs` all exist and are
+exercised by this crate's test suite. The rest of this README is both the
+design rationale and, still, an accurate description of the current shape.
 
 ## What this crate is for
 

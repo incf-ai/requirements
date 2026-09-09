@@ -106,6 +106,20 @@ mod test {
     }
 
     #[test]
+    fn malformed_result_ron_is_reported() {
+        let dir = valid_result_dir("malformed-ron");
+        std::fs::write(dir.join("result.ron"), "not valid ron {{{").unwrap();
+
+        let err = load_result(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(
+            err.0,
+            ErrorKind::Definition(LoadRonError::Parse { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn missing_attachments_dir_is_reported() {
         let dir = valid_result_dir("missing-attachments");
         std::fs::remove_dir(dir.join("attachments")).unwrap();

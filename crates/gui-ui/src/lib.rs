@@ -46,10 +46,10 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use gui_core::{
-    Command, CoreHandle, EntryDetail, EntryKind, EntryName, EntryPath, Event, LogicalPath,
-    ModulePools, Outcome, ReferenceAction, ReferencePath, ReferenceRepairError, ReferenceSite,
-    ReferenceTarget, RequestId, RequirementDraft, ResultDraft, ResultPath, SaveError, TestDraft,
-    TreeNode, TreeSnapshot, title_case_from_name,
+    Command, CoreHandle, EntryDetail, EntryKind, EntryName, EntryPath, Event, LocalCommitKind,
+    LogicalPath, ModulePools, Outcome, ReferenceAction, ReferencePath, ReferenceRepairError,
+    ReferenceSite, ReferenceTarget, RequestId, RequirementDraft, ResultDraft, ResultPath,
+    SaveError, TestDraft, TreeNode, TreeSnapshot, title_case_from_name,
 };
 
 /// gui-ui's own state — never a borrow into `gui-core`'s. Populated by
@@ -202,12 +202,41 @@ pub struct GuiApp {
     /// Which `GetDiff` request `diff_dialog` is waiting on — same
     /// stale-reply guard shape as `changed_files_request`.
     diff_request: Option<RequestId>,
+    /// The entry whose "Commit history" section is currently loaded or
+    /// being loaded, if any — only one view form is ever open at once, so
+    /// a single slot (rather than one per `RequirementFormState`/
+    /// `TestFormState`/`ResultFormState`) is enough. Reset alongside
+    /// `commit_log`/`commit_log_error` in `apply_entry_detail`, the single
+    /// chokepoint that already rebuilds the editor whenever the open entry
+    /// changes — including after a Save/Update reload, where resetting is
+    /// correct: the on-disk history has genuinely just gained a commit.
+    commit_log_target: Option<gui_core::EntryPath>,
+    /// Which `GetCommitLog` request `commit_log`/`commit_log_error` is
+    /// waiting on — same stale-reply guard shape as `diff_request`.
+    commit_log_request: Option<RequestId>,
+    /// The fetched "Commit history" section contents for `commit_log_target`
+    /// — `None` until a `GetCommitLog` reply arrives.
+    commit_log: Option<Vec<gui_core::CommitInfo>>,
+    /// A failed `GetCommitLog` fetch for `commit_log_target`.
+    commit_log_error: Option<String>,
+    /// The per-commit file-list modal — `Some` while it's open, on top of
+    /// whichever view screen it was opened from. See
+    /// `CommitFilesDialogState`'s own doc comment.
+    commit_files_dialog: Option<CommitFilesDialogState>,
+    /// Which `GetCommitFiles` request `commit_files_dialog` is waiting on
+    /// — same stale-reply guard shape as `diff_request`.
+    commit_files_request: Option<RequestId>,
     /// The "Push" modal — `Some` while it's open. See `PushDialogState`'s
     /// own doc comment.
     push_dialog: Option<PushDialogState>,
     /// Which `Push` request `push_dialog` is waiting on — same stale-reply
     /// guard shape as `commit_all_request`.
     push_request: Option<RequestId>,
+    /// Which `GetUnpushedCommits` request `push_dialog`'s own commit
+    /// preview is waiting on — same stale-reply guard shape as
+    /// `push_request`, but a separate slot since the preview fetch and the
+    /// push itself are independent round trips (see `push_button_clicked`).
+    push_unpushed_commits_request: Option<RequestId>,
     /// The tree's right-click Copy/Paste "clipboard" for requirements —
     /// `(the source's own name, its full content)`, `None` until a Copy
     /// has actually completed. Purely local to `gui-ui`: nothing is sent
@@ -592,8 +621,8 @@ pub struct DuplicateRequirementState {
 }
 
 /// The requirement view's "Create new result" prompt — opened from the
-/// empty-results state in `render_requirement_form` (see that fn's Results
-/// block) rather than living inside `RequirementFormState` itself, since a
+/// Results block in `render_requirement_form` rather than living inside
+/// `RequirementFormState` itself, since a
 /// result is a separate entry submitted via its own `Command::AddResult`,
 /// not part of the requirement's own draft (same reasoning as the
 /// Duplicate/Recreate prompts). `requirement`/`tests` are a snapshot of the
@@ -698,6 +727,40 @@ enum LocalPoolKind {
     ResultAttachment,
 }
 
+/// Bundles a `LocalPoolKind` with the one `EntryPath` variant it's actually
+/// valid for — the payload `add_local_pool_entry`/`remove_local_pool_entry`
+/// take instead of a loose `(LocalPoolKind, EntryPath)` pair, which allowed
+/// 12 of its 16 combinations to be nonsensical and fall through to an
+/// `unreachable!()`. Same idea as `gui-core`'s own `EntryPath`, which
+/// replaced a looser `(LogicalPath, EntryKind)` pair for the same reason —
+/// this just applies it one layer up, where `LocalPoolKind` (attachment vs.
+/// template) is the axis `EntryPath` alone doesn't encode.
+enum LocalPoolTarget {
+    RequirementAttachment(LogicalPath),
+    TestAttachment(LogicalPath),
+    TestTemplate(LogicalPath),
+    ResultAttachment(ResultPath),
+}
+
+impl LocalPoolTarget {
+    fn kind(&self) -> LocalPoolKind {
+        match self {
+            LocalPoolTarget::RequirementAttachment(_) => LocalPoolKind::RequirementAttachment,
+            LocalPoolTarget::TestAttachment(_) => LocalPoolKind::TestAttachment,
+            LocalPoolTarget::TestTemplate(_) => LocalPoolKind::TestTemplate,
+            LocalPoolTarget::ResultAttachment(_) => LocalPoolKind::ResultAttachment,
+        }
+    }
+
+    fn entry_path(&self) -> EntryPath {
+        match self {
+            LocalPoolTarget::RequirementAttachment(p) => EntryPath::Requirement(p.clone()),
+            LocalPoolTarget::TestAttachment(p) | LocalPoolTarget::TestTemplate(p) => EntryPath::Test(p.clone()),
+            LocalPoolTarget::ResultAttachment(p) => EntryPath::Result(p.clone()),
+        }
+    }
+}
+
 /// A pending local-pool add/remove — tracked per-`RequestId` (unlike the
 /// module-level Attachments dialog, which just re-fetches `ModulePools` on
 /// any completion) because re-fetching `EntryDetail` here would rebuild
@@ -757,14 +820,38 @@ impl PathPickerTarget {
     /// Which of `self.tree`'s leaf kinds this target's field points at —
     /// every target has exactly one, so `PathPickerDialogState::kind`
     /// derives from it instead of being passed alongside redundantly.
-    fn kind(self) -> EntryKind {
+    fn kind(self) -> LeafKind {
         match self {
             PathPickerTarget::ResultRequirementPath | PathPickerTarget::Dependency(_) => {
-                EntryKind::Requirement
+                LeafKind::Requirement
             }
             PathPickerTarget::ResultTestPath | PathPickerTarget::TestReference(_) => {
-                EntryKind::Test
+                LeafKind::Test
             }
+        }
+    }
+}
+
+/// A tree leaf's kind, narrowed to the two `EntryKind` variants that have
+/// their own on-disk reference-path segment (`leaf_kind_segment`) and are
+/// ever named by a path-picker (`PathPickerTarget::kind`) — unlike
+/// `EntryKind`, a `Module` (no leaf path of its own) or a `Result` (no
+/// reference-path identity — see `logical::ResultPath`) can't be
+/// constructed here, so callers of either don't need a fallback for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafKind {
+    Requirement,
+    Test,
+}
+
+impl From<LeafKind> for EntryKind {
+    /// For call sites that need the wider `EntryKind` — e.g.
+    /// `scoped_leaf_paths`, which is also used for kinds `LeafKind` can't
+    /// express — rather than threading `LeafKind` through every consumer.
+    fn from(kind: LeafKind) -> EntryKind {
+        match kind {
+            LeafKind::Requirement => EntryKind::Requirement,
+            LeafKind::Test => EntryKind::Test,
         }
     }
 }
@@ -784,14 +871,38 @@ pub struct CommitAllDialogState {
     pub error: Option<String>,
 }
 
-/// The "View diff" modal's state — opened by clicking one of
+/// The per-commit "Commit history" file-list modal's state — opened by
+/// clicking a commit in a Requirement/Test/Result view screen's "Commit
+/// history" section (`render_commit_log_section`). Same shape as
+/// `CommitAllDialogState` minus the commit-message/Commit-button bits
+/// (this modal is read-only: nothing here ever gets committed). `target`/
+/// `commit` are kept (rather than looked up again at render time) so the
+/// modal still knows what it's showing/what to fetch a file's diff
+/// against even after the underlying `Command::GetCommitFiles` reply
+/// comes back.
+#[derive(Debug)]
+pub struct CommitFilesDialogState {
+    pub target: gui_core::EntryPath,
+    pub commit: String,
+    pub loading: bool,
+    pub files: Vec<PathBuf>,
+    pub error: Option<String>,
+}
+
+/// The "View diff" modal's state — opened either by clicking one of
 /// `CommitAllDialogState::changed_files` in the "Commit all changes"
-/// dialog. `path` is kept (rather than looked up again at render time) so
-/// the modal's heading still shows which file it's for even after the
-/// underlying `Command::GetDiff` reply comes back.
+/// dialog (`commit: None`, diffed against the working tree via
+/// `Command::GetDiff`) or by clicking one of `CommitFilesDialogState::files`
+/// in the commit-files modal (`commit: Some(hash)`, diffed against that
+/// specific historical commit via `Command::GetCommitFileDiff`) — one
+/// dialog/render function serves both so the color-coded diff rendering
+/// isn't duplicated. `path` is kept (rather than looked up again at render
+/// time) so the modal's heading still shows which file it's for even after
+/// the reply comes back.
 #[derive(Debug, Default)]
 pub struct DiffDialogState {
     pub path: PathBuf,
+    pub commit: Option<String>,
     pub loading: bool,
     pub diff: String,
     pub error: Option<String>,
@@ -803,11 +914,22 @@ pub struct DiffDialogState {
 /// reaches a shared remote. `output`/`error` are mutually exclusive, both
 /// `None` until the push completes, and neither is cleared back to `None`
 /// on Close — the dialog is simply dropped and rebuilt fresh next click.
+///
+/// `unpushed_*` fields are a second, independent round trip
+/// (`Command::GetUnpushedCommits`) fired alongside the dialog opening —
+/// the confirm-state preview of what a click of "Push" would actually
+/// send, so the user isn't pushing blind (and sees a warning up front if
+/// there's nothing to push at all). Unlike `pushing`/`output`/`error`,
+/// this doesn't gate the "Push" button itself — a failed or still-loading
+/// preview is just missing context, not a reason to block the push.
 #[derive(Debug, Default)]
 pub struct PushDialogState {
     pub pushing: bool,
     pub output: Option<String>,
     pub error: Option<String>,
+    pub unpushed_loading: bool,
+    pub unpushed_commits: Option<Vec<gui_core::CommitInfo>>,
+    pub unpushed_error: Option<String>,
 }
 
 /// The path-picker modal's state — open (`Some`) for exactly as long as
@@ -822,9 +944,7 @@ pub struct PushDialogState {
 /// — see `render_path_picker_dialog`.
 #[derive(Debug, Clone)]
 pub struct PathPickerDialogState {
-    /// `EntryKind::Requirement` or `EntryKind::Test` — never `Module`/
-    /// `Result` (nothing here ever picks a path for either of those).
-    pub kind: EntryKind,
+    pub kind: LeafKind,
     pub target: PathPickerTarget,
     pub filter: String,
     pub scope: PathPickerScope,
@@ -860,6 +980,16 @@ pub enum PendingKind {
 #[derive(Debug, Default)]
 pub struct StatusLine {
     // TODO: project path, last validation outcome. See README's "Layout".
+}
+
+/// `Option::take_if`'s non-consuming counterpart, for the handful of
+/// dialog state machines that need to keep mutating the same
+/// `Option<Dialog>` in place after confirming it's the one waiting on a
+/// given `request`, rather than taking it out. Centralizes the "check,
+/// then re-derive that it's still there" pattern these dialogs used to
+/// hand-copy via a `matches!` guard followed by `.as_mut().expect(...)`.
+fn matching_mut<T>(slot: &mut Option<T>, matches: impl FnOnce(&T) -> bool) -> Option<&mut T> {
+    if slot.as_ref().is_some_and(matches) { slot.as_mut() } else { None }
 }
 
 impl GuiApp {
@@ -901,8 +1031,15 @@ impl GuiApp {
             commit_all_request: None,
             diff_dialog: None,
             diff_request: None,
+            commit_log_target: None,
+            commit_log_request: None,
+            commit_log: None,
+            commit_log_error: None,
+            commit_files_dialog: None,
+            commit_files_request: None,
             push_dialog: None,
             push_request: None,
+            push_unpushed_commits_request: None,
             requirement_clipboard: None,
             copy_requirement_request: None,
             paste_requirement_request: None,
@@ -1260,7 +1397,9 @@ impl GuiApp {
                     .as_ref()
                     .is_some_and(|(r, _)| *r == request) =>
             {
-                let (_, name) = self.copy_requirement_request.take().unwrap();
+                let Some((_, name)) = self.copy_requirement_request.take_if(|(r, _)| *r == request) else {
+                    return;
+                };
                 self.apply_copy_requirement_result(name, detail);
             }
             Outcome::EntryDetail(detail)
@@ -1269,7 +1408,10 @@ impl GuiApp {
                     .as_ref()
                     .is_some_and(|(r, _)| *r == request) =>
             {
-                let (_, target) = self.recreate_requirement_context_request.take().unwrap();
+                let Some((_, target)) = self.recreate_requirement_context_request.take_if(|(r, _)| *r == request)
+                else {
+                    return;
+                };
                 if let Some(EntryDetail::Requirement { original, .. }) = detail {
                     self.open_recreate_requirement_dialog(target, *original);
                 }
@@ -1280,7 +1422,9 @@ impl GuiApp {
                     .as_ref()
                     .is_some_and(|(r, _)| *r == request) =>
             {
-                let (_, source) = self.duplicate_requirement_request.take().unwrap();
+                let Some((_, source)) = self.duplicate_requirement_request.take_if(|(r, _)| *r == request) else {
+                    return;
+                };
                 if let Some(EntryDetail::Requirement { original, .. }) = detail {
                     self.open_duplicate_requirement_dialog(source, *original);
                 }
@@ -1328,7 +1472,19 @@ impl GuiApp {
             Outcome::Push(result) if self.push_request == Some(request) => {
                 self.apply_push_result(result.map_err(|e| e.to_string()));
             }
+            Outcome::GetUnpushedCommits(result) if self.push_unpushed_commits_request == Some(request) => {
+                self.apply_unpushed_commits_result(result.map_err(|e| e.to_string()));
+            }
             Outcome::GetDiff(result) if self.diff_request == Some(request) => {
+                self.apply_diff_result(result.map_err(|e| e.to_string()));
+            }
+            Outcome::GetCommitLog(result) if self.commit_log_request == Some(request) => {
+                self.apply_commit_log_result(result.map_err(|e| e.to_string()));
+            }
+            Outcome::GetCommitFiles(result) if self.commit_files_request == Some(request) => {
+                self.apply_commit_files_result(result.map_err(|e| e.to_string()));
+            }
+            Outcome::GetCommitFileDiff(result) if self.diff_request == Some(request) => {
                 self.apply_diff_result(result.map_err(|e| e.to_string()));
             }
             Outcome::ResolveLocalCommit(result) => {
@@ -1379,19 +1535,15 @@ impl GuiApp {
     /// "ignore stale replies by request id" shape as `apply_entry_detail`
     /// via `detail_request`) and only if it actually succeeded.
     fn apply_project_path_result(&mut self, request: RequestId, succeeded: bool) {
-        if self
+        let Some((_, path)) = self
             .pending_project_path
-            .as_ref()
-            .is_some_and(|(pending_request, _)| *pending_request == request)
-        {
-            let (_, path) = self
-                .pending_project_path
-                .take()
-                .expect("just checked Some above");
-            if succeeded {
-                self.project_path = Some(path.clone());
-                self.record_recent_project(path);
-            }
+            .take_if(|(pending_request, _)| *pending_request == request)
+        else {
+            return;
+        };
+        if succeeded {
+            self.project_path = Some(path.clone());
+            self.record_recent_project(path);
         }
     }
 
@@ -2287,10 +2439,9 @@ impl GuiApp {
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
         let requirement = {
-            let dialog = self
-                .duplicate_requirement_dialog
-                .as_mut()
-                .expect("just matched Some above");
+            let Some(dialog) = self.duplicate_requirement_dialog.as_mut() else {
+                return;
+            };
             dialog.pending_request = Some(request);
             dialog.error = None;
             dialog.requirement.clone()
@@ -2326,10 +2477,11 @@ impl GuiApp {
         match result {
             Ok(()) => {
                 self.dirty = true;
-                let dialog = self
-                    .duplicate_requirement_dialog
-                    .take()
-                    .expect("just matched Some above");
+                let Some(dialog) =
+                    self.duplicate_requirement_dialog.take_if(|d| d.pending_request == Some(request))
+                else {
+                    return true;
+                };
                 let target = LogicalPath {
                     modules: dialog.source.modules,
                     name: EntryName(dialog.new_name.trim().to_string()),
@@ -2346,8 +2498,8 @@ impl GuiApp {
         true
     }
 
-    /// "Create new result" clicked in the requirement view's empty-results
-    /// state — see `render_requirement_form`. A no-op if the requirement
+    /// "Create new result" clicked in the requirement view's Results
+    /// section — see `render_requirement_form`. A no-op if the requirement
     /// form has since navigated away, or the requirement has no test
     /// procedures of its own yet (nothing to pick in the dialog's test
     /// selector — see `CreateResultDialogState`'s own doc comment on why
@@ -2396,7 +2548,7 @@ impl GuiApp {
         dialog.requirement_commit_pending = Some(request);
         self.send_command(Command::ResolveLocalCommit {
             target,
-            kind: EntryKind::Requirement,
+            kind: LocalCommitKind::Requirement,
             request,
         });
     }
@@ -2431,7 +2583,7 @@ impl GuiApp {
         dialog.test_commit_pending = Some(request);
         self.send_command(Command::ResolveLocalCommit {
             target,
-            kind: EntryKind::Test,
+            kind: LocalCommitKind::Test,
             request,
         });
     }
@@ -2510,10 +2662,9 @@ impl GuiApp {
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
         let requirement = {
-            let dialog = self
-                .create_result_dialog
-                .as_mut()
-                .expect("just matched Some above");
+            let Some(dialog) = self.create_result_dialog.as_mut() else {
+                return;
+            };
             dialog.pending_request = Some(request);
             dialog.error = None;
             dialog.requirement.clone()
@@ -2543,15 +2694,30 @@ impl GuiApp {
         match result {
             Ok(()) => {
                 self.dirty = true;
-                let dialog = self
-                    .create_result_dialog
-                    .take()
-                    .expect("just matched Some above");
+                let Some(dialog) = self.create_result_dialog.take_if(|d| d.pending_request == Some(request)) else {
+                    return true;
+                };
                 let target = ResultPath {
                     requirement: dialog.requirement,
                     name: EntryName(dialog.name.trim().to_string()),
                 };
-                self.select(EntryPath::Result(target));
+                // The result itself is already saved at this point (that's
+                // what `self.dirty = true` above reflects) — but navigating
+                // straight there would silently discard the *requirement*
+                // form's own unsubmitted edits (e.g. a test reference added
+                // via "Add test procedure" but not yet Saved), the same way
+                // any other navigation that replaces `self.editor` would.
+                // So this goes through the same unsaved-edits gate as a
+                // tree click (see the `editor_has_unsaved_edits` call
+                // sites in `view.rs`) instead of always navigating
+                // unconditionally.
+                if self.editor_has_unsaved_edits() {
+                    self.unsaved_form_dialog_opened(PendingNavigation::Select(
+                        EntryPath::Result(target),
+                    ));
+                } else {
+                    self.select(EntryPath::Result(target));
+                }
             }
             Err(err) => {
                 if let Some(dialog) = &mut self.create_result_dialog {
@@ -2737,6 +2903,13 @@ impl GuiApp {
             return;
         };
         let read_only = self.current_nav_mode() == NavMode::View;
+        // The open entry is changing (or reloading) — any "Commit history"
+        // fetched/pending for whatever was open before no longer applies.
+        // See these fields' own doc comments.
+        self.commit_log_target = None;
+        self.commit_log_request = None;
+        self.commit_log = None;
+        self.commit_log_error = None;
         self.editor = match (target, detail) {
             (_, None) => EditorState::None,
             (
@@ -2967,6 +3140,98 @@ impl GuiApp {
         self.diff_dialog = None;
     }
 
+    /// Fires a `GetCommitLog` fetch for `target` — a view screen's "Commit
+    /// history" section calls this the first time it's expanded for the
+    /// currently open entry (see `commit_log_target`'s own doc comment).
+    /// A no-op if `target` is already loaded or has a fetch in flight, so
+    /// re-expanding an already-fetched section doesn't re-fetch.
+    fn commit_log_section_expanded(&mut self, target: gui_core::EntryPath) {
+        if self.commit_log_target.as_ref() == Some(&target) {
+            return;
+        }
+        self.commit_log_target = Some(target.clone());
+        self.commit_log = None;
+        self.commit_log_error = None;
+        let request = self.next_request_id();
+        self.commit_log_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetCommitLog { target, request });
+    }
+
+    fn apply_commit_log_result(&mut self, result: Result<Vec<gui_core::CommitInfo>, String>) {
+        self.commit_log_request = None;
+        match result {
+            Ok(commits) => self.commit_log = Some(commits),
+            Err(message) => self.commit_log_error = Some(message),
+        }
+    }
+
+    /// Opens the per-commit file-list modal for `commit` (one of
+    /// `target`'s own "Commit history" entries) and fetches its file list.
+    /// See `CommitFilesDialogState`'s own doc comment.
+    fn commit_files_dialog_opened(&mut self, target: gui_core::EntryPath, commit: String) {
+        self.commit_files_dialog = Some(CommitFilesDialogState {
+            target: target.clone(),
+            commit: commit.clone(),
+            loading: true,
+            files: Vec::new(),
+            error: None,
+        });
+        let request = self.next_request_id();
+        self.commit_files_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetCommitFiles { target, commit, request });
+    }
+
+    fn commit_files_dialog_closed(&mut self) {
+        self.commit_files_dialog = None;
+    }
+
+    /// Same sort convention as `apply_changed_files`.
+    fn apply_commit_files_result(&mut self, result: Result<Vec<PathBuf>, String>) {
+        let Some(dialog) = &mut self.commit_files_dialog else {
+            return;
+        };
+        dialog.loading = false;
+        match result {
+            Ok(mut files) => {
+                files.sort_by_key(|path| (path.components().count(), path.clone()));
+                dialog.files = files;
+            }
+            Err(message) => dialog.error = Some(message),
+        }
+    }
+
+    /// Opens the "View diff" modal for `path` (one of `commit_files_dialog`'s
+    /// own file list) against the commit that dialog is showing, fetching
+    /// it via `Command::GetCommitFileDiff` rather than `Command::GetDiff`.
+    /// Leaves `commit_files_dialog` open underneath, same "diff modal opens
+    /// on top of the file-list modal" shape `diff_file_clicked` already
+    /// uses for `commit_all_dialog`. A no-op if `commit_files_dialog` isn't
+    /// open — the only way this is ever called.
+    fn commit_file_diff_clicked(&mut self, path: PathBuf) {
+        let Some(dialog) = &self.commit_files_dialog else {
+            return;
+        };
+        let target = dialog.target.clone();
+        let commit = dialog.commit.clone();
+        self.diff_dialog = Some(DiffDialogState {
+            path: path.clone(),
+            commit: Some(commit.clone()),
+            loading: true,
+            ..DiffDialogState::default()
+        });
+        let request = self.next_request_id();
+        self.diff_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetCommitFileDiff {
+            target,
+            commit,
+            path,
+            request,
+        });
+    }
+
     fn apply_diff_result(&mut self, result: Result<String, String>) {
         let Some(dialog) = &mut self.diff_dialog else {
             return;
@@ -3010,16 +3275,37 @@ impl GuiApp {
         }
     }
 
-    /// Opens the "Push" modal in its confirm state — sends nothing to
-    /// `gui-core` yet, since pushing reaches a shared remote and needs an
-    /// explicit second click inside the modal (see `PushDialogState`'s doc
-    /// comment).
+    /// Opens the "Push" modal in its confirm state — sends nothing that
+    /// would actually push yet, since pushing reaches a shared remote and
+    /// needs an explicit second click inside the modal (see
+    /// `PushDialogState`'s doc comment). Does fire the read-only
+    /// `GetUnpushedCommits` preview fetch right away, so the commit list
+    /// (or "nothing to push" warning) is populated by the time the user
+    /// looks at the dialog.
     fn push_button_clicked(&mut self) {
-        self.push_dialog = Some(PushDialogState::default());
+        self.push_dialog = Some(PushDialogState {
+            unpushed_loading: true,
+            ..PushDialogState::default()
+        });
+        let request = self.next_request_id();
+        self.push_unpushed_commits_request = Some(request);
+        self.pending.insert(request, PendingKind::Generic);
+        self.send_command(Command::GetUnpushedCommits { request });
     }
 
     fn push_dialog_closed(&mut self) {
         self.push_dialog = None;
+    }
+
+    fn apply_unpushed_commits_result(&mut self, result: Result<Vec<gui_core::CommitInfo>, String>) {
+        let Some(dialog) = &mut self.push_dialog else {
+            return;
+        };
+        dialog.unpushed_loading = false;
+        match result {
+            Ok(commits) => dialog.unpushed_commits = Some(commits),
+            Err(message) => dialog.unpushed_error = Some(message),
+        }
     }
 
     fn push_dialog_push_clicked(&mut self) {
@@ -3180,101 +3466,79 @@ impl GuiApp {
         });
     }
 
-    /// Sends the `Add*` command for `kind` and remembers it in
+    /// Sends the `Add*` command for `target` and remembers it in
     /// `local_pool_ops` so the reply can update the right form/field.
-    /// `kind` and `target` always agree (every call site picks both
-    /// together — see `local_attachment_add_clicked`), so the `_ =>
-    /// unreachable!()` fallback below is only there to keep the match
-    /// total, never actually reached.
-    fn add_local_pool_entry(&mut self, kind: LocalPoolKind, target: EntryPath, path: PathBuf) {
+    fn add_local_pool_entry(&mut self, target: LocalPoolTarget, path: PathBuf) {
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
         self.local_pool_ops.insert(
             request,
             LocalPoolOp {
-                kind,
+                kind: target.kind(),
                 adding: true,
-                target: target.clone(),
+                target: target.entry_path(),
                 path: path.clone(),
             },
         );
-        let command = match (kind, target) {
-            (LocalPoolKind::RequirementAttachment, EntryPath::Requirement(target)) => {
-                Command::AddRequirementAttachment {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            (LocalPoolKind::TestAttachment, EntryPath::Test(target)) => {
-                Command::AddTestAttachment {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            (LocalPoolKind::TestTemplate, EntryPath::Test(target)) => {
-                Command::AddTestTemplateFile {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            (LocalPoolKind::ResultAttachment, EntryPath::Result(target)) => {
-                Command::AddResultAttachment {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            _ => unreachable!("kind and target always agree"),
+        let command = match target {
+            LocalPoolTarget::RequirementAttachment(target) => Command::AddRequirementAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolTarget::TestAttachment(target) => Command::AddTestAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolTarget::TestTemplate(target) => Command::AddTestTemplateFile {
+                target,
+                path,
+                request,
+            },
+            LocalPoolTarget::ResultAttachment(target) => Command::AddResultAttachment {
+                target,
+                path,
+                request,
+            },
         };
         self.send_command(command);
     }
 
-    /// See `add_local_pool_entry`'s own doc comment on the fallback arm.
-    fn remove_local_pool_entry(&mut self, kind: LocalPoolKind, target: EntryPath, path: PathBuf) {
+    /// See `add_local_pool_entry`'s own doc comment.
+    fn remove_local_pool_entry(&mut self, target: LocalPoolTarget, path: PathBuf) {
         let request = self.next_request_id();
         self.pending.insert(request, PendingKind::Generic);
         self.local_pool_ops.insert(
             request,
             LocalPoolOp {
-                kind,
+                kind: target.kind(),
                 adding: false,
-                target: target.clone(),
+                target: target.entry_path(),
                 path: path.clone(),
             },
         );
-        let command = match (kind, target) {
-            (LocalPoolKind::RequirementAttachment, EntryPath::Requirement(target)) => {
-                Command::RemoveRequirementAttachment {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            (LocalPoolKind::TestAttachment, EntryPath::Test(target)) => {
-                Command::RemoveTestAttachment {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            (LocalPoolKind::TestTemplate, EntryPath::Test(target)) => {
-                Command::RemoveTestTemplateFile {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            (LocalPoolKind::ResultAttachment, EntryPath::Result(target)) => {
-                Command::RemoveResultAttachment {
-                    target,
-                    path,
-                    request,
-                }
-            }
-            _ => unreachable!("kind and target always agree"),
+        let command = match target {
+            LocalPoolTarget::RequirementAttachment(target) => Command::RemoveRequirementAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolTarget::TestAttachment(target) => Command::RemoveTestAttachment {
+                target,
+                path,
+                request,
+            },
+            LocalPoolTarget::TestTemplate(target) => Command::RemoveTestTemplateFile {
+                target,
+                path,
+                request,
+            },
+            LocalPoolTarget::ResultAttachment(target) => Command::RemoveResultAttachment {
+                target,
+                path,
+                request,
+            },
         };
         self.send_command(command);
     }
@@ -3289,53 +3553,51 @@ impl GuiApp {
     /// otherwise).
     fn local_attachment_add_clicked(&mut self, kind: LocalPoolKind) {
         let Some((target, path)) = (match (&mut self.editor, kind) {
-            (EditorState::NewRequirement(form), LocalPoolKind::RequirementAttachment) => {
-                form.editing_target.clone().map(|target| {
-                    (
-                        EntryPath::Requirement(target),
-                        &mut form.new_attachment_path,
-                    )
-                })
-            }
+            (EditorState::NewRequirement(form), LocalPoolKind::RequirementAttachment) => form
+                .editing_target
+                .clone()
+                .map(|target| (LocalPoolTarget::RequirementAttachment(target), &mut form.new_attachment_path)),
             (EditorState::NewTest(form), LocalPoolKind::TestAttachment) => form
                 .editing_target
                 .clone()
-                .map(|target| (EntryPath::Test(target), &mut form.new_attachment_path)),
+                .map(|target| (LocalPoolTarget::TestAttachment(target), &mut form.new_attachment_path)),
             (EditorState::NewTest(form), LocalPoolKind::TestTemplate) => form
                 .editing_target
                 .clone()
-                .map(|target| (EntryPath::Test(target), &mut form.new_template_path)),
+                .map(|target| (LocalPoolTarget::TestTemplate(target), &mut form.new_template_path)),
             (EditorState::NewResult(form), LocalPoolKind::ResultAttachment) => form
                 .editing_target
                 .clone()
-                .map(|target| (EntryPath::Result(target), &mut form.new_attachment_path)),
+                .map(|target| (LocalPoolTarget::ResultAttachment(target), &mut form.new_attachment_path)),
             _ => None,
         })
         .filter(|(_, field)| !field.trim().is_empty())
         .map(|(target, field)| (target, PathBuf::from(std::mem::take(field)))) else {
             return;
         };
-        self.add_local_pool_entry(kind, target, path);
+        self.add_local_pool_entry(target, path);
     }
 
     fn local_attachment_remove_clicked(&mut self, kind: LocalPoolKind, path: PathBuf) {
         let target = match (&self.editor, kind) {
             (EditorState::NewRequirement(form), LocalPoolKind::RequirementAttachment) => {
-                form.editing_target.clone().map(EntryPath::Requirement)
+                form.editing_target.clone().map(LocalPoolTarget::RequirementAttachment)
             }
-            (
-                EditorState::NewTest(form),
-                LocalPoolKind::TestAttachment | LocalPoolKind::TestTemplate,
-            ) => form.editing_target.clone().map(EntryPath::Test),
+            (EditorState::NewTest(form), LocalPoolKind::TestAttachment) => {
+                form.editing_target.clone().map(LocalPoolTarget::TestAttachment)
+            }
+            (EditorState::NewTest(form), LocalPoolKind::TestTemplate) => {
+                form.editing_target.clone().map(LocalPoolTarget::TestTemplate)
+            }
             (EditorState::NewResult(form), LocalPoolKind::ResultAttachment) => {
-                form.editing_target.clone().map(EntryPath::Result)
+                form.editing_target.clone().map(LocalPoolTarget::ResultAttachment)
             }
             _ => None,
         };
         let Some(target) = target else {
             return;
         };
-        self.remove_local_pool_entry(kind, target, path);
+        self.remove_local_pool_entry(target, path);
     }
 
     /// A dependency row's "Auto" button — see `render_dependency_fields`'s
@@ -3355,7 +3617,7 @@ impl GuiApp {
         let command = match kind {
             AutoCommitKind::Local(target) => Command::ResolveLocalCommit {
                 target,
-                kind: EntryKind::Requirement,
+                kind: LocalCommitKind::Requirement,
                 request,
             },
             AutoCommitKind::Remote { url, path } => {
@@ -3428,7 +3690,7 @@ impl GuiApp {
         }
         self.send_command(Command::ResolveLocalCommit {
             target: logical,
-            kind: EntryKind::Test,
+            kind: LocalCommitKind::Test,
             request,
         });
     }
@@ -3651,11 +3913,17 @@ impl GuiApp {
                 form.error = None;
                 Some(form.build_command(module, request))
             }
-            EditorState::NewResult(form) => {
-                form.pending_request = Some(request);
-                form.error = None;
-                Some(form.build_command(module, request))
-            }
+            EditorState::NewResult(form) => match form.build_command(module, request) {
+                Some(command) => {
+                    form.pending_request = Some(request);
+                    form.error = None;
+                    Some(command)
+                }
+                None => {
+                    form.error = Some("Pick a requirement before creating a result.".to_string());
+                    None
+                }
+            },
             EditorState::NewModule(form) => {
                 form.pending_request = Some(request);
                 form.error = None;
@@ -3892,11 +4160,13 @@ impl GuiApp {
         }
         if removed {
             self.dirty = true;
-            let target = self
+            let Some(target) = self
                 .delete_confirm_dialog
-                .take()
-                .expect("just matched Some above")
-                .target;
+                .take_if(|d| d.pending_request == Some(request))
+                .map(|d| d.target)
+            else {
+                return;
+            };
             let parent = match target {
                 DeleteTarget::Requirement(target) | DeleteTarget::Test(target) => target.modules,
                 DeleteTarget::Result(target) => target.requirement.modules,
@@ -4071,10 +4341,11 @@ impl GuiApp {
         if !is_pending {
             return false;
         }
-        let dialog = self
-            .recreate_requirement_dialog
-            .as_mut()
-            .expect("just matched Some above");
+        let Some(dialog) = matching_mut(&mut self.recreate_requirement_dialog, |d| {
+            d.find_references_request == Some(request)
+        }) else {
+            return false;
+        };
         dialog.find_references_request = None;
         dialog.checked_references = true;
         let is_empty = sites.is_empty();
@@ -4132,10 +4403,12 @@ impl GuiApp {
         }
         match result {
             Ok(()) => {
-                let dialog = self
+                let Some(dialog) = self
                     .recreate_requirement_dialog
-                    .take()
-                    .expect("just matched Some above");
+                    .take_if(|d| d.pending_request == Some(request) && d.repairing)
+                else {
+                    return true;
+                };
                 let new_target = LogicalPath {
                     modules: dialog.target.modules,
                     name: EntryName(dialog.new_name.trim().to_string()),
@@ -4181,10 +4454,11 @@ impl GuiApp {
         self.dirty = true;
         let add_request = self.next_request_id();
         self.pending.insert(add_request, PendingKind::Generic);
-        let dialog = self
-            .recreate_requirement_dialog
-            .as_mut()
-            .expect("just matched Some above");
+        let Some(dialog) = matching_mut(&mut self.recreate_requirement_dialog, |d| {
+            d.pending_request == Some(request) && !d.deleted
+        }) else {
+            return true;
+        };
         dialog.deleted = true;
         let module = dialog.target.modules.clone();
         let name = EntryName(dialog.new_name.trim().to_string());
@@ -4228,11 +4502,10 @@ impl GuiApp {
                     .is_some_and(|dialog| !dialog.reference_choices.is_empty());
                 if has_reference_choices {
                     self.send_recreate_requirement_repair();
-                } else {
-                    let dialog = self
-                        .recreate_requirement_dialog
-                        .take()
-                        .expect("just matched Some above");
+                } else if let Some(dialog) = self
+                    .recreate_requirement_dialog
+                    .take_if(|d| d.pending_request == Some(request) && d.deleted)
+                {
                     let new_target = LogicalPath {
                         modules: dialog.target.modules,
                         name: EntryName(dialog.new_name.trim().to_string()),
@@ -4361,10 +4634,11 @@ impl GuiApp {
         if !is_pending {
             return false;
         }
-        let dialog = self
-            .recreate_test_dialog
-            .as_mut()
-            .expect("just matched Some above");
+        let Some(dialog) = matching_mut(&mut self.recreate_test_dialog, |d| {
+            d.find_references_request == Some(request)
+        }) else {
+            return false;
+        };
         dialog.find_references_request = None;
         dialog.checked_references = true;
         let is_empty = sites.is_empty();
@@ -4419,10 +4693,10 @@ impl GuiApp {
         }
         match result {
             Ok(()) => {
-                let dialog = self
-                    .recreate_test_dialog
-                    .take()
-                    .expect("just matched Some above");
+                let Some(dialog) = self.recreate_test_dialog.take_if(|d| d.pending_request == Some(request) && d.repairing)
+                else {
+                    return true;
+                };
                 let new_target = LogicalPath {
                     modules: dialog.target.modules,
                     name: EntryName(dialog.new_name.trim().to_string()),
@@ -4462,10 +4736,11 @@ impl GuiApp {
         self.dirty = true;
         let add_request = self.next_request_id();
         self.pending.insert(add_request, PendingKind::Generic);
-        let dialog = self
-            .recreate_test_dialog
-            .as_mut()
-            .expect("just matched Some above");
+        let Some(dialog) = matching_mut(&mut self.recreate_test_dialog, |d| {
+            d.pending_request == Some(request) && !d.deleted
+        }) else {
+            return true;
+        };
         dialog.deleted = true;
         let module = dialog.target.modules.clone();
         let name = EntryName(dialog.new_name.trim().to_string());
@@ -4501,11 +4776,10 @@ impl GuiApp {
                     .is_some_and(|dialog| !dialog.reference_choices.is_empty());
                 if has_reference_choices {
                     self.send_recreate_test_repair();
-                } else {
-                    let dialog = self
-                        .recreate_test_dialog
-                        .take()
-                        .expect("just matched Some above");
+                } else if let Some(dialog) = self
+                    .recreate_test_dialog
+                    .take_if(|d| d.pending_request == Some(request) && d.deleted)
+                {
                     let new_target = LogicalPath {
                         modules: dialog.target.modules,
                         name: EntryName(dialog.new_name.trim().to_string()),
@@ -4962,6 +5236,7 @@ impl eframe::App for GuiApp {
         self.render_load_error_dialog(ui);
         self.render_attachments_dialog(ui);
         self.render_commit_all_dialog(ui);
+        self.render_commit_files_dialog(ui);
         self.render_diff_dialog(ui);
         self.render_push_dialog(ui);
         self.render_path_picker_dialog(ui);
@@ -5184,25 +5459,14 @@ pub(crate) fn absolute_reference_path(target: &LogicalPath, kind_segment: &str) 
 
 /// The on-disk directory name for a leaf `kind` — `"requirements"`/
 /// `"tests"`, matching `disk`'s own project layout (see
-/// `absolute_reference_path`'s doc comment). `EntryKind::Result` never
-/// reaches here in practice: nothing in the app ever names a *result* via
-/// a `disk::ReferencePath`-shaped string (a result's own location is
-/// structural — see `logical::ResultPath` — not a reference path), so
-/// every real caller (the path-picker's `PathPickerTarget::kind()`, the
-/// tree filter's leaf matching) only ever passes `Requirement`/`Test`.
-/// `EntryKind::Module` has no
-/// leaf path of its own, so no sensible mapping — every caller
-/// (`view.rs`'s `node_matches_filter`/`render_path_picker_dialog`,
-/// `path_picker_dialog_selected` above) only ever reaches this with a real
-/// leaf kind.
-pub(crate) fn leaf_kind_segment(kind: EntryKind) -> &'static str {
+/// `absolute_reference_path`'s doc comment). Takes `LeafKind` rather than
+/// the wider `EntryKind` precisely because neither a result (no
+/// reference-path identity — see `logical::ResultPath`) nor a module (no
+/// leaf path of its own) has a sensible mapping here.
+pub(crate) fn leaf_kind_segment(kind: LeafKind) -> &'static str {
     match kind {
-        EntryKind::Requirement => "requirements",
-        EntryKind::Test => "tests",
-        EntryKind::Result => {
-            unreachable!("nothing ever names a result via a reference-path string")
-        }
-        EntryKind::Module => unreachable!("a module has no leaf path of its own"),
+        LeafKind::Requirement => "requirements",
+        LeafKind::Test => "tests",
     }
 }
 
@@ -5220,7 +5484,7 @@ mod test {
         // whether a zoom change or a recent-project record actually
         // reached disk (that's `config::test`'s/`recent::test`'s job).
         GuiApp::new(
-            CoreHandle::start(),
+            CoreHandle::start().expect("test tokio runtime"),
             GuiConfig::default(),
             PathBuf::from("/dev/null"),
             RecentProjects::default(),
@@ -7992,9 +8256,67 @@ mod test {
         assert!(!dialog.pushing);
         assert!(dialog.output.is_none());
         assert!(dialog.error.is_none());
-        // Nothing sent to gui-core yet — confirm state only.
+        // The push itself sends nothing to gui-core yet (confirm state
+        // only) — but the read-only unpushed-commits preview does fire
+        // right away.
         assert!(app.push_request.is_none());
-        assert!(app.pending.is_empty());
+        assert!(dialog.unpushed_loading);
+        assert!(app.push_unpushed_commits_request.is_some());
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn apply_unpushed_commits_result_ok_populates_the_preview() {
+        let mut app = test_app();
+        app.push_button_clicked();
+        let request = app.push_unpushed_commits_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::GetUnpushedCommits(Ok(vec![gui_core::CommitInfo {
+                hash: "deadbeef".to_string(),
+                subject: "a change".to_string(),
+                date: "2024-01-01".to_string(),
+            }])),
+        });
+
+        let dialog = app.push_dialog.as_ref().unwrap();
+        assert!(!dialog.unpushed_loading);
+        assert_eq!(dialog.unpushed_commits.as_ref().unwrap().len(), 1);
+        assert!(dialog.unpushed_error.is_none());
+    }
+
+    #[test]
+    fn apply_unpushed_commits_result_ok_with_no_commits_reports_an_empty_list() {
+        let mut app = test_app();
+        app.push_button_clicked();
+        let request = app.push_unpushed_commits_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::GetUnpushedCommits(Ok(Vec::new())),
+        });
+
+        let dialog = app.push_dialog.as_ref().unwrap();
+        assert!(!dialog.unpushed_loading);
+        assert_eq!(dialog.unpushed_commits.as_ref().unwrap(), &Vec::new());
+    }
+
+    #[test]
+    fn apply_unpushed_commits_result_err_reports_the_error() {
+        let mut app = test_app();
+        app.push_button_clicked();
+        let request = app.push_unpushed_commits_request.unwrap();
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::GetUnpushedCommits(Err(gui_core::GetUnpushedCommitsError::NoProjectPath)),
+        });
+
+        let dialog = app.push_dialog.as_ref().unwrap();
+        assert!(!dialog.unpushed_loading);
+        assert!(dialog.unpushed_commits.is_none());
+        assert!(dialog.unpushed_error.is_some());
     }
 
     #[test]
@@ -8016,7 +8338,9 @@ mod test {
 
         assert!(app.push_dialog.as_ref().unwrap().pushing);
         assert!(app.push_request.is_some());
-        assert_eq!(app.pending.len(), 1);
+        // One pending entry for the confirm-state unpushed-commits preview
+        // (fired by `push_button_clicked`) plus one for the push itself.
+        assert_eq!(app.pending.len(), 2);
     }
 
     #[test]

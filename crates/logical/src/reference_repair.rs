@@ -310,31 +310,52 @@ fn site_index(kind: &ReferenceSiteKind) -> usize {
 /// List-based sites (`RequirementTestReference`/`RequirementDependency`)
 /// are applied in descending index order so that removing one entry never
 /// invalidates another action's index into the same list.
+/// `ReferenceAction` with `Ignore` already excluded — `apply_reference_actions`
+/// discards `Ignore`d sites before any site-kind dispatch happens, so every
+/// per-site `apply_to_*` function only ever needs to handle these two cases.
+/// Replaces the old pattern of threading the 3-variant `ReferenceAction`
+/// down into each `apply_to_*` and re-deriving "not `Ignore`" by hand via a
+/// `repaired.expect("computed above for a non-Remove action")` that had no
+/// local proof of its own — it was only true because of a filter three call
+/// frames away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairOrRemove {
+    Repair,
+    Remove,
+}
+
 pub fn apply_reference_actions(
     project: &mut ProjectDraft,
     old_target: &ReferenceTarget,
     new_target: Option<&ReferenceTarget>,
     actions: &[(ReferenceSite, ReferenceAction)],
 ) -> Result<(), ReferenceRepairError> {
-    let mut ordered: Vec<&(ReferenceSite, ReferenceAction)> = actions
+    let mut ordered: Vec<(&ReferenceSite, RepairOrRemove)> = actions
         .iter()
-        .filter(|(_, action)| *action != ReferenceAction::Ignore)
+        .filter_map(|(site, action)| {
+            let action = match action {
+                ReferenceAction::Repair => RepairOrRemove::Repair,
+                ReferenceAction::Remove => RepairOrRemove::Remove,
+                ReferenceAction::Ignore => return None,
+            };
+            Some((site, action))
+        })
         .collect();
     ordered.sort_by_key(|(site, _)| Reverse(site_index(&site.kind)));
 
     for (site, action) in ordered {
         match &site.kind {
             ReferenceSiteKind::RequirementTestReference { index } => {
-                apply_to_requirement_test_ref(project, site, *index, *action, old_target, new_target)?
+                apply_to_requirement_test_ref(project, site, *index, action, old_target, new_target)?
             }
             ReferenceSiteKind::RequirementDependency { index } => {
-                apply_to_requirement_dependency(project, site, *index, *action, old_target, new_target)?
+                apply_to_requirement_dependency(project, site, *index, action, old_target, new_target)?
             }
             ReferenceSiteKind::RequirementSubmoduleDependency { index } => {
-                apply_to_requirement_submodule_dependency(project, site, *index, *action, new_target)?
+                apply_to_requirement_submodule_dependency(project, site, *index, action, new_target)?
             }
             ReferenceSiteKind::ResultTestRef { result_name } => {
-                apply_to_result(project, site, result_name, *action, old_target, new_target)?
+                apply_to_result(project, site, result_name, action, old_target, new_target)?
             }
         }
     }
@@ -345,37 +366,51 @@ fn apply_to_requirement_test_ref(
     project: &mut ProjectDraft,
     site: &ReferenceSite,
     index: usize,
-    action: ReferenceAction,
+    action: RepairOrRemove,
     old_target: &ReferenceTarget,
     new_target: Option<&ReferenceTarget>,
 ) -> Result<(), ReferenceRepairError> {
     let referrer_modules = site.referrer.modules.clone();
-    let repaired = if action == ReferenceAction::Repair {
-        let raw = {
-            let requirement = get_module(&project.tree, &referrer_modules)
-                .and_then(|module| module.requirements.get(&site.referrer.name))
-                .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
-            let test_ref = requirement.tests.get(index).ok_or_else(|| {
-                ReferenceRepairError::MissingIndex {
-                    referrer: site.referrer.clone(),
-                    index,
-                }
-            })?;
-            let TestReferenceKind::TestReferenceV1(local) = test_ref;
-            local.path.clone()
-        };
-        Some(compute_repair(
-            project,
-            &referrer_modules,
-            &raw,
-            "tests",
-            old_target,
-            new_target,
-            EntityKind::Test,
-        )?)
-    } else {
-        None
+
+    if action == RepairOrRemove::Remove {
+        let module = get_module_mut(&mut project.tree, &referrer_modules)
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        let requirement = module
+            .requirements
+            .get_mut(&site.referrer.name)
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        if index >= requirement.tests.len() {
+            return Err(ReferenceRepairError::MissingIndex {
+                referrer: site.referrer.clone(),
+                index,
+            });
+        }
+        requirement.tests.remove(index);
+        return Ok(());
+    }
+
+    let raw = {
+        let requirement = get_module(&project.tree, &referrer_modules)
+            .and_then(|module| module.requirements.get(&site.referrer.name))
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        let test_ref = requirement.tests.get(index).ok_or_else(|| {
+            ReferenceRepairError::MissingIndex {
+                referrer: site.referrer.clone(),
+                index,
+            }
+        })?;
+        let TestReferenceKind::TestReferenceV1(local) = test_ref;
+        local.path.clone()
     };
+    let (path, commit) = compute_repair(
+        project,
+        &referrer_modules,
+        &raw,
+        "tests",
+        old_target,
+        new_target,
+        EntityKind::Test,
+    )?;
 
     let module = get_module_mut(&mut project.tree, &referrer_modules)
         .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
@@ -389,12 +424,7 @@ fn apply_to_requirement_test_ref(
             index,
         });
     }
-    if action == ReferenceAction::Remove {
-        requirement.tests.remove(index);
-    } else {
-        let (path, commit) = repaired.expect("computed above for a non-Remove action");
-        requirement.tests[index] = TestReferenceKind::TestReferenceV1(LocalGitReference { path, commit });
-    }
+    requirement.tests[index] = TestReferenceKind::TestReferenceV1(LocalGitReference { path, commit });
     Ok(())
 }
 
@@ -402,42 +432,56 @@ fn apply_to_requirement_dependency(
     project: &mut ProjectDraft,
     site: &ReferenceSite,
     index: usize,
-    action: ReferenceAction,
+    action: RepairOrRemove,
     old_target: &ReferenceTarget,
     new_target: Option<&ReferenceTarget>,
 ) -> Result<(), ReferenceRepairError> {
     let referrer_modules = site.referrer.modules.clone();
-    let repaired = if action == ReferenceAction::Repair {
-        let raw = {
-            let requirement = get_module(&project.tree, &referrer_modules)
-                .and_then(|module| module.requirements.get(&site.referrer.name))
-                .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
-            let dependency = requirement.dependencies.get(index).ok_or_else(|| {
-                ReferenceRepairError::MissingIndex {
-                    referrer: site.referrer.clone(),
-                    index,
-                }
-            })?;
-            let DependencyReferenceKind::RequirementReferenceV1(local) = dependency else {
-                return Err(ReferenceRepairError::NotALocalRequirementReference {
-                    referrer: site.referrer.clone(),
-                    index,
-                });
-            };
-            local.path.clone()
+
+    if action == RepairOrRemove::Remove {
+        let module = get_module_mut(&mut project.tree, &referrer_modules)
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        let requirement = module
+            .requirements
+            .get_mut(&site.referrer.name)
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        if index >= requirement.dependencies.len() {
+            return Err(ReferenceRepairError::MissingIndex {
+                referrer: site.referrer.clone(),
+                index,
+            });
+        }
+        requirement.dependencies.remove(index);
+        return Ok(());
+    }
+
+    let raw = {
+        let requirement = get_module(&project.tree, &referrer_modules)
+            .and_then(|module| module.requirements.get(&site.referrer.name))
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        let dependency = requirement.dependencies.get(index).ok_or_else(|| {
+            ReferenceRepairError::MissingIndex {
+                referrer: site.referrer.clone(),
+                index,
+            }
+        })?;
+        let DependencyReferenceKind::RequirementReferenceV1(local) = dependency else {
+            return Err(ReferenceRepairError::NotALocalRequirementReference {
+                referrer: site.referrer.clone(),
+                index,
+            });
         };
-        Some(compute_repair(
-            project,
-            &referrer_modules,
-            &raw,
-            "requirements",
-            old_target,
-            new_target,
-            EntityKind::Requirement,
-        )?)
-    } else {
-        None
+        local.path.clone()
     };
+    let (path, commit) = compute_repair(
+        project,
+        &referrer_modules,
+        &raw,
+        "requirements",
+        old_target,
+        new_target,
+        EntityKind::Requirement,
+    )?;
 
     let module = get_module_mut(&mut project.tree, &referrer_modules)
         .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
@@ -451,13 +495,7 @@ fn apply_to_requirement_dependency(
             index,
         });
     }
-    if action == ReferenceAction::Remove {
-        requirement.dependencies.remove(index);
-    } else {
-        let (path, commit) = repaired.expect("computed above for a non-Remove action");
-        requirement.dependencies[index] =
-            DependencyReferenceKind::RequirementReferenceV1(LocalGitReference { path, commit });
-    }
+    requirement.dependencies[index] = DependencyReferenceKind::RequirementReferenceV1(LocalGitReference { path, commit });
     Ok(())
 }
 
@@ -474,25 +512,41 @@ fn apply_to_requirement_submodule_dependency(
     project: &mut ProjectDraft,
     site: &ReferenceSite,
     index: usize,
-    action: ReferenceAction,
+    action: RepairOrRemove,
     new_target: Option<&ReferenceTarget>,
 ) -> Result<(), ReferenceRepairError> {
     let referrer_modules = site.referrer.modules.clone();
-    let new_name = if action == ReferenceAction::Repair {
-        {
-            let dependency = get_module(&project.tree, &referrer_modules)
-                .and_then(|module| module.requirements.get(&site.referrer.name))
-                .and_then(|requirement| requirement.dependencies.get(index))
-                .ok_or_else(|| ReferenceRepairError::MissingIndex {
-                    referrer: site.referrer.clone(),
-                    index,
-                })?;
-            if !matches!(dependency, DependencyReferenceKind::SubmoduleV1(_)) {
-                return Err(ReferenceRepairError::NotASubmoduleDependency {
-                    referrer: site.referrer.clone(),
-                    index,
-                });
-            }
+
+    if action == RepairOrRemove::Remove {
+        let module = get_module_mut(&mut project.tree, &referrer_modules)
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        let requirement = module
+            .requirements
+            .get_mut(&site.referrer.name)
+            .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
+        if index >= requirement.dependencies.len() {
+            return Err(ReferenceRepairError::MissingIndex {
+                referrer: site.referrer.clone(),
+                index,
+            });
+        }
+        requirement.dependencies.remove(index);
+        return Ok(());
+    }
+
+    let new_name = {
+        let dependency = get_module(&project.tree, &referrer_modules)
+            .and_then(|module| module.requirements.get(&site.referrer.name))
+            .and_then(|requirement| requirement.dependencies.get(index))
+            .ok_or_else(|| ReferenceRepairError::MissingIndex {
+                referrer: site.referrer.clone(),
+                index,
+            })?;
+        if !matches!(dependency, DependencyReferenceKind::SubmoduleV1(_)) {
+            return Err(ReferenceRepairError::NotASubmoduleDependency {
+                referrer: site.referrer.clone(),
+                index,
+            });
         }
         let new_target = new_target.ok_or(ReferenceRepairError::RepairWithoutNewTarget)?;
         let ReferenceTarget::Module(new_path) = new_target else {
@@ -503,9 +557,7 @@ fn apply_to_requirement_submodule_dependency(
         {
             return Err(ReferenceRepairError::TargetMismatch);
         }
-        Some(new_path[referrer_modules.len()].clone())
-    } else {
-        None
+        new_path[referrer_modules.len()].clone()
     };
 
     let module = get_module_mut(&mut project.tree, &referrer_modules)
@@ -520,12 +572,7 @@ fn apply_to_requirement_submodule_dependency(
             index,
         });
     }
-    if action == ReferenceAction::Remove {
-        requirement.dependencies.remove(index);
-    } else {
-        let name = new_name.expect("computed above for a non-Remove action");
-        requirement.dependencies[index] = DependencyReferenceKind::SubmoduleV1(name);
-    }
+    requirement.dependencies[index] = DependencyReferenceKind::SubmoduleV1(new_name);
     Ok(())
 }
 
@@ -539,7 +586,7 @@ fn apply_to_result(
     project: &mut ProjectDraft,
     site: &ReferenceSite,
     result_name: &EntryName,
-    action: ReferenceAction,
+    action: RepairOrRemove,
     old_target: &ReferenceTarget,
     new_target: Option<&ReferenceTarget>,
 ) -> Result<(), ReferenceRepairError> {
@@ -549,7 +596,7 @@ fn apply_to_result(
         name: result_name.clone(),
     };
 
-    if action == ReferenceAction::Remove {
+    if action == RepairOrRemove::Remove {
         let module = get_module_mut(&mut project.tree, &referrer_modules)
             .ok_or_else(|| ReferenceRepairError::UnknownReferrer(site.referrer.clone()))?;
         let requirement = module

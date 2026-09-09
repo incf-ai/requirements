@@ -75,14 +75,14 @@ pub(crate) fn parse_reference_path(
     let trimmed = raw.0.trim_start_matches('/');
     let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
 
-    if segments.len() < 2 {
+    let Some(split_at) = segments.len().checked_sub(2) else {
         return Err(ParseReferencePathError::TooShort {
             path: raw.0.clone(),
             expected_kind,
         });
-    }
+    };
 
-    let (module_segments, kind_and_name) = segments.split_at(segments.len() - 2);
+    let (module_segments, kind_and_name) = segments.split_at(split_at);
     let kind = kind_and_name[0];
     let name = kind_and_name[1];
     if kind != expected_kind {
@@ -243,6 +243,12 @@ mod test {
     fn reports_a_path_too_short_to_name_anything() {
         let err =
             parse_reference_path(&ReferencePath("tests".to_string()), &[], "tests").unwrap_err();
+        assert!(matches!(err, ParseReferencePathError::TooShort { .. }));
+    }
+
+    #[test]
+    fn reports_an_empty_path_as_too_short_rather_than_panicking() {
+        let err = parse_reference_path(&ReferencePath(String::new()), &[], "tests").unwrap_err();
         assert!(matches!(err, ParseReferencePathError::TooShort { .. }));
     }
 

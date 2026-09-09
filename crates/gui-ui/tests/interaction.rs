@@ -72,7 +72,7 @@ fn harness<'a>() -> Harness<'a, GuiApp> {
         .with_size(egui::Vec2::new(800.0, 2000.0))
         .build_eframe(|_cc| {
             GuiApp::new(
-                gui_core::CoreHandle::start(),
+                gui_core::CoreHandle::start().expect("test tokio runtime"),
                 GuiConfig::default(),
                 PathBuf::from("/dev/null"),
                 RecentProjects::default(),
@@ -94,11 +94,19 @@ fn harness<'a>() -> Harness<'a, GuiApp> {
 /// alone). Bounded so a real hang still fails the test instead of the
 /// suite, per README's "Known gap" about `validate()` having no timeout —
 /// same shape of problem, this is gui-ui's side of coping with it.
+///
+/// 500 attempts (5s worst case) rather than a tighter budget: observed in
+/// practice to still time out occasionally at 200 attempts (2s) under the
+/// CPU contention of a full `cargo test --workspace` run sharing the
+/// machine with other work — widening it only costs real time on the
+/// genuinely-slow-under-contention path (the common case still returns as
+/// soon as `condition` is met), while still catching an actual hang well
+/// short of anything a human would wait out.
 fn wait_until(
     harness: &mut Harness<GuiApp>,
     mut condition: impl FnMut(&mut Harness<GuiApp>) -> bool,
 ) {
-    for _ in 0..200 {
+    for _ in 0..500 {
         if condition(harness) {
             return;
         }
@@ -438,7 +446,7 @@ fn new_project_then_save_as_creates_and_persists_a_project_from_scratch() {
     // just here so `CoreHandle::start_with` has *some* `Git`/`RemoteGit`
     // to plug in (its bound needs both, same as every other test using
     // `start_with`).
-    let core = gui_core::CoreHandle::start_with(syscalls::StdFilesystem, FixedGit);
+    let core = gui_core::CoreHandle::start_with(syscalls::StdFilesystem, FixedGit).expect("test tokio runtime");
     let mut harness = Harness::new_eframe(|_cc| {
         GuiApp::new(
             core,
@@ -551,7 +559,7 @@ fn opening_a_project_records_it_to_recent_ron_and_it_appears_in_the_file_menu() 
     let recent_path_for_app = recent_path.clone();
     let mut harness = Harness::new_eframe(move |_cc| {
         GuiApp::new(
-            gui_core::CoreHandle::start(),
+            gui_core::CoreHandle::start().expect("test tokio runtime"),
             GuiConfig::default(),
             PathBuf::from("/dev/null"),
             RecentProjects::default(),
@@ -874,7 +882,7 @@ fn zoom_in_stops_at_the_configured_maximum() {
         .with_size(egui::Vec2::new(1600.0, 600.0))
         .build_eframe(|_cc| {
             GuiApp::new(
-                gui_core::CoreHandle::start(),
+                gui_core::CoreHandle::start().expect("test tokio runtime"),
                 GuiConfig::default(),
                 PathBuf::from("/dev/null"),
                 RecentProjects::default(),
@@ -1006,7 +1014,7 @@ fn a_zoom_change_persists_to_the_config_file() {
 
     let mut harness = Harness::new_eframe(move |_cc| {
         GuiApp::new(
-            gui_core::CoreHandle::start(),
+            gui_core::CoreHandle::start().expect("test tokio runtime"),
             GuiConfig::default(),
             config_path_for_app.clone(),
             RecentProjects::default(),
@@ -1058,7 +1066,7 @@ fn selecting_a_theme_updates_the_selector_and_persists_to_the_config_file() {
 
     let mut harness = Harness::new_eframe(move |_cc| {
         GuiApp::new(
-            gui_core::CoreHandle::start(),
+            gui_core::CoreHandle::start().expect("test tokio runtime"),
             GuiConfig::default(),
             config_path_for_app.clone(),
             RecentProjects::default(),
@@ -1115,7 +1123,7 @@ fn unchecking_spellcheck_persists_to_the_config_file() {
 
     let mut harness = Harness::new_eframe(move |_cc| {
         GuiApp::new(
-            gui_core::CoreHandle::start(),
+            gui_core::CoreHandle::start().expect("test tokio runtime"),
             GuiConfig::default(),
             config_path_for_app.clone(),
             RecentProjects::default(),
@@ -1404,7 +1412,7 @@ fn close_button_closes_the_attachments_dialog() {
 /// diff, so `FixedGit` sidesteps depending on this checkout's actual
 /// working-tree state.
 fn commit_all_harness(dir: &Path) -> Harness<'static, GuiApp> {
-    let core = gui_core::CoreHandle::start_with(syscalls::StdFilesystem, FixedGit);
+    let core = gui_core::CoreHandle::start_with(syscalls::StdFilesystem, FixedGit).expect("test tokio runtime");
     let mut harness = Harness::builder()
         .with_size(egui::Vec2::new(800.0, 2000.0))
         .build_eframe(|_cc| {
@@ -1539,6 +1547,15 @@ fn clicking_a_changed_file_opens_its_diff() {
         h.query_by_role_and_label(Role::Label, "Diff: root.txt")
             .is_some()
     });
+    // The title above renders synchronously the instant the dialog opens
+    // (straight from `dialog.path`, before `Command::GetDiff` is even
+    // sent) — it proves the dialog opened, not that the diff arrived. The
+    // diff body only appears once the async reply lands and
+    // `apply_diff_result` fills it in, so it needs its own `wait_until`,
+    // not a bare assert right after the title's.
+    wait_until(&mut harness, |h| {
+        h.query_by_label_contains("+new line").is_some()
+    });
     // `FixedGit::diff`'s own fixed reply (see its doc comment) — a real
     // unified diff round-tripped through `Command::GetDiff`, proving the
     // click sent the request for *this* path and the reply rendered.
@@ -1573,13 +1590,14 @@ fn closing_the_diff_dialog_leaves_the_commit_all_dialog_open() {
         .get_by_role_and_label(Role::Button, "Close")
         .click_accesskit();
     harness.step();
-    harness.step();
-
-    assert!(
-        harness
-            .query_by_role_and_label(Role::Label, "Diff: root.txt")
+    // `wait_until`, not a hardcoded step count — same reasoning as
+    // `exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting`'s
+    // "Exit anyway" close: under CPU contention this has been observed
+    // taking longer than a fixed two `step()`s to settle.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Diff: root.txt")
             .is_none()
-    );
+    });
     // The diff modal closed back to the still-open commit-all dialog, not
     // out entirely — see `GuiApp::diff_dialog_closed`'s own doc comment.
     assert!(
@@ -1621,6 +1639,26 @@ fn push_button_opens_the_confirm_dialog() {
             .query_by_role_and_label(Role::Label, "Commit all changes")
             .is_none()
     );
+
+    drop(harness);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn push_dialog_warns_when_there_is_nothing_to_push() {
+    let dir = scratch_copy_of_test_project("push-nothing-to-push");
+    let mut harness = commit_all_harness(&dir);
+
+    harness.get_by_role_and_label(Role::Button, "Push…").click();
+    harness.step();
+    harness.step();
+
+    // `FixedGit::unpushed_commits`'s default (empty) reply — a real round
+    // trip through `Command::GetUnpushedCommits`, proving the preview
+    // fetch fired alongside the dialog opening and rendered its warning.
+    wait_until(&mut harness, |h| {
+        h.query_by_label("No commits to push.").is_some()
+    });
 
     drop(harness);
     std::fs::remove_dir_all(&dir).ok();
@@ -2295,7 +2333,14 @@ fn pasting_via_the_requirements_leaf_group_header_targets_the_current_module() {
     // group wouldn't render at all (`render_leaf_group` returns early) —
     // it shows up here as "requirements (0)" specifically because
     // something is on the clipboard to paste (see that function's own
-    // comment on `can_paste_here`).
+    // comment on `can_paste_here`). `wait_until` rather than assuming the
+    // single `step()` above already settled it — under CPU contention a
+    // panicking getter immediately after just one `step()` has been
+    // observed to run a beat too early.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "requirements (0)")
+            .is_some()
+    });
     harness
         .get_by_role_and_label(Role::Button, "requirements (0)")
         .click_secondary();
@@ -3581,6 +3626,131 @@ fn selecting_an_existing_requirement_opens_its_read_only_viewer() {
 }
 
 #[test]
+fn expanding_commit_history_shows_the_entrys_real_git_log() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    // "design" is a real root-level requirement in `test_project`, a real
+    // (checked-in) git repository — see `selecting_an_existing_requirement_
+    // opens_its_read_only_viewer` above.
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} design")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Requirement")
+            .is_some()
+    });
+
+    // A `CollapsingHeader`'s own label reports as `Role::Button` — see
+    // `the_tree_groups_leaves_under_requirements_and_test_procedures_
+    // folders`'s own comment on this. Starts collapsed, so nothing's been
+    // fetched yet; expanding it is what fires `Command::GetCommitLog` (see
+    // `render_commit_log_section`'s own doc comment).
+    harness
+        .get_by_role_and_label(Role::Button, "Commit history")
+        .click();
+    harness.step();
+    harness.step();
+
+    // This is the real `harness()` (real `CoreHandle`, real `SystemGit`),
+    // not a `FixedGit` fake — `requirements/design` is a real, checked-in
+    // fixture in this repository's own git history, so a real `git log`
+    // against it always finds at least one entry with a real (recent)
+    // author date, never the "No commits yet." empty state a brand-new/
+    // untracked path would show. `--date=short` formats each entry's date
+    // as `YYYY-MM-DD`; any commit touching this repo is from the last few
+    // years, so "202" is a safe (not over-fitted) substring to wait on.
+    wait_until(&mut harness, |h| h.query_by_label_contains("202").is_some());
+    assert!(harness.query_by_label("No commits yet.").is_none());
+}
+
+#[test]
+fn clicking_a_commit_opens_its_file_list_then_a_files_colored_diff() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} design")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Requirement")
+            .is_some()
+    });
+
+    harness
+        .get_by_role_and_label(Role::Button, "Commit history")
+        .click();
+    harness.step();
+    harness.step();
+    wait_until(&mut harness, |h| h.query_by_label_contains("202").is_some());
+
+    // `ui.link()` reports as `Role::Label` in this accesskit conversion
+    // (see `expanding_commit_history_shows_the_entrys_real_git_log`'s own
+    // comment above), and its exact text (an 8-character hex hash) isn't
+    // knowable ahead of time — locate the date label's row instead
+    // (`render_commit_log_section`'s `egui::Grid` lays out hash, date,
+    // subject per row, in that order, so the first `Role::Label` in the
+    // same container as the date is that row's hash link) and click it.
+    let date_label = harness.get_by_label_contains("202");
+    let grid = date_label.parent().expect("commit history grid not found");
+    grid.get_all_by_role(Role::Label)
+        .next()
+        .expect("commit hash link not found")
+        .click();
+    harness.step();
+    harness.step();
+
+    // The commit-files modal's own heading is "Commit <hash>" — same
+    // "hash not knowable ahead of time" reasoning, so wait on the file-list
+    // label it always renders once loaded instead.
+    wait_until(&mut harness, |h| {
+        h.query_by_label_contains("Files changed").is_some()
+    });
+    assert!(harness.query_by_label("No files.").is_none());
+
+    let files_label = harness.get_by_label_contains("Files changed");
+    let file_list = files_label.parent().expect("commit files list not found");
+    file_list
+        .get_all_by_role(Role::Label)
+        .nth(1) // skips the "Files changed (N):" label itself.
+        .expect("changed file link not found")
+        .click();
+    harness.step();
+    harness.step();
+
+    // The diff modal's heading is "Diff: <path> @ <hash>" for a per-commit
+    // diff (vs. plain "Diff: <path>" for the working-tree diff opened from
+    // "Commit all changes") — the " @ " confirms `DiffDialogState::commit`
+    // took the `Some` branch, i.e. this really is `Command::GetCommitFileDiff`'s
+    // reply, not `Command::GetDiff`'s.
+    wait_until(&mut harness, |h| {
+        h.query_by_label_contains("Diff: ").is_some()
+    });
+    assert!(harness.query_by_label_contains(" @ ").is_some());
+
+    // The heading above renders synchronously the instant the dialog opens
+    // — it proves the dialog opened, not that the diff arrived. Wait for
+    // "Loading…" to clear (the async `Command::GetCommitFileDiff` reply
+    // landing and `apply_diff_result` filling the dialog in) before
+    // asserting on its contents, same reasoning as
+    // `clicking_a_changed_file_opens_its_diff`'s own comment on this.
+    wait_until(&mut harness, |h| h.query_by_label("Loading…").is_none());
+
+    // Real, color-coded diff content from this repository's own history —
+    // not the "No textual diff available" fallback a binary/no-op diff
+    // would show.
+    assert!(
+        harness
+            .query_by_label("No textual diff available (binary file, or no changes).")
+            .is_none()
+    );
+}
+
+#[test]
 fn back_and_forward_toolbar_buttons_round_trip_two_real_selections() {
     let mut harness = harness();
     harness.step();
@@ -4311,23 +4481,25 @@ fn a_submodule_dependencys_link_navigates_to_that_module() {
 
     // Back in the read-only viewer: the new dependency shows as a
     // "Submodule:" label next to a clickable link showing the submodule's
-    // fully qualified, leading-`/` path (not `DependencyDraft::brief`'s
-    // "Submodule: beta" form, which would be redundant with the leading
-    // label — see `render_requirement_form`'s own comment on this).
-    // "design" lives at the project root, so "beta"'s fully qualified path
-    // is just "/beta" here. Scoped to the row's own container (`.parent()`
-    // of the "Submodule:" label) rather than a bare
-    // `harness.get_by_label("/beta")` since that'd still be unambiguous
-    // here, but matches the pattern the rest of this test follows.
-    // `Role::Label` rather than `Role::Link` — a real `ui.link()` reports
-    // as `Role::Label` in this accesskit conversion, same as the
+    // fully qualified, `modules/`-prefixed, leading-`/` path (not
+    // `DependencyDraft::brief`'s "Submodule: beta" form, which would be
+    // redundant with the leading label — see `render_requirement_form`'s
+    // own comment on this). "design" lives at the project root, so
+    // "beta"'s fully qualified path is "/modules/beta" here, matching the
+    // same `modules/`-prefixed convention `LocalRequirement` dependency
+    // links and every other path in this app use. Scoped to the row's own
+    // container (`.parent()` of the "Submodule:" label) rather than a bare
+    // `harness.get_by_label("/modules/beta")` since that'd still be
+    // unambiguous here, but matches the pattern the rest of this test
+    // follows. `Role::Label` rather than `Role::Link` — a real `ui.link()`
+    // reports as `Role::Label` in this accesskit conversion, same as the
     // pre-existing `LocalRequirement` dependency link above (confirmed
     // empirically: neither shows up under `Role::Link`).
     let dependency_row = harness
         .get_by_role_and_label(Role::Label, "Submodule:")
         .parent()
         .expect("submodule dependency row not found");
-    dependency_row.get_by_label("/beta").click();
+    dependency_row.get_by_label("/modules/beta").click();
     harness.step();
 
     // Clicking it opens "beta"'s own module page, the same destination
@@ -5199,6 +5371,262 @@ fn creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_cr
 }
 
 #[test]
+fn switching_the_create_result_dialogs_test_picker_updates_the_prefilled_identifier() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    // "integration" is a real root-level requirement in `test_project`
+    // with two test references of its own — `tests/smoke` and
+    // `tests/contract` (see `test_project/requirements/integration/
+    // requirement.ron`) — so switching the dialog's test picker is
+    // actually meaningful here, unlike "design"/"external" which only
+    // have one test each.
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} integration")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Requirement")
+            .is_some()
+    });
+
+    harness
+        .get_by_role_and_label(Role::Button, "Create new result")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "New Result")
+            .is_some()
+    });
+
+    let identifier_field = harness
+        .get_by_role_and_label(Role::Label, "New Result")
+        .parent()
+        .expect("create-result modal container not found")
+        .get_all_by_role(Role::TextInput)
+        .next()
+        .expect("result identifier field not found");
+    // Prefilled from the first test reference, "tests/smoke" — same
+    // `<today> <test name>` shape asserted in
+    // `creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_creates_it`.
+    let prefilled = identifier_field
+        .value()
+        .expect("identifier field has no value");
+    assert!(
+        prefilled.ends_with("smoke"),
+        "expected identifier prefilled from tests/smoke, got {prefilled:?}"
+    );
+
+    // Switch the test picker to the requirement's other test procedure —
+    // the `ComboBox` trigger reports its selected text ("tests/smoke") as
+    // an AccessKit value, same convention as the theme selector's own
+    // `ComboBox` test.
+    harness
+        .get_all_by_role(Role::ComboBox)
+        .find(|node| node.value().as_deref() == Some("tests/smoke"))
+        .expect("test picker combo box not found")
+        .click();
+    harness.step();
+    harness.step(); // let the popup settle.
+
+    harness
+        .get_by_role_and_label(Role::Button, "tests/contract")
+        .click();
+    harness.step();
+    harness.step();
+
+    // The identifier must now follow the newly selected test, not stay
+    // stuck on the one it was prefilled from — this is the actual bug fix
+    // under test: previously switching the dropdown left the identifier
+    // (and, transitively, the title still following it) referencing the
+    // old test.
+    let identifier_field = harness
+        .get_by_role_and_label(Role::Label, "New Result")
+        .parent()
+        .expect("create-result modal container not found")
+        .get_all_by_role(Role::TextInput)
+        .next()
+        .expect("result identifier field not found");
+    let updated = identifier_field
+        .value()
+        .expect("identifier field has no value");
+    assert!(
+        updated.ends_with("contract"),
+        "expected identifier to follow the newly selected tests/contract, got {updated:?}"
+    );
+}
+
+#[test]
+fn creating_a_result_with_unsaved_requirement_edits_prompts_before_discarding_them() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+    create_scratch_requirement(&mut harness);
+
+    // Same "Add test procedure" flow as
+    // `creating_a_result_from_the_requirement_views_empty_state_opens_a_modal_and_creates_it`,
+    // but — unlike that test — the outer form's own Save is deliberately
+    // *not* clicked afterward, so the new test reference stays a local,
+    // unsubmitted `form.tests` edit (`form.edited == true`) rather than
+    // something actually persisted to the requirement on disk. That's the
+    // state this bug was reported in: creating a result while the
+    // requirement form itself still has edits pending.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "Edit").is_some()
+    });
+    harness.get_by_role_and_label(Role::Button, "Edit").click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Edit Requirement")
+            .is_some()
+    });
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add test procedure")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Label, "Add Test Procedure")
+        .parent()
+        .expect("test reference composer modal container not found")
+        .get_all_by_role_and_label(Role::Button, "Pick…")
+        .next()
+        .expect("test reference composer Pick button not found")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_all_by_label("smoke")
+        .last()
+        .expect("modal row not found")
+        .click();
+    harness.step();
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Button, "Add test procedure")
+        .click_accesskit();
+    harness.step();
+
+    // The requirement form's own Save is never clicked — `form.tests` now
+    // holds an unsubmitted edit, and "Create new result" reads that local
+    // state (see `GuiApp::create_result_clicked`), so it's available here
+    // exactly as it would be for a saved test reference.
+    harness
+        .get_by_role_and_label(Role::Button, "Create new result")
+        .click_accesskit();
+    harness.step();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "New Result")
+            .is_some()
+    });
+
+    harness
+        .get_by_role_and_label(Role::Button, "Create result")
+        .click();
+    harness.step();
+    harness.step();
+
+    // The `AddResult` succeeds, but landing straight on the new result's
+    // read-only viewer (the usual "go look at what you just created" flow)
+    // would silently replace `self.editor` and discard the still-unsaved
+    // test reference sitting in the requirement form — the exact bug
+    // reported. So instead of navigating immediately, this must fall back
+    // to the same "unsaved changes" gate every other navigation that
+    // would replace `self.editor` already goes through (see
+    // `editor_has_unsaved_edits` call sites in `view.rs`).
+    wait_until(&mut harness, |h| {
+        h.query_by_label("This form has unsaved changes. Continue and lose them?")
+            .is_some()
+    });
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Result")
+            .is_none()
+    );
+    // The requirement form underneath is still showing, edits intact —
+    // not silently swapped out for the result viewer.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Edit Requirement")
+            .is_some()
+    );
+
+    // Cancelling the prompt keeps the requirement form open with its
+    // unsaved test reference still there, rather than losing it. Scoped
+    // to the unsaved-changes modal's own container — the requirement
+    // form underneath has a "Cancel" button of its own too (currently
+    // disabled, since a request is still pending), so an unscoped query
+    // would be ambiguous.
+    harness
+        .get_by_label("This form has unsaved changes. Continue and lose them?")
+        .parent()
+        .expect("unsaved-changes modal container not found")
+        .get_by_role_and_label(Role::Button, "Cancel")
+        .click();
+    harness.step();
+
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "Edit Requirement")
+            .is_some()
+    );
+    // The test reference's own "Path:" field (a plain `TextEdit`, so its
+    // text is an AccessKit *value*, not a label — see
+    // `render_test_ref_fields`) still holds "/tests/smoke" (the absolute
+    // reference path the Pick flow filled in): the unsaved edit survived,
+    // it wasn't silently dropped.
+    assert!(
+        harness
+            .get_all_by_role(Role::TextInput)
+            .any(|node| node.value().as_deref() == Some("/tests/smoke"))
+    );
+}
+
+#[test]
+fn create_new_result_button_stays_present_once_a_requirement_already_has_a_result() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+
+    // "design" is a real root-level requirement in `test_project` with
+    // both a test reference and an existing result already on disk (see
+    // `test_project/requirements/design/`) — the case the empty-results
+    // shortcut used to hide "Create new result" for, since the button only
+    // rendered inside the `form.results.is_empty()` branch. It must stay
+    // reachable even once results already exist, so a second/third result
+    // is exactly as easy to add as the first.
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} design")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Requirement")
+            .is_some()
+    });
+
+    assert!(
+        harness
+            .query_by_label("No results reference this requirement yet.")
+            .is_none()
+    );
+    assert!(
+        !harness
+            .get_by_role_and_label(Role::Button, "Create new result")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
 fn opening_a_project_defaults_to_the_root_view_page() {
     let mut harness = harness();
     harness.step();
@@ -5762,6 +6190,17 @@ fn editing_an_existing_result_can_add_a_local_attachment() {
     // (real pointer coordinates, not `click_accesskit`) misses — the
     // layout is still one frame behind where the button's rect settles.
     harness.step();
+    // Re-confirm presence after that settle step rather than assuming it
+    // held — a background `Event` landing during that one extra `step()`
+    // (this test is two nested navigations and `wait_until`s deep, with a
+    // real actor delivering completions on its own schedule) can
+    // transiently redraw the pane, and the panicking getter right below
+    // shouldn't run against a frame where the button just isn't there
+    // yet. Under normal timing this returns immediately, since the
+    // condition is already true.
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Button, "Edit").is_some()
+    });
     harness.get_by_role_and_label(Role::Button, "Edit").click();
     harness.step();
     wait_until(&mut harness, |h| {
@@ -5869,32 +6308,114 @@ fn editing_an_existing_test_can_add_a_local_attachment_and_template_file() {
     assert!(harness.query_by_label("\u{e18a} unsaved changes").is_some());
 }
 
+/// Blocks every `write`/`create_dir_all`/`remove_dir_all` call on `gate`
+/// until the test releases it — everything else delegates straight to
+/// `inner`. Used by `exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting`
+/// in place of `syscalls::SlowFilesystem`'s fixed real-time delay: a fixed
+/// delay is still a race (a real `Save` completing before the exit
+/// dialog's own deadline is ever observed loses the race under enough CPU
+/// contention — confirmed empirically, this test kept failing
+/// intermittently under a full parallel `cargo test` run even after
+/// widening `wait_until`'s own budget), where blocking on an explicit
+/// release makes `Saving` stay true for as long as the test needs it to,
+/// however long real time takes to get there.
+#[derive(Clone)]
+struct HangingWritesFilesystem<F> {
+    inner: F,
+    gate: SaveGate,
+}
+
+impl<F: syscalls::Filesystem> syscalls::Filesystem for HangingWritesFilesystem<F> {
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        self.inner.read_to_string(path)
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<PathBuf>> {
+        self.inner.read_dir(path)
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        self.inner.is_dir(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+
+    fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        self.gate.wait();
+        self.inner.write(path, contents)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        self.gate.wait();
+        self.inner.create_dir_all(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        self.gate.wait();
+        self.inner.remove_dir_all(path)
+    }
+}
+
+/// A one-shot, multi-waiter gate: any number of `wait()` calls block until
+/// `release()` is called once, after which every past-or-future `wait()`
+/// returns immediately. Plain `std::sync::{Mutex, Condvar}`, not a tokio
+/// primitive — `wait()` runs from inside `spawn_blocking`, off the async
+/// runtime entirely (same reasoning as `gui-core::actor::test::Gate`,
+/// which this mirrors but can't share — that one's private to `gui-core`'s
+/// own test module).
+#[derive(Clone)]
+struct SaveGate {
+    inner: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl SaveGate {
+    fn new() -> Self {
+        SaveGate {
+            inner: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        }
+    }
+
+    fn wait(&self) {
+        let (lock, condvar) = &*self.inner;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = condvar.wait(released).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let (lock, condvar) = &*self.inner;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+    }
+}
+
 #[test]
 fn exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting() {
-    // `syscalls::SlowFilesystem` makes the real background `Save` take
-    // deliberately longer than `save_on_exit_timeout` — a plain
-    // `CoreHandle::start()` couldn't reach `TimedOut` deterministically
-    // (tried, and reverted: a real `Save` against `test_project` is
-    // pure local disk I/O, sometimes faster than `egui_kittest`'s own
-    // `step()` call, so it often won the race to `Ready` before
-    // `TimedOut` was ever observable). `SlowFilesystem` only delays
-    // `write`/`create_dir_all`, not reads, so `LoadProject` and the
-    // module creation below stay fast — only the `Save` this test
-    // actually exercises is slow.
-    //
     // This is also the one test in this file that completes a real
     // `Save`, so — unlike every other test here — it must run against
     // `scratch_copy_of_test_project`'s writable copy, not the real
-    // fixture: an earlier version of this test pointed `SlowFilesystem`
-    // at the real `test_project` directly, and a real `Save` reaching
-    // disk permanently wrote a new module and reformatted every `.ron`
-    // file into the repository's own working tree.
+    // fixture: an earlier version of this test pointed its filesystem
+    // wrapper at the real `test_project` directly, and a real `Save`
+    // reaching disk permanently wrote a new module and reformatted every
+    // `.ron` file into the repository's own working tree.
     let project_dir = scratch_copy_of_test_project("exit-dialog-saving");
 
+    let save_gate = SaveGate::new();
     let core = gui_core::CoreHandle::start_with(
-        syscalls::SlowFilesystem::new(syscalls::StdFilesystem, Duration::from_millis(5)),
+        HangingWritesFilesystem {
+            inner: syscalls::StdFilesystem,
+            gate: save_gate.clone(),
+        },
         FixedGit,
-    );
+    )
+    .expect("test tokio runtime");
     let config = GuiConfig {
         save_on_exit_timeout: Duration::from_millis(1),
         ..GuiConfig::default()
@@ -5936,11 +6457,11 @@ fn exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting() {
     });
 
     // `Save` only actually touches the filesystem (and so only actually
-    // exercises `SlowFilesystem`'s delay) against a `Validated` project —
-    // against a `Draft` it fails immediately with `SaveError::NotValidated`,
-    // with no real I/O at all, resolving `Saving` -> `Ready` almost
-    // instantly regardless of `SlowFilesystem`. `test_project` plus an
-    // empty new module validates cleanly.
+    // hits `save_gate`) against a `Validated` project — against a `Draft`
+    // it fails immediately with `SaveError::NotValidated`, with no real
+    // I/O at all, resolving `Saving` -> `Ready` almost instantly
+    // regardless of the gate. `test_project` plus an empty new module
+    // validates cleanly.
     harness
         .get_by_role_and_label(Role::Button, "Validate")
         .click();
@@ -5970,10 +6491,12 @@ fn exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting() {
         .click();
     harness.step();
 
-    // The real `Save` is now sleeping inside its first slow `write`/
-    // `create_dir_all` call (at least 5ms away from completing), and
-    // the exit dialog's own deadline is only 1ms out — `TimedOut` is
-    // reached and observable well before the real save can finish.
+    // The real `Save` is now permanently blocked on `save_gate`'s first
+    // `write`/`create_dir_all` call — not raced against a fixed delay —
+    // so `TimedOut` is guaranteed to eventually become observable
+    // (however long real time takes to get there under whatever CPU
+    // contention is happening) rather than possibly never appearing
+    // because the save finished first.
     wait_until(&mut harness, |h| {
         h.query_by_label("Still saving — exit anyway and lose unsaved changes, or keep waiting?")
             .is_some()
@@ -5984,11 +6507,10 @@ fn exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting() {
         .click();
     harness.step();
     // Re-arms `Saving` with a fresh 1ms deadline — the real save is
-    // still going (its own delay comfortably outlasts a handful of
-    // these round trips), so this reaches `TimedOut` again rather than
-    // resolving straight to `Ready`. Proves "Keep waiting" genuinely
-    // re-arms `Saving` rather than just leaving the same `TimedOut`
-    // state on screen.
+    // still blocked on `save_gate`, so this reaches `TimedOut` again
+    // rather than resolving straight to `Ready`. Proves "Keep waiting"
+    // genuinely re-arms `Saving` rather than just leaving the same
+    // `TimedOut` state on screen.
     wait_until(&mut harness, |h| {
         h.query_by_label("Still saving — exit anyway and lose unsaved changes, or keep waiting?")
             .is_some()
@@ -6012,15 +6534,13 @@ fn exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting() {
     });
 
     // "Exit anyway" only resolves the *dialog* — the real background
-    // `Save` this test deliberately made slow is still mid-write when
-    // that happens (`SlowFilesystem`'s 5ms-per-call delay, times roughly a
-    // hundred files/dirs in `test_project`, comfortably
-    // outlasts a couple of dialog round trips) and keeps running
-    // independently of it. Dropping `harness` (and so the `CoreHandle`/
-    // `tokio::runtime::Runtime` it owns) blocks until that in-flight
-    // `spawn_blocking` task actually finishes, so the scratch directory
-    // is safe to remove afterward — without this, `remove_dir_all` races
-    // the still-running save and silently leaves the directory behind.
+    // `Save` is still blocked on `save_gate` when that happens, and keeps
+    // running independently of it. Release the gate so it can actually
+    // finish before dropping `harness`: dropping (and so the
+    // `CoreHandle`/`tokio::runtime::Runtime` it owns) blocks until that
+    // in-flight `spawn_blocking` task completes, which would otherwise
+    // hang forever waiting on a save this test never let proceed.
+    save_gate.release();
     drop(harness);
     std::fs::remove_dir_all(&project_dir).ok();
 }
@@ -6135,3 +6655,4 @@ fn debug_panel_logs_real_commands_and_can_trigger_a_tx_stall() {
             .is_some()
     );
 }
+

@@ -13,6 +13,15 @@ mod actor;
 mod tree;
 
 pub use actor::CoreHandle;
+
+/// `CoreHandle::start`/`start_with`'s own error — the tokio runtime backing
+/// the actor failed to start (OS refused thread creation: process/thread
+/// limits, a restrictive container ulimit, etc.). The one genuinely
+/// I/O-adjacent failure mode in `gui-core`'s startup path, as opposed to
+/// every other error type here, which reports an in-memory precondition.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to start gui-core's tokio runtime: {0}")]
+pub struct StartError(#[from] std::io::Error);
 // Re-exported so `gui-ui` can name these in its own `Command`-adjacent code
 // (e.g. `self.selection: Option<LogicalPath>`) without taking a direct
 // Cargo dependency on `disk`/`logical` itself — see gui-ui/README.md's
@@ -28,6 +37,10 @@ pub use logical::{RequirementResult, TestUnmetReason, UnmetReason, UnsatisfiedTe
 pub use logical::{
     ReferenceAction, ReferenceRepairError, ReferenceSite, ReferenceSiteKind, ReferenceTarget,
 };
+// Same reasoning as the `disk`/`logical` re-exports above — lets `gui-ui`
+// name `Outcome::GetCommitLog`'s payload type without a direct (non-dev)
+// Cargo dependency on `syscalls` itself.
+pub use syscalls::CommitInfo;
 
 use std::path::PathBuf;
 
@@ -360,7 +373,7 @@ pub enum Command {
     /// touches no project state.
     ResolveLocalCommit {
         target: LogicalPath,
-        kind: EntryKind,
+        kind: LocalCommitKind,
         request: RequestId,
     },
     /// The remote-reference counterpart to `ResolveLocalCommit` — resolves
@@ -387,6 +400,37 @@ pub enum Command {
         path: PathBuf,
         request: RequestId,
     },
+    /// Every commit touching `target`'s own on-disk directory, newest
+    /// first — the view screen's "Commit history" section. Read-only, same
+    /// shape as `GetDiff`/`GetChangedFiles`; doesn't touch
+    /// `mutation_in_flight`. Unlike `ResolveLocalCommit`, `target` can also
+    /// be a `Result` — a result has its own directory
+    /// (`requirements/<req>/results/<name>`) even though, unlike a
+    /// requirement/test, it has no single "current commit" field of its
+    /// own to resolve.
+    GetCommitLog {
+        target: EntryPath,
+        request: RequestId,
+    },
+    /// Every file `commit` (one of `target`'s own `GetCommitLog` entries)
+    /// changed, scoped the same way that log entry itself was — the
+    /// "Commit history" section's per-commit file-list modal, opened by
+    /// clicking a commit. Read-only, same shape as `GetCommitLog`.
+    GetCommitFiles {
+        target: EntryPath,
+        commit: String,
+        request: RequestId,
+    },
+    /// The diff `commit` introduced for `path` (one of `GetCommitFiles`'s
+    /// own results) — opened by clicking a file in that modal. Read-only,
+    /// same shape as `GetDiff`, but against a specific historical commit
+    /// rather than the working tree.
+    GetCommitFileDiff {
+        target: EntryPath,
+        commit: String,
+        path: PathBuf,
+        request: RequestId,
+    },
     /// Stages and commits every pending change in the project's working
     /// directory with `message` — the "Commit all changes" button. Touches
     /// no in-memory project state (the draft/validated project is
@@ -401,6 +445,17 @@ pub enum Command {
     /// in-memory project state, same as `CommitAll`, so it isn't gated by
     /// `mutation_in_flight` either.
     Push {
+        request: RequestId,
+    },
+    /// Every local commit not yet on the project's upstream (`git log
+    /// @{u}..HEAD`), newest first — see `syscalls::Git::unpushed_commits`.
+    /// The read behind the "Push" dialog's commit preview, fired alongside
+    /// opening the dialog so the user sees what a click of its own "Push"
+    /// button would actually send (and a warning if there's nothing to
+    /// send) before committing to it. Read-only, same "no in-memory
+    /// project state touched" shape as `Push` itself, so it isn't gated by
+    /// `mutation_in_flight` either.
+    GetUnpushedCommits {
         request: RequestId,
     },
     /// Every reference in the project that would break if `target` were
@@ -497,8 +552,12 @@ pub enum Outcome {
     ResolveRemoteCommit(Result<String, syscalls::CommitForRemoteError>),
     GetChangedFiles(Result<Vec<PathBuf>, GetChangedFilesError>),
     GetDiff(Result<String, GetDiffError>),
+    GetCommitLog(Result<Vec<syscalls::CommitInfo>, GetCommitLogError>),
+    GetCommitFiles(Result<Vec<PathBuf>, GetCommitFilesError>),
+    GetCommitFileDiff(Result<String, GetCommitFileDiffError>),
     CommitAll(Result<(), CommitAllError>),
     Push(Result<String, PushError>),
+    GetUnpushedCommits(Result<Vec<syscalls::CommitInfo>, GetUnpushedCommitsError>),
     FindReferences(Vec<ReferenceSite>),
     RepairReferences(Result<(), ReferenceRepairError>),
     /// A command that needs a loaded project arrived when `state` is
@@ -550,6 +609,36 @@ pub enum GetDiffError {
     Diff(#[from] syscalls::DiffError),
 }
 
+/// `GetCommitLog`'s own error type — same "no project on disk yet" failure
+/// mode as `GetDiffError`, plus `syscalls`'s own `git log` failure.
+#[derive(Debug, thiserror::Error)]
+pub enum GetCommitLogError {
+    #[error("no project is loaded on disk to look up commit history")]
+    NoProjectPath,
+    #[error(transparent)]
+    Commit(#[from] syscalls::CommitForPathError),
+}
+
+/// `GetCommitFiles`'s own error type — same shape as `GetCommitLogError`.
+#[derive(Debug, thiserror::Error)]
+pub enum GetCommitFilesError {
+    #[error("no project is loaded on disk to look up commit history")]
+    NoProjectPath,
+    #[error(transparent)]
+    Commit(#[from] syscalls::CommitForPathError),
+}
+
+/// `GetCommitFileDiff`'s own error type — same "no project on disk yet"
+/// failure mode as `GetDiffError`, plus `syscalls`'s own `git show`
+/// failure.
+#[derive(Debug, thiserror::Error)]
+pub enum GetCommitFileDiffError {
+    #[error("no project is loaded on disk to look up commit history")]
+    NoProjectPath,
+    #[error(transparent)]
+    Diff(#[from] syscalls::DiffError),
+}
+
 /// `CommitAll`'s own error type — same "no project on disk yet" failure
 /// mode as `GetChangedFilesError`, plus `syscalls`'s own add/commit
 /// failure (including "nothing to commit").
@@ -569,6 +658,16 @@ pub enum PushError {
     NoProjectPath,
     #[error(transparent)]
     Push(#[from] syscalls::PushError),
+}
+
+/// `GetUnpushedCommits`'s own error type — same "no project on disk yet"
+/// failure mode as `PushError`, plus `syscalls`'s own `git log` failure.
+#[derive(Debug, thiserror::Error)]
+pub enum GetUnpushedCommitsError {
+    #[error("no project is loaded on disk to look up unpushed commits")]
+    NoProjectPath,
+    #[error(transparent)]
+    Commits(#[from] syscalls::UnpushedCommitsError),
 }
 
 /// `add_requirement`/`add_test`/`add_result`/`add_module` all need
@@ -911,6 +1010,22 @@ pub enum EntryKind {
     Requirement,
     Test,
     Result,
+}
+
+/// `Command::ResolveLocalCommit`'s own `kind` field — narrower than
+/// `EntryKind` on purpose: a local commit is only ever resolved for a
+/// requirement's or test's own on-disk directory (see `entry_directory` in
+/// `actor.rs`), never a module (no directory of its own) or a result (never
+/// addressed by a bare `LogicalPath` — see `ResultPath`). Every `gui-ui`
+/// call site already only ever constructs `Requirement`/`Test`, but nothing
+/// enforced that before this type existed — `Command`/`EntryKind` are the
+/// public wire format between the two crates, so a future call site
+/// widening to a value this doesn't expect wouldn't have been caught at
+/// compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalCommitKind {
+    Requirement,
+    Test,
 }
 
 /// Addresses one requirement/test/result, generically — the payload for

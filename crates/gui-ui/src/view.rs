@@ -14,14 +14,15 @@ use gui_core::{
 
 use crate::spellcheck::{
     FieldSpellCache, SpellChecker, SpellField, SpellPopupState, SuggestionRequest, SuggestionState,
-    replace_word_in_place, word_at_byte_offset,
+    range_is_valid_for, replace_word_in_place, word_at_byte_offset,
 };
 use crate::{
     AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp,
-    LocalPoolKind, PathPickerScope, PathPickerTarget, PendingNavigation, PendingProjectAction,
-    TestRefDraft, TestRefSlot, ThemeChoice, ValidateBeforeSaveDialogState, absolute_reference_path,
+    LeafKind, LocalPoolKind, PathPickerScope, PathPickerTarget, PendingNavigation,
+    PendingProjectAction, PushDialogState, TestRefDraft, TestRefSlot, ThemeChoice,
+    ValidateBeforeSaveDialogState, absolute_reference_path, default_result_name,
     direct_submodule_names, flatten_leaf_paths, icons, leaf_kind_segment, scoped_leaf_paths,
-    theme_colors,
+    theme_colors, today_iso_date,
 };
 
 /// A short label for a `ReferenceSiteKind`, for the broken-references
@@ -98,6 +99,16 @@ fn render_grouped_text(ui: &mut egui::Ui, label: &str, text: &str) {
             ui.label(text);
         });
     }
+}
+
+/// Vertical breathing room between the requirement viewer's Requirement
+/// guidance/Dependencies/Test procedures/Results sections, sized to match
+/// `ui.separator()`'s own footprint (its default 6.0 line-height plus the
+/// `item_spacing` it would otherwise pick up on either side) but without
+/// painting the line itself — those sections are visually set off by their
+/// own `Frame::group` borders already, so the line was redundant.
+fn section_gap(ui: &mut egui::Ui) {
+    ui.add_space(ui.spacing().item_spacing.y + 6.0);
 }
 
 fn render_requirement_status(ui: &mut egui::Ui, status: &RequirementMetStatus) {
@@ -265,20 +276,30 @@ fn apply_spell_popup_action(
     }
 }
 
-/// Builds a `TextEdit::layouter` from `cache`'s already-computed
-/// misspellings, underlining each one — used by both `spellchecked_singleline`
-/// and `resizable_multiline`. Does no `zspell` work itself (that already
-/// happened in `cache.refresh`, before this is ever called), so it's cheap
-/// to call every frame regardless of typing activity. Matches the default
-/// layouter's own font/color choice (see `egui::TextEdit::show`'s internal
-/// `default_layouter`) so a field with no misspellings looks identical to
-/// before this feature existed.
-fn spellcheck_text_layouter(
-    cache: &FieldSpellCache,
+/// Builds a `TextEdit::layouter` that refreshes `cache` against the exact
+/// buffer content it's about to lay out, then underlines whatever
+/// misspellings that refresh finds — used by both `spellchecked_singleline`
+/// and `resizable_multiline`. `refresh` is a cheap no-op unless the text
+/// actually changed (see its own doc comment), so doing it here instead of
+/// once before `.show()` is free — and it's the only way to guarantee the
+/// ranges sliced below always match the string being sliced: `TextEdit::
+/// show` applies this frame's keystroke to the buffer *before* invoking the
+/// layouter, so a `cache.refresh` call made before `.show()` (the previous
+/// approach) can scan stale, pre-edit text while this closure — and
+/// everything downstream of it — sees the post-edit buffer, letting a
+/// shrinking edit produce misspelling ranges that run past the new, shorter
+/// string. Matches the default layouter's own font/color choice (see
+/// `egui::TextEdit::show`'s internal `default_layouter`) so a field with no
+/// misspellings looks identical to before this feature existed.
+fn spellcheck_text_layouter<'a>(
+    cache: &'a mut FieldSpellCache,
+    checker: &'a SpellChecker,
+    custom_words: &'a BTreeSet<String>,
     break_on_newline: bool,
-) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::Galley> + '_ {
+) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::Galley> + 'a {
     move |ui, buffer, wrap_width| {
         let text = buffer.as_str();
+        cache.refresh(text, checker, custom_words);
         let text_color = ui
             .visuals()
             .override_text_color
@@ -365,8 +386,16 @@ fn attach_spellcheck_popup(
             SuggestionState::Ready(list) => {
                 for suggestion in list {
                     if ui.button(suggestion).clicked() {
-                        replace_word_in_place(text, &state.misspelling.range, suggestion);
-                        action = Some(SpellPopupAction::Replace);
+                        // `state.misspelling.range` was captured whenever
+                        // the popup opened and the field may have been
+                        // edited since — re-validate against the buffer's
+                        // current length/char boundaries rather than
+                        // trusting a range that's gone stale, since both
+                        // indexing and `replace_range` panic otherwise.
+                        if range_is_valid_for(text, &state.misspelling.range) {
+                            replace_word_in_place(text, &state.misspelling.range, suggestion);
+                            action = Some(SpellPopupAction::Replace);
+                        }
                         ui.close();
                     }
                 }
@@ -419,8 +448,7 @@ fn spellchecked_singleline(
         field,
         ..
     } = spell;
-    cache.refresh(text, checker, custom_words);
-    let mut layouter = spellcheck_text_layouter(cache, false);
+    let mut layouter = spellcheck_text_layouter(cache, checker, custom_words, false);
     let output = egui::TextEdit::singleline(text)
         .layouter(&mut layouter)
         .show(ui);
@@ -503,8 +531,7 @@ fn resizable_multiline_with_max_height(
                     field,
                     ..
                 }) => {
-                    cache.refresh(text, checker, custom_words);
-                    let mut layouter = spellcheck_text_layouter(cache, true);
+                    let mut layouter = spellcheck_text_layouter(cache, checker, custom_words, true);
                     let layout = egui::Layout::centered_and_justified(ui.layout().main_dir());
                     let output = ui
                         .allocate_ui_with_layout(desired_size, layout, |ui| {
@@ -1159,6 +1186,14 @@ impl GuiApp {
         // since `attach_spellcheck_popup` never sees `self.config` at all
         // (see `SpellPopupAction::AddToDictionary`'s own doc comment).
         let mut spellcheck_add_to_dictionary: Option<String> = None;
+        // Set by the "Commit history" section the first time it's expanded
+        // for an entry nothing's been fetched for yet — see
+        // `render_commit_log_section`'s own doc comment on why this can't
+        // just fire the fetch inline.
+        let mut commit_log_expand_requested: Option<gui_core::EntryPath> = None;
+        // Set by clicking a commit's hash link in the "Commit history"
+        // section — see `render_commit_log_section`'s own doc comment.
+        let mut commit_log_commit_clicked: Option<(gui_core::EntryPath, String)> = None;
         {
             let EditorState::NewRequirement(form) = &mut self.editor else {
                 return;
@@ -1386,7 +1421,7 @@ impl GuiApp {
                 // set before it's ever created, since they're plain draft
                 // data submitted whole on Save/Create, not a local file pool
                 // requiring the entry to already exist.
-                ui.separator();
+                section_gap(ui);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label("Dependencies:");
                     let mut remove_dependency: Option<usize> = None;
@@ -1455,18 +1490,27 @@ impl GuiApp {
                                     // own module plus the child's bare name),
                                     // not just the bare name, since several
                                     // sibling modules can share a child name.
-                                    // Leading `/` matches the project-root-
-                                    // relative `disk::ReferencePath` convention
-                                    // other dependency kinds display.
+                                    // Each level gets a `modules/` segment and
+                                    // the whole thing a leading `/`, matching
+                                    // the `modules/`-prefixed convention every
+                                    // other path in this view uses (see
+                                    // `LogicalPath::Display` and
+                                    // `absolute_reference_path`) rather than
+                                    // just joining bare module names.
                                     let full_path = form.editing_target.as_ref().map(|t| {
-                                        let joined = t
+                                        let mut path = String::from("/");
+                                        for module in t
                                             .modules
                                             .iter()
                                             .map(EntryName::as_str)
                                             .chain(std::iter::once(name.as_str()))
-                                            .collect::<Vec<_>>()
-                                            .join("/");
-                                        format!("/{joined}")
+                                        {
+                                            path.push_str("modules/");
+                                            path.push_str(module);
+                                            path.push('/');
+                                        }
+                                        path.pop();
+                                        path
                                     });
                                     let label_text = full_path.unwrap_or_else(|| name.clone());
                                     ui.horizontal(|ui| {
@@ -1571,7 +1615,7 @@ impl GuiApp {
                 // attachments below), aren't gated on `editing` — plain draft
                 // data submitted whole on Save/Create, not a local file pool
                 // requiring the entry to already exist.
-                ui.separator();
+                section_gap(ui);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label("Test procedures:");
                     let mut remove_test_ref: Option<usize> = None;
@@ -1653,7 +1697,7 @@ impl GuiApp {
                                                         .find(|target| {
                                                             absolute_reference_path(
                                                                 target,
-                                                                leaf_kind_segment(EntryKind::Test),
+                                                                leaf_kind_segment(LeafKind::Test),
                                                             ) == path
                                                         })
                                                 {
@@ -1687,22 +1731,11 @@ impl GuiApp {
                 // add/remove/edit. Shown only for an already-existing
                 // requirement, same as Local attachments below.
                 if editing {
-                    ui.separator();
+                    section_gap(ui);
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.label("Results:");
                         if form.results.is_empty() {
                             ui.label("No results reference this requirement yet.");
-                            // Unlike Dependencies/Test references/Local
-                            // attachments, this doesn't mutate the
-                            // requirement itself — it opens the Create
-                            // Result dialog, which creates a separate
-                            // Result entity referencing this requirement.
-                            // So it's offered in the read-only viewer too.
-                            if form.tests.is_empty() {
-                                ui.label("Add a test procedure above before creating a result.");
-                            } else if ui.button("Create new result").clicked() {
-                                create_result_clicked = true;
-                            }
                         }
                         for result in &form.results {
                             // Unlike Dependencies/Test references above, a
@@ -1723,6 +1756,19 @@ impl GuiApp {
                                         name: result.name.clone(),
                                     }));
                             }
+                        }
+                        // Unlike Dependencies/Test references/Local
+                        // attachments, this doesn't mutate the requirement
+                        // itself — it opens the Create Result dialog, which
+                        // creates a separate Result entity referencing this
+                        // requirement. So it's offered in the read-only
+                        // viewer too, and always shown (not just when there
+                        // are no results yet) so a second/third result can
+                        // be added just as easily as the first.
+                        if form.tests.is_empty() {
+                            ui.label("Add a test procedure above before creating a result.");
+                        } else if ui.button("Create new result").clicked() {
+                            create_result_clicked = true;
                         }
                     });
                 }
@@ -1758,6 +1804,23 @@ impl GuiApp {
                             ui.colored_label(egui::Color32::RED, error);
                         }
                     }
+                }
+                // Pinned at the bottom, below every other section — a
+                // history log is background information to check on
+                // demand, not something that belongs above the entry's own
+                // content.
+                if let Some(target) = &form.editing_target {
+                    ui.separator();
+                    let entry_path = gui_core::EntryPath::Requirement(target.clone());
+                    render_commit_log_section(
+                        ui,
+                        &entry_path,
+                        self.commit_log_target.as_ref(),
+                        self.commit_log.as_deref(),
+                        self.commit_log_error.as_deref(),
+                        &mut commit_log_expand_requested,
+                        &mut commit_log_commit_clicked,
+                    );
                 }
             });
         if edit_clicked {
@@ -1800,6 +1863,12 @@ impl GuiApp {
         if let Some(word) = spellcheck_add_to_dictionary {
             self.add_spellcheck_word_to_dictionary(word);
         }
+        if let Some(target) = commit_log_expand_requested {
+            self.commit_log_section_expanded(target);
+        }
+        if let Some((target, commit)) = commit_log_commit_clicked {
+            self.commit_files_dialog_opened(target, commit);
+        }
     }
 
     fn render_test_form(&mut self, ui: &mut egui::Ui) {
@@ -1815,6 +1884,10 @@ impl GuiApp {
         let mut recreate_clicked = false;
         // See the Requirement form's own comment on this.
         let mut spellcheck_add_to_dictionary: Option<String> = None;
+        // See the Requirement form's own comment on this.
+        let mut commit_log_expand_requested: Option<gui_core::EntryPath> = None;
+        // See the Requirement form's own comment on this.
+        let mut commit_log_commit_clicked: Option<(gui_core::EntryPath, String)> = None;
         {
             let EditorState::NewTest(form) = &mut self.editor else {
                 return;
@@ -2027,6 +2100,21 @@ impl GuiApp {
                         }
                     }
                 }
+                // See the Requirement form's own comment on why this is
+                // pinned at the bottom.
+                if let Some(target) = &form.editing_target {
+                    ui.separator();
+                    let entry_path = gui_core::EntryPath::Test(target.clone());
+                    render_commit_log_section(
+                        ui,
+                        &entry_path,
+                        self.commit_log_target.as_ref(),
+                        self.commit_log.as_deref(),
+                        self.commit_log_error.as_deref(),
+                        &mut commit_log_expand_requested,
+                        &mut commit_log_commit_clicked,
+                    );
+                }
             });
         if edit_clicked {
             self.editor_edit_clicked();
@@ -2050,6 +2138,12 @@ impl GuiApp {
         if let Some(word) = spellcheck_add_to_dictionary {
             self.add_spellcheck_word_to_dictionary(word);
         }
+        if let Some(target) = commit_log_expand_requested {
+            self.commit_log_section_expanded(target);
+        }
+        if let Some((target, commit)) = commit_log_commit_clicked {
+            self.commit_files_dialog_opened(target, commit);
+        }
     }
 
     fn render_result_form(&mut self, ui: &mut egui::Ui) {
@@ -2064,6 +2158,10 @@ impl GuiApp {
         let mut refresh_stale_result_reference_clicked = false;
         // See the Requirement form's own comment on this.
         let mut spellcheck_add_to_dictionary: Option<String> = None;
+        // See the Requirement form's own comment on this.
+        let mut commit_log_expand_requested: Option<gui_core::EntryPath> = None;
+        // See the Requirement form's own comment on this.
+        let mut commit_log_commit_clicked: Option<(gui_core::EntryPath, String)> = None;
         {
             let EditorState::NewResult(form) = &mut self.editor else {
                 return;
@@ -2323,6 +2421,21 @@ impl GuiApp {
                         }
                     }
                 }
+                // See the Requirement form's own comment on why this is
+                // pinned at the bottom.
+                if let Some(target) = &form.editing_target {
+                    ui.separator();
+                    let entry_path = gui_core::EntryPath::Result(target.clone());
+                    render_commit_log_section(
+                        ui,
+                        &entry_path,
+                        self.commit_log_target.as_ref(),
+                        self.commit_log.as_deref(),
+                        self.commit_log_error.as_deref(),
+                        &mut commit_log_expand_requested,
+                        &mut commit_log_commit_clicked,
+                    );
+                }
             });
         if edit_clicked {
             self.editor_edit_clicked();
@@ -2345,6 +2458,12 @@ impl GuiApp {
         }
         if let Some(word) = spellcheck_add_to_dictionary {
             self.add_spellcheck_word_to_dictionary(word);
+        }
+        if let Some(target) = commit_log_expand_requested {
+            self.commit_log_section_expanded(target);
+        }
+        if let Some((target, commit)) = commit_log_commit_clicked {
+            self.commit_files_dialog_opened(target, commit);
         }
     }
 
@@ -2933,8 +3052,76 @@ impl GuiApp {
         }
     }
 
+    /// The per-commit file-list modal — opened by clicking a commit's hash
+    /// link in a view screen's "Commit history" section
+    /// (`render_commit_log_section`). Same structure as
+    /// `render_commit_all_dialog` above, minus the commit-message box and
+    /// Commit button — this modal is read-only, just a heading naming the
+    /// commit and a scrolled list of files it changed (scoped to agree
+    /// with the log itself — see `Command::GetCommitFiles`'s own doc
+    /// comment), each a link opening the diff modal for that file.
+    pub(crate) fn render_commit_files_dialog(&mut self, ui: &mut egui::Ui) {
+        if self.commit_files_dialog.is_none() {
+            return;
+        }
+
+        let mut close_clicked = false;
+        let mut diff_clicked: Option<PathBuf> = None;
+
+        let screen_rect = ui.ctx().content_rect();
+        let max_height = (screen_rect.height() - 120.0).max(200.0);
+        let width = screen_rect.width() * 0.5;
+
+        egui::Modal::new(egui::Id::new("commit_files_dialog")).show(ui.ctx(), |ui| {
+            let Some(dialog) = &self.commit_files_dialog else {
+                return;
+            };
+            ui.set_width(width);
+            ui.heading(format!(
+                "Commit {}",
+                &dialog.commit[..dialog.commit.len().min(8)]
+            ));
+            ui.separator();
+
+            if dialog.loading {
+                ui.label("Loading…");
+            } else if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::RED, error);
+            } else {
+                ui.label(format!("Files changed ({}):", dialog.files.len()));
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if dialog.files.is_empty() {
+                            ui.label("No files.");
+                        } else {
+                            for path in &dialog.files {
+                                if ui.link(path.display().to_string()).clicked() {
+                                    diff_clicked = Some(path.clone());
+                                }
+                            }
+                        }
+                    });
+            }
+
+            ui.separator();
+            if ui.button("Close").clicked() {
+                close_clicked = true;
+            }
+        });
+
+        if close_clicked {
+            self.commit_files_dialog_closed();
+        } else if let Some(path) = diff_clicked {
+            self.commit_file_diff_clicked(path);
+        }
+    }
+
     /// The "View diff" modal — opened by clicking a file in
-    /// `render_commit_all_dialog`'s file list. Renders the unified diff
+    /// `render_commit_all_dialog`'s file list, or by clicking a file in
+    /// `render_commit_files_dialog`'s (`DiffDialogState::commit` tells
+    /// these two apart — see its own doc comment). Renders the unified diff
     /// `Command::GetDiff` returned one line at a time, colored red/green
     /// via `theme_colors::diff_line_colors` (which returns `None` for
     /// context/header lines, left in the theme's ordinary text color) so
@@ -2957,7 +3144,15 @@ impl GuiApp {
                 return;
             };
             ui.set_width(width);
-            ui.heading(format!("Diff: {}", dialog.path.display()));
+            let heading = match &dialog.commit {
+                Some(commit) => format!(
+                    "Diff: {} @ {}",
+                    dialog.path.display(),
+                    &commit[..commit.len().min(8)]
+                ),
+                None => format!("Diff: {}", dialog.path.display()),
+            };
+            ui.heading(heading);
             ui.separator();
 
             if dialog.loading {
@@ -3002,7 +3197,9 @@ impl GuiApp {
     /// (failure), with the confirm button still available on failure to
     /// retry. No auto-close on success, unlike "Commit all changes" — the
     /// whole point is showing the user push's status/output until they
-    /// dismiss it.
+    /// dismiss it. The confirm state also shows a preview of what would
+    /// actually be pushed (`render_unpushed_commits_preview`), including a
+    /// warning when there's nothing to push.
     pub(crate) fn render_push_dialog(&mut self, ui: &mut egui::Ui) {
         if self.push_dialog.is_none() {
             return;
@@ -3036,6 +3233,8 @@ impl GuiApp {
                     });
             } else {
                 ui.label("Push the current branch to its remote?");
+                ui.add_space(8.0);
+                render_unpushed_commits_preview(ui, dialog);
             }
 
             ui.separator();
@@ -3091,11 +3290,8 @@ impl GuiApp {
                 return;
             };
             ui.heading(match dialog.kind {
-                EntryKind::Requirement => "Pick a requirement",
-                EntryKind::Test => "Pick a test procedure",
-                EntryKind::Module | EntryKind::Result => {
-                    unreachable!("no picker ever targets a module or result")
-                }
+                LeafKind::Requirement => "Pick a requirement",
+                LeafKind::Test => "Pick a test procedure",
             });
             ui.text_edit_singleline(&mut dialog.filter);
 
@@ -3122,7 +3318,7 @@ impl GuiApp {
                 .show(ui, |ui| {
                     let mut any_shown = false;
                     for target in
-                        scoped_leaf_paths(tree, dialog.kind, dialog.scope, &dialog.owning_module)
+                        scoped_leaf_paths(tree, dialog.kind.into(), dialog.scope, &dialog.owning_module)
                     {
                         let path_str = absolute_reference_path(&target, kind_segment);
                         if !filter.is_empty() && !path_str.to_lowercase().contains(&filter) {
@@ -3296,7 +3492,7 @@ impl GuiApp {
     }
 
     /// The requirement view's "Create new result" prompt — opened by
-    /// `GuiApp::create_result_clicked` from the empty-results state in
+    /// `GuiApp::create_result_clicked` from the Results section in
     /// `render_requirement_form`. See `CreateResultDialogState`'s own doc
     /// comment for why the test picker only offers this requirement's own
     /// `tests`, and why the commit fields are pre-filled automatically but
@@ -3415,6 +3611,25 @@ impl GuiApp {
         });
 
         let test_changed = test_index != dialog.test_index;
+        // Keep the identifier (and, transitively, the title when it's
+        // still following the identifier) in sync with the selected test
+        // procedure — but only when the field still holds the
+        // auto-generated default for the *previously* selected test, so
+        // switching tests never clobbers an identifier the user typed by
+        // hand. Same "don't stomp a manual edit" precedent as
+        // `regenerate_title` itself.
+        if test_changed
+            && let Some(old_test) = dialog.tests.get(dialog.test_index)
+            && let Some(new_test) = dialog.tests.get(test_index)
+        {
+            let today = today_iso_date();
+            if name == default_result_name(&today, old_test) {
+                name = default_result_name(&today, new_test);
+                if regenerate_title {
+                    title = title_case_from_name(&name);
+                }
+            }
+        }
         if confirmed {
             if let Some(dialog) = &mut self.create_result_dialog {
                 dialog.name = name;
@@ -4220,6 +4435,115 @@ fn render_pool_group(ui: &mut egui::Ui, title: &str, paths: &[PathBuf]) {
         });
 }
 
+/// The "Commit history" collapsible section shown on an existing (not
+/// create-mode) Requirement/Test/Result viewer — a log of every commit
+/// touching `entry_path`'s own on-disk directory, newest first (see
+/// `Command::GetCommitLog`). Reads `GuiApp`'s single commit-log slot
+/// (`commit_log_target`/`commit_log`/`commit_log_error` — only one view
+/// form is ever open at once, so one slot covers all three callers) rather
+/// than taking `&GuiApp` directly, so it can be called while `self.editor`
+/// is still mutably borrowed by the caller's own `form`.
+///
+/// The first time this is expanded for an `entry_path` nothing has been
+/// fetched for yet (`commit_log_target != Some(entry_path)`), it writes
+/// `entry_path` into `*expand_requested` rather than firing the fetch
+/// itself — same deferred-click idiom `render_requirement_form` and its
+/// siblings already use throughout (`edit_clicked` et al.), needed here
+/// because firing the fetch means calling a `&mut self` method, which
+/// can't happen while `self.editor` is already mutably borrowed. The
+/// closure only runs on frames where the section is actually expanded, so
+/// this naturally fires at most once per newly-opened entry rather than
+/// needing to track the header's previous open state.
+///
+/// Each row's hash is a link — clicking it writes `(entry_path.clone(),
+/// commit.hash.clone())` into `*commit_clicked`, the same deferred idiom,
+/// for the caller to open the per-commit file-list modal
+/// (`GuiApp::commit_files_dialog_opened`) once `self.editor`'s borrow ends.
+fn render_commit_log_section(
+    ui: &mut egui::Ui,
+    entry_path: &gui_core::EntryPath,
+    commit_log_target: Option<&gui_core::EntryPath>,
+    commit_log: Option<&[gui_core::CommitInfo]>,
+    commit_log_error: Option<&str>,
+    expand_requested: &mut Option<gui_core::EntryPath>,
+    commit_clicked: &mut Option<(gui_core::EntryPath, String)>,
+) {
+    egui::CollapsingHeader::new("Commit history")
+        .default_open(false)
+        .show(ui, |ui| {
+            if commit_log_target != Some(entry_path) {
+                *expand_requested = Some(entry_path.clone());
+                ui.spinner();
+                return;
+            }
+            if let Some(error) = commit_log_error {
+                ui.colored_label(egui::Color32::RED, error);
+                return;
+            }
+            let Some(commits) = commit_log else {
+                // Fetch already under way (`commit_log_target` matches,
+                // but neither a result nor an error has landed yet).
+                ui.spinner();
+                return;
+            };
+            if commits.is_empty() {
+                ui.label("No commits yet.");
+                return;
+            }
+            egui::Grid::new("commit_log_grid").striped(true).show(ui, |ui| {
+                for commit in commits {
+                    if ui.link(&commit.hash[..commit.hash.len().min(8)]).clicked() {
+                        *commit_clicked = Some((entry_path.clone(), commit.hash.clone()));
+                    }
+                    ui.label(&commit.date);
+                    ui.label(&commit.subject);
+                    ui.end_row();
+                }
+            });
+        });
+}
+
+/// The "Push" confirm-state preview of `dialog.unpushed_commits` — what a
+/// click of the dialog's own "Push" button would actually send, fetched by
+/// `GuiApp::push_button_clicked` alongside opening the dialog. A `RED`
+/// error label for a failed fetch and a spinner while it's in flight, same
+/// convention `render_commit_log_section` uses; an empty (but successfully
+/// fetched) list gets its own `YELLOW` warning rather than the plain "No
+/// commits yet." label that section uses, since "nothing to push" here is
+/// something the user is about to act on, not just informational history.
+fn render_unpushed_commits_preview(ui: &mut egui::Ui, dialog: &PushDialogState) {
+    if dialog.unpushed_loading {
+        ui.spinner();
+        return;
+    }
+    if let Some(error) = &dialog.unpushed_error {
+        ui.colored_label(egui::Color32::RED, format!("Unable to check for unpushed commits: {error}"));
+        return;
+    }
+    let Some(commits) = &dialog.unpushed_commits else {
+        return;
+    };
+    if commits.is_empty() {
+        ui.colored_label(egui::Color32::YELLOW, "No commits to push.");
+        return;
+    }
+    ui.label(format!(
+        "{} commit{} to push:",
+        commits.len(),
+        if commits.len() == 1 { "" } else { "s" }
+    ));
+    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+        egui::Grid::new("push_unpushed_commits_grid").striped(true).show(ui, |ui| {
+            for commit in commits {
+                ui.label(&commit.hash[..commit.hash.len().min(8)]);
+                ui.label(&commit.date);
+                ui.label(&commit.subject);
+                ui.end_row();
+            }
+        });
+    });
+}
+
 /// Three radio buttons switching `dep`'s variant — resets its fields to
 /// empty rather than trying to carry any over, since a `LocalRequirement`'s
 /// `path`/`Remote`'s `url` mean different things (see `DependencyDraft`'s
@@ -4502,7 +4826,7 @@ fn render_test_ref_fields(
                 flatten_leaf_paths(tree, EntryKind::Test)
                     .into_iter()
                     .find(|target| {
-                        absolute_reference_path(target, leaf_kind_segment(EntryKind::Test))
+                        absolute_reference_path(target, leaf_kind_segment(LeafKind::Test))
                             == test_ref.path
                     })
         {
@@ -4590,7 +4914,12 @@ fn node_matches_filter(node: &TreeNode, module_path: &[EntryName], filter: &str)
                 .iter()
                 .any(|child| node_matches_filter(child, &this_module_path, &filter))
         }
-        leaf_kind => {
+        EntryKind::Requirement | EntryKind::Test => {
+            let leaf_kind = if node.kind == EntryKind::Requirement {
+                LeafKind::Requirement
+            } else {
+                LeafKind::Test
+            };
             let target = LogicalPath {
                 modules: module_path.to_vec(),
                 name: node.name.clone(),
@@ -4599,6 +4928,12 @@ fn node_matches_filter(node: &TreeNode, module_path: &[EntryName], filter: &str)
                 .to_lowercase()
                 .contains(&filter)
         }
+        // A result has no reference-path identity of its own to search —
+        // see `leaf_kind_segment`'s doc comment — and nothing currently
+        // renders a filterable "results" group (see `render_leaf_group`'s
+        // own doc comment on why that name still appears there). Until one
+        // exists, err on the side of not hiding it rather than panicking.
+        EntryKind::Result => true,
     }
 }
 

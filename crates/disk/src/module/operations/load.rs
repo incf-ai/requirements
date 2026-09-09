@@ -94,6 +94,20 @@ mod test {
     }
 
     #[test]
+    fn malformed_submodule_ron_is_reported() {
+        let dir = valid_submodule_dir("malformed-ron");
+        std::fs::write(dir.join("submodule.ron"), "not valid ron {{{").unwrap();
+
+        let err = load_submodule(&StdFilesystem, &FixedGit, &dir).unwrap_err();
+        assert!(matches!(
+            err.0,
+            ErrorKind::Definition(LoadRonError::Parse { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn missing_requirements_dir_is_reported() {
         let dir = valid_submodule_dir("missing-requirements");
         std::fs::remove_dir(dir.join("requirements")).unwrap();

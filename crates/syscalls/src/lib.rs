@@ -213,6 +213,57 @@ pub trait Git {
         self.commit_for_path_excluding(path, &[])
     }
 
+    /// Every commit touching `path`, newest first, up to `limit` — the full
+    /// history `commit_for_path_excluding` only ever returns the newest
+    /// entry of. Same `excludes` semantics. Unlike
+    /// `commit_for_path_excluding`, an empty result is never an error: a
+    /// path with no matching commits (or a repository with no commits at
+    /// all yet) is simply a history of length zero, not something
+    /// exceptional the way "no *latest* commit" is.
+    ///
+    /// Defaults to a single-entry log built from `commit_for_path_excluding`
+    /// (empty subject/date, since the single-hash lookup doesn't have
+    /// them; empty log once that reports `NotTracked`) so the workspace's
+    /// several hand-rolled test fakes, which only implement "what's the
+    /// latest commit", don't also need their own override.
+    fn commit_log_for_path(
+        &self,
+        path: &Path,
+        excludes: &[&Path],
+        _limit: usize,
+    ) -> Result<Vec<CommitInfo>, CommitForPathError> {
+        match self.commit_for_path_excluding(path, excludes) {
+            Ok(hash) => Ok(vec![CommitInfo {
+                hash,
+                subject: String::new(),
+                date: String::new(),
+            }]),
+            Err(e) if e.is_not_tracked() => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Every file `commit` itself changed under `dir`, relative to `dir`,
+    /// ignoring any confined entirely to `excludes` — the "Commit history"
+    /// section's per-commit file list, scoped to agree with whatever
+    /// `commit_log_for_path` excluded when it produced `commit` in the
+    /// first place (a file that couldn't have produced a log entry
+    /// shouldn't appear in that entry's own file list either). An empty
+    /// result (a commit that touched nothing under `dir` once `excludes`
+    /// is applied) is a normal answer, not an error.
+    ///
+    /// Defaults to `Ok(Vec::new())`, same "trivial default so hand-rolled
+    /// test fakes don't need their own override" reasoning as `push`'s
+    /// existing default.
+    fn files_changed_in_commit(
+        &self,
+        _dir: &Path,
+        _commit: &str,
+        _excludes: &[&Path],
+    ) -> Result<Vec<PathBuf>, CommitForPathError> {
+        Ok(Vec::new())
+    }
+
     /// Whether `dir` is inside a git working tree at all. Every other
     /// method on this trait assumes it is (a project's commit lookups
     /// fail, confusingly, one leaf at a time otherwise) — callers that can
@@ -253,6 +304,21 @@ pub trait Git {
     /// `commit_all` would sweep up.
     fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError>;
 
+    /// The diff `commit` itself introduced for `path` (relative to `dir`,
+    /// as `files_changed_in_commit` itself returns them) — parent vs.
+    /// `commit`, or an empty tree vs. `commit` for a root commit with no
+    /// parent (`git show`'s own native behavior for that case, unlike
+    /// `diff`'s own manual `--no-index` fallback for an untracked file).
+    /// Read-only, same as `diff`.
+    ///
+    /// Defaults to `self.diff(dir, path)` (ignoring `commit` entirely) —
+    /// the workspace's hand-rolled test fakes only assert plumbing/shape
+    /// against this, never real git semantics, so this trivial default
+    /// (same reasoning as `push`'s) lets them skip their own override.
+    fn diff_for_commit(&self, dir: &Path, _commit: &str, path: &Path) -> Result<String, DiffError> {
+        self.diff(dir, path)
+    }
+
     /// Pushes `dir`'s current branch to its configured upstream (`git
     /// push`, no explicit remote/branch — relies on the repo's own
     /// tracking branch). Returns the combined stdout+stderr text on
@@ -265,6 +331,27 @@ pub trait Git {
     fn push(&self, _dir: &Path) -> Result<String, PushError> {
         Ok(String::new())
     }
+
+    /// Every local commit not yet on `dir`'s upstream (`git log
+    /// @{u}..HEAD`), newest first — exactly what a `push` would actually
+    /// send, so the push dialog can preview it before the user commits to
+    /// a real push. An empty result is a normal answer (nothing to push),
+    /// not an error. Defaults to an empty list so fakes that don't care
+    /// about pushing don't need their own override, same reasoning as
+    /// `push`'s own default.
+    fn unpushed_commits(&self, _dir: &Path) -> Result<Vec<CommitInfo>, UnpushedCommitsError> {
+        Ok(Vec::new())
+    }
+}
+
+/// One entry of `Git::commit_log_for_path`'s result — a single commit's
+/// hash, message subject (first line only, same as `git log`'s own
+/// `%s`), and author date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub hash: String,
+    pub subject: String,
+    pub date: String,
 }
 
 #[derive(Debug, Error)]
@@ -347,6 +434,17 @@ pub enum PushError {
     CommandFailed { status: ExitStatus, stderr: String },
 }
 
+#[derive(Debug, Error)]
+pub enum UnpushedCommitsError {
+    #[error("failed to run git: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("git exited with {status}: {stderr}")]
+    CommandFailed { status: ExitStatus, stderr: String },
+}
+
 /// `path` rewritten as a pathspec valid after `Command::current_dir(cwd)`
 /// — `.` when `path` and `cwd` are the same directory (git rejects an
 /// empty string as a pathspec, unlike `.`), the part of `path` beyond
@@ -361,6 +459,53 @@ fn relative_pathspec<'a>(path: &'a Path, cwd: &Path) -> std::borrow::Cow<'a, Pat
     }
 }
 
+/// The directory `git`'s pathspecs below should resolve relative to for a
+/// lookup against `path` — `path` itself if it's a directory, its parent
+/// otherwise. Shared by `commit_for_path_excluding` and
+/// `commit_log_for_path` (both resolve `path`/`excludes` the same way).
+fn log_cwd_for(path: &Path) -> &Path {
+    if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    }
+}
+
+/// Whether `cwd` (inside an actual repository — checked by the caller via
+/// `is_repository`) has a `HEAD` for `git log` to walk at all. A brand-new
+/// repository with no commits yet (an "unborn" branch) doesn't, and `git
+/// log`/`git rev-parse` fail outright rather than reporting an empty match
+/// in that state — checking this up front lets both `commit_for_path_excluding`
+/// and `commit_log_for_path` treat it as "nothing here yet" in whatever way
+/// suits each (an error for the former, an empty log for the latter)
+/// instead of a confusing `CommandFailed`.
+fn head_exists(cwd: &Path) -> Result<bool, CommitForPathError> {
+    Ok(Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .map_err(|source| CommitForPathError::Spawn { source })?
+        .status
+        .success())
+}
+
+/// Appends `-- <path> [:(exclude)<each of excludes>]` to `command`, with
+/// every path re-relativized against `cwd` first — shared by
+/// `commit_for_path_excluding` and `commit_log_for_path`, whose pathspec
+/// handling is otherwise identical. See `relative_pathspec`'s own doc
+/// comment for why re-relativizing against `cwd` (rather than passing
+/// `path`/`excludes` through unchanged) matters for a relative `path`.
+fn apply_path_and_excludes(command: &mut Command, path: &Path, excludes: &[&Path], cwd: &Path) {
+    command
+        .arg("--")
+        .arg(relative_pathspec(path, cwd).as_ref());
+    for exclude in excludes {
+        let mut pathspec = std::ffi::OsString::from(":(exclude)");
+        pathspec.push(relative_pathspec(exclude, cwd).as_ref());
+        command.arg(pathspec);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemGit;
 
@@ -370,58 +515,20 @@ impl Git for SystemGit {
         path: &Path,
         excludes: &[&Path],
     ) -> Result<String, CommitForPathError> {
-        let cwd = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
+        let cwd = log_cwd_for(path);
 
-        // A repository with no commits at all (an "unborn" branch) has no
-        // HEAD for `git log` to walk, so it fails outright rather than
-        // reporting an empty match — check for that case first (but only
-        // inside an actual repository, so a path outside any repo still
-        // reports `CommandFailed`) and treat it the same as "no commit
-        // touches this path".
-        if self.is_repository(cwd) {
-            let head_exists = Command::new("git")
-                .current_dir(cwd)
-                .args(["rev-parse", "--verify", "-q", "HEAD"])
-                .output()
-                .map_err(|source| CommitForPathError::Spawn { source })?
-                .status
-                .success();
-            if !head_exists {
-                return Err(CommitForPathError::NotTracked {
-                    path: path.to_path_buf(),
-                });
-            }
+        // See `head_exists`'s own doc comment on why this is checked first
+        // (but only inside an actual repository, so a path outside any
+        // repo still reports `CommandFailed` rather than `NotTracked`).
+        if self.is_repository(cwd) && !head_exists(cwd)? {
+            return Err(CommitForPathError::NotTracked {
+                path: path.to_path_buf(),
+            });
         }
-
-        // `git`'s own pathspecs below resolve relative to `current_dir`
-        // (`cwd`), which is deliberately *not* necessarily the calling
-        // process's own cwd — `cwd` walks to wherever `path` itself lives
-        // so `git` can discover the right repository regardless of what
-        // the process's cwd happens to be (that's also why `is_repository`
-        // above is checked against `cwd`, not `path`). A relative `path`
-        // has to be re-relativized against that same `cwd` before being
-        // used as a pathspec, or git resolves it against `cwd` a *second*
-        // time on top of whatever it was already relative to — e.g.
-        // `cwd` = "a/b" (from a relative `path` "a/b"), pathspec "a/b"
-        // resolves to "a/b/a/b", silently matching nothing. An absolute
-        // `path` never had this problem (unambiguous regardless of `cwd`),
-        // which is why this only ever shows up for a relative one.
-        let relative_path = relative_pathspec(path, cwd);
 
         let mut command = Command::new("git");
-        command
-            .current_dir(cwd)
-            .args(["log", "-1", "--format=%H", "--"])
-            .arg(relative_path.as_ref());
-        for exclude in excludes {
-            let mut pathspec = std::ffi::OsString::from(":(exclude)");
-            pathspec.push(relative_pathspec(exclude, cwd).as_ref());
-            command.arg(pathspec);
-        }
+        command.current_dir(cwd).args(["log", "-1", "--format=%H"]);
+        apply_path_and_excludes(&mut command, path, excludes, cwd);
 
         let output = command
             .output()
@@ -442,6 +549,98 @@ impl Git for SystemGit {
         }
 
         Ok(hash)
+    }
+
+    fn commit_log_for_path(
+        &self,
+        path: &Path,
+        excludes: &[&Path],
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, CommitForPathError> {
+        let cwd = log_cwd_for(path);
+
+        // Unlike `commit_for_path_excluding`, an unborn HEAD (or, below, a
+        // path with no matching commits) is simply an empty log here, not
+        // an error — see this method's own doc comment.
+        if self.is_repository(cwd) && !head_exists(cwd)? {
+            return Ok(Vec::new());
+        }
+
+        // Fields are separated by `\x1f` (unit separator) rather than
+        // anything printable, so a `%s` subject containing e.g. a literal
+        // `|` or tab still splits unambiguously; each commit is already on
+        // its own stdout line courtesy of `git log`'s own per-commit
+        // formatting.
+        let mut command = Command::new("git");
+        command.current_dir(cwd).args([
+            "log",
+            &format!("-{limit}"),
+            "--format=%H%x1f%s%x1f%ad",
+            "--date=short",
+        ]);
+        apply_path_and_excludes(&mut command, path, excludes, cwd);
+
+        let output = command
+            .output()
+            .map_err(|source| CommitForPathError::Spawn { source })?;
+
+        if !output.status.success() {
+            return Err(CommitForPathError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let commits = stdout
+            .lines()
+            .map(|line| {
+                let mut fields = line.splitn(3, '\u{1f}');
+                CommitInfo {
+                    hash: fields.next().unwrap_or_default().to_string(),
+                    subject: fields.next().unwrap_or_default().to_string(),
+                    date: fields.next().unwrap_or_default().to_string(),
+                }
+            })
+            .collect();
+
+        Ok(commits)
+    }
+
+    fn files_changed_in_commit(
+        &self,
+        dir: &Path,
+        commit: &str,
+        excludes: &[&Path],
+    ) -> Result<Vec<PathBuf>, CommitForPathError> {
+        // `--relative` (no argument) defaults to paths relative to
+        // `current_dir` — `dir` itself here, matching the convention every
+        // other method on this trait uses (`dir` is always the git `cwd`).
+        // `--format=` suppresses `git show`'s usual commit-message header,
+        // leaving just the (here, `--name-only`) file list.
+        let mut command = Command::new("git");
+        command
+            .current_dir(dir)
+            .args(["show", "--format=", "--name-only", "--relative", commit]);
+        apply_path_and_excludes(&mut command, dir, excludes, dir);
+
+        let output = command
+            .output()
+            .map_err(|source| CommitForPathError::Spawn { source })?;
+
+        if !output.status.success() {
+            return Err(CommitForPathError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect())
     }
 
     fn is_repository(&self, dir: &Path) -> bool {
@@ -596,6 +795,30 @@ impl Git for SystemGit {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    fn diff_for_commit(&self, dir: &Path, commit: &str, path: &Path) -> Result<String, DiffError> {
+        // Unlike `diff`, no untracked-file/`--no-index` handling is needed
+        // here — `commit` always names a real commit already in history,
+        // and `git show` already diffs a root commit (no parent) against
+        // an empty tree on its own, the same "treat it as an addition"
+        // outcome `diff`'s manual fallback exists to get for a *working
+        // tree* file with no `HEAD` to compare against.
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(["show", "--format=", commit, "--"])
+            .arg(path)
+            .output()
+            .map_err(|source| DiffError::Spawn { source })?;
+
+        if !output.status.success() {
+            return Err(DiffError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn push(&self, dir: &Path) -> Result<String, PushError> {
         let output = Command::new("git")
             .current_dir(dir)
@@ -613,6 +836,41 @@ impl Git for SystemGit {
         }
 
         Ok(format!("{stdout}{stderr}"))
+    }
+
+    fn unpushed_commits(&self, dir: &Path) -> Result<Vec<CommitInfo>, UnpushedCommitsError> {
+        // Same `\x1f`-separated `--format` as `commit_log_for_path` — see
+        // that method's own doc comment on why.
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "log",
+                "@{u}..HEAD",
+                "--format=%H%x1f%s%x1f%ad",
+                "--date=short",
+            ])
+            .output()
+            .map_err(|source| UnpushedCommitsError::Spawn { source })?;
+
+        if !output.status.success() {
+            return Err(UnpushedCommitsError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .map(|line| {
+                let mut fields = line.splitn(3, '\u{1f}');
+                CommitInfo {
+                    hash: fields.next().unwrap_or_default().to_string(),
+                    subject: fields.next().unwrap_or_default().to_string(),
+                    date: fields.next().unwrap_or_default().to_string(),
+                }
+            })
+            .collect())
     }
 }
 
@@ -656,20 +914,112 @@ impl<G: Git> Git for FaultInjectingGit<G> {
         self.inner.commit_for_path_excluding(path, excludes)
     }
 
+    fn commit_log_for_path(
+        &self,
+        path: &Path,
+        excludes: &[&Path],
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, CommitForPathError> {
+        if let Some(kind) = self.faults.get(path) {
+            return Err(CommitForPathError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", path.display())),
+            });
+        }
+        self.inner.commit_log_for_path(path, excludes, limit)
+    }
+
+    /// Delegates to `inner` rather than the trait's `true` default — unlike
+    /// every other method here, there's no `Result` to carry an injected
+    /// fault, so an injected fault instead makes this report `dir` as not a
+    /// repository (the closest bool-shaped equivalent).
+    fn is_repository(&self, dir: &Path) -> bool {
+        if self.faults.contains_key(dir) {
+            return false;
+        }
+        self.inner.is_repository(dir)
+    }
+
+    fn init_repository(&self, dir: &Path) -> Result<(), InitRepositoryError> {
+        if let Some(kind) = self.faults.get(dir) {
+            return Err(InitRepositoryError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", dir.display())),
+            });
+        }
+        self.inner.init_repository(dir)
+    }
+
     fn changed_paths(&self, dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+        if let Some(kind) = self.faults.get(dir) {
+            return Err(ChangedPathsError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", dir.display())),
+            });
+        }
         self.inner.changed_paths(dir)
     }
 
     fn commit_all(&self, dir: &Path, message: &str) -> Result<(), CommitAllError> {
+        if let Some(kind) = self.faults.get(dir) {
+            return Err(CommitAllError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", dir.display())),
+            });
+        }
         self.inner.commit_all(dir, message)
     }
 
+    /// Keyed on `dir`, same convention as `changed_paths`/`commit_all`
+    /// (this takes no single "the" path the way `diff`/`commit_for_path_excluding` do).
+    fn files_changed_in_commit(
+        &self,
+        dir: &Path,
+        commit: &str,
+        excludes: &[&Path],
+    ) -> Result<Vec<PathBuf>, CommitForPathError> {
+        if let Some(kind) = self.faults.get(dir) {
+            return Err(CommitForPathError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", dir.display())),
+            });
+        }
+        self.inner.files_changed_in_commit(dir, commit, excludes)
+    }
+
+    /// Checks `path` (the more specific of the two, matching
+    /// `commit_for_path_excluding`'s convention) rather than `dir`.
     fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError> {
+        if let Some(kind) = self.faults.get(path) {
+            return Err(DiffError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", path.display())),
+            });
+        }
         self.inner.diff(dir, path)
     }
 
+    /// Checks `path`, same convention as `diff` itself.
+    fn diff_for_commit(&self, dir: &Path, commit: &str, path: &Path) -> Result<String, DiffError> {
+        if let Some(kind) = self.faults.get(path) {
+            return Err(DiffError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", path.display())),
+            });
+        }
+        self.inner.diff_for_commit(dir, commit, path)
+    }
+
     fn push(&self, dir: &Path) -> Result<String, PushError> {
+        if let Some(kind) = self.faults.get(dir) {
+            return Err(PushError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", dir.display())),
+            });
+        }
         self.inner.push(dir)
+    }
+
+    /// Keyed on `dir`, same convention as `push` itself.
+    fn unpushed_commits(&self, dir: &Path) -> Result<Vec<CommitInfo>, UnpushedCommitsError> {
+        if let Some(kind) = self.faults.get(dir) {
+            return Err(UnpushedCommitsError::Spawn {
+                source: io::Error::new(*kind, format!("injected fault for {}", dir.display())),
+            });
+        }
+        self.inner.unpushed_commits(dir)
     }
 }
 
@@ -1176,6 +1526,280 @@ mod tests {
     }
 
     #[test]
+    fn commit_log_for_path_returns_every_commit_newest_first() {
+        let dir = scratch_git_repo("log-newest-first");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(dir.join("tracked.txt"), "second").unwrap();
+        run(&["commit", "--quiet", "-am", "second commit"]);
+        std::fs::write(dir.join("tracked.txt"), "third").unwrap();
+        run(&["commit", "--quiet", "-am", "third commit"]);
+
+        let log = SystemGit
+            .commit_log_for_path(&dir.join("tracked.txt"), &[], 10)
+            .unwrap();
+
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].subject, "third commit");
+        assert_eq!(log[1].subject, "second commit");
+        assert_eq!(log[2].subject, "initial");
+        assert!(log.iter().all(|c| !c.hash.is_empty() && !c.date.is_empty()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_log_for_path_respects_limit() {
+        let dir = scratch_git_repo("log-limit");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(dir.join("tracked.txt"), "second").unwrap();
+        run(&["commit", "--quiet", "-am", "second commit"]);
+        std::fs::write(dir.join("tracked.txt"), "third").unwrap();
+        run(&["commit", "--quiet", "-am", "third commit"]);
+
+        let log = SystemGit
+            .commit_log_for_path(&dir.join("tracked.txt"), &[], 2)
+            .unwrap();
+
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].subject, "third commit");
+        assert_eq!(log[1].subject, "second commit");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_log_for_path_excluding_ignores_commits_confined_to_the_excluded_path() {
+        let dir = scratch_git_repo("log-excluding-ignores");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/inner.txt"), "hello").unwrap();
+        run(&["add", "sub/inner.txt"]);
+        run(&["commit", "--quiet", "-m", "touches only sub/"]);
+
+        let unexcluded = SystemGit.commit_log_for_path(&dir, &[], 10).unwrap();
+        assert_eq!(unexcluded.len(), 2);
+
+        let excluded = SystemGit
+            .commit_log_for_path(&dir, &[&dir.join("sub")], 10)
+            .unwrap();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].subject, "initial");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_log_for_path_is_empty_for_a_repo_with_no_commits_at_all() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-git-log-unborn-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = Command::new("git")
+            .current_dir(&dir)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(dir.join("file.txt"), "hello").unwrap();
+
+        let log = SystemGit.commit_log_for_path(&dir.join("file.txt"), &[], 10).unwrap();
+        assert!(log.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_log_for_path_is_empty_for_an_untracked_path_in_a_repo_with_history() {
+        let dir = scratch_git_repo("log-untracked");
+        std::fs::write(dir.join("untracked.txt"), "hello").unwrap();
+
+        let log = SystemGit
+            .commit_log_for_path(&dir.join("untracked.txt"), &[], 10)
+            .unwrap();
+        assert!(log.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_commit_log_for_path() {
+        let dir = scratch_git_repo("fault-log");
+        let path = dir.join("tracked.txt");
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&path, io::ErrorKind::PermissionDenied);
+
+        let err = git.commit_log_for_path(&path, &[], 10).unwrap_err();
+        assert!(matches!(err, CommitForPathError::Spawn { .. }));
+
+        git.clear(&path);
+        assert!(git.commit_log_for_path(&path, &[], 10).unwrap().len() == 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs `git rev-parse HEAD` in `dir` and returns the trimmed hash —
+    /// shared by the `files_changed_in_commit`/`diff_for_commit` tests
+    /// below, which (unlike `commit_log_for_path`'s tests) need a specific
+    /// commit hash to ask about, not just "the log".
+    fn head_hash(dir: &Path) -> String {
+        String::from_utf8(
+            Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    #[test]
+    fn files_changed_in_commit_lists_only_what_that_commit_touched() {
+        let dir = scratch_git_repo("files-changed-only-this-commit");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(dir.join("second.txt"), "second").unwrap();
+        run(&["add", "second.txt"]);
+        run(&["commit", "--quiet", "-m", "second commit"]);
+        let second_commit = head_hash(&dir);
+
+        let files = SystemGit
+            .files_changed_in_commit(&dir, &second_commit, &[])
+            .unwrap();
+        assert_eq!(files, vec![PathBuf::from("second.txt")]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_changed_in_commit_lists_files_for_a_root_commit_with_no_parent() {
+        let dir = scratch_git_repo("files-changed-root-commit");
+        let root_commit = head_hash(&dir);
+
+        let files = SystemGit
+            .files_changed_in_commit(&dir, &root_commit, &[])
+            .unwrap();
+        assert_eq!(files, vec![PathBuf::from("tracked.txt")]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_changed_in_commit_excludes_a_confined_subtree() {
+        let dir = scratch_git_repo("files-changed-excluding");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/inner.txt"), "hello").unwrap();
+        std::fs::write(dir.join("second.txt"), "second").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "--quiet", "-m", "touches both sub/ and a top-level file"]);
+        let commit = head_hash(&dir);
+
+        let files = SystemGit
+            .files_changed_in_commit(&dir, &commit, &[&dir.join("sub")])
+            .unwrap();
+        assert_eq!(files, vec![PathBuf::from("second.txt")]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_for_commit_returns_what_that_commit_changed() {
+        let dir = scratch_git_repo("diff-for-commit-changed");
+        std::fs::write(dir.join("tracked.txt"), "goodbye").unwrap();
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["commit", "--quiet", "-am", "modify tracked.txt"]);
+        let commit = head_hash(&dir);
+
+        let diff = SystemGit
+            .diff_for_commit(&dir, &commit, Path::new("tracked.txt"))
+            .unwrap();
+        assert!(diff.contains("-hello"), "diff was: {diff}");
+        assert!(diff.contains("+goodbye"), "diff was: {diff}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_for_commit_is_empty_for_a_file_that_commit_did_not_touch() {
+        let dir = scratch_git_repo("diff-for-commit-untouched");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(dir.join("second.txt"), "second").unwrap();
+        run(&["add", "second.txt"]);
+        run(&["commit", "--quiet", "-m", "add second.txt only"]);
+        let commit = head_hash(&dir);
+
+        let diff = SystemGit
+            .diff_for_commit(&dir, &commit, Path::new("tracked.txt"))
+            .unwrap();
+        assert_eq!(diff, "");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_files_changed_in_commit() {
+        let dir = scratch_git_repo("fault-files-changed");
+        let commit = head_hash(&dir);
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&dir, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.files_changed_in_commit(&dir, &commit, &[]).unwrap_err(),
+            CommitForPathError::Spawn { .. }
+        ));
+
+        git.clear(&dir);
+        assert!(git.files_changed_in_commit(&dir, &commit, &[]).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_diff_for_commit() {
+        let dir = scratch_git_repo("fault-diff-for-commit");
+        let path = dir.join("tracked.txt");
+        let commit = head_hash(&dir);
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&path, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.diff_for_commit(&dir, &commit, &path).unwrap_err(),
+            DiffError::Spawn { .. }
+        ));
+
+        git.clear(&path);
+        assert!(git.diff_for_commit(&dir, &commit, &path).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn changed_paths_reports_nothing_in_a_clean_repo() {
         let dir = scratch_git_repo("changed-paths-clean");
 
@@ -1371,6 +1995,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Sets up `dir` with an upstream tracking branch established (same
+    /// fixture shape as `system_git_push_sends_new_commits_to_the_configured_upstream`),
+    /// returning `dir` and the remote's directory for the caller to add
+    /// its own local-only commits on top of.
+    fn scratch_git_repo_with_upstream(name: &str) -> (PathBuf, PathBuf) {
+        let remote_dir = std::env::temp_dir().join(format!(
+            "syscalls-git-{name}-remote-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(&remote_dir)
+                .args(["init", "--quiet", "--bare"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let dir = scratch_git_repo(name);
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["remote", "add", "origin", remote_dir.to_str().unwrap()]);
+        let branch = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        run(&["push", "--quiet", "-u", "origin", &branch]);
+
+        (dir, remote_dir)
+    }
+
+    #[test]
+    fn system_git_unpushed_commits_lists_local_only_commits_newest_first() {
+        let (dir, remote_dir) = scratch_git_repo_with_upstream("unpushed");
+        let run = |args: &[&str]| {
+            let status = Command::new("git").current_dir(&dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        std::fs::write(dir.join("second.txt"), "more").unwrap();
+        run(&["add", "second.txt"]);
+        run(&["commit", "--quiet", "-m", "second"]);
+        std::fs::write(dir.join("third.txt"), "more still").unwrap();
+        run(&["add", "third.txt"]);
+        run(&["commit", "--quiet", "-m", "third"]);
+
+        let commits = SystemGit.unpushed_commits(&dir).unwrap();
+        let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["third", "second"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_unpushed_commits_is_empty_once_up_to_date_with_the_upstream() {
+        let (dir, remote_dir) = scratch_git_repo_with_upstream("unpushed-up-to-date");
+
+        assert_eq!(SystemGit.unpushed_commits(&dir).unwrap(), Vec::new());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+    }
+
+    #[test]
+    fn system_git_unpushed_commits_without_an_upstream_reports_command_failed() {
+        let dir = scratch_git_repo("unpushed-no-upstream");
+
+        let err = SystemGit.unpushed_commits(&dir).unwrap_err();
+        assert!(matches!(err, UnpushedCommitsError::CommandFailed { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn system_git_reports_paths_outside_any_repo() {
         let dir = std::env::temp_dir().join(format!("syscalls-non-repo-{}", std::process::id()));
@@ -1398,6 +2107,185 @@ mod tests {
 
         git.clear(&path);
         assert!(git.commit_for_path(&path).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_changed_paths() {
+        let dir = scratch_git_repo("fault-changed-paths");
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&dir, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.changed_paths(&dir).unwrap_err(),
+            ChangedPathsError::Spawn { .. }
+        ));
+
+        git.clear(&dir);
+        assert!(git.changed_paths(&dir).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_commit_all() {
+        let dir = scratch_git_repo("fault-commit-all");
+        std::fs::write(dir.join("tracked.txt"), "changed").unwrap();
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&dir, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.commit_all(&dir, "message").unwrap_err(),
+            CommitAllError::Spawn { .. }
+        ));
+
+        git.clear(&dir);
+        assert!(git.commit_all(&dir, "message").is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_diff() {
+        let dir = scratch_git_repo("fault-diff");
+        let path = dir.join("tracked.txt");
+        std::fs::write(&path, "changed").unwrap();
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&path, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.diff(&dir, &path).unwrap_err(),
+            DiffError::Spawn { .. }
+        ));
+
+        git.clear(&path);
+        assert!(git.diff(&dir, &path).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_push() {
+        let dir = scratch_git_repo("fault-push");
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&dir, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.push(&dir).unwrap_err(),
+            PushError::Spawn { .. }
+        ));
+
+        // A real `push` needs a configured upstream remote, which
+        // `scratch_git_repo` deliberately doesn't set up — add one so
+        // `git.clear` + push also exercises the delegate-to-`inner` path,
+        // not just the fault path above.
+        let remote_dir = std::env::temp_dir().join(format!(
+            "syscalls-git-fault-push-remote-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(&remote_dir)
+                .args(["init", "--quiet", "--bare"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["remote", "add", "origin", remote_dir.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let branch = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Establishes the upstream tracking branch as fixture setup, via a
+        // raw `git push` rather than the wrapper under test — the
+        // unadorned `git.push(&dir)` below (relying on that tracking
+        // branch, same as `Git::push`'s own contract) is the actual call
+        // under test.
+        assert!(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["push", "--quiet", "-u", "origin", &branch])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        git.clear(&dir);
+        assert!(git.push(&dir).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_unpushed_commits() {
+        let (dir, remote_dir) = scratch_git_repo_with_upstream("fault-unpushed");
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&dir, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.unpushed_commits(&dir).unwrap_err(),
+            UnpushedCommitsError::Spawn { .. }
+        ));
+
+        git.clear(&dir);
+        assert!(git.unpushed_commits(&dir).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_is_repository() {
+        let dir = scratch_git_repo("fault-is-repository");
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        assert!(git.is_repository(&dir));
+
+        git.inject(&dir, io::ErrorKind::PermissionDenied);
+        assert!(!git.is_repository(&dir));
+
+        git.clear(&dir);
+        assert!(git.is_repository(&dir));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fault_injecting_git_overrides_init_repository() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscalls-git-fault-init-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut git = FaultInjectingGit::new(SystemGit);
+        git.inject(&dir, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git.init_repository(&dir).unwrap_err(),
+            InitRepositoryError::Spawn { .. }
+        ));
+
+        git.clear(&dir);
+        assert!(git.init_repository(&dir).is_ok());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

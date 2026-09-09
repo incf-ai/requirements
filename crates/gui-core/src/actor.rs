@@ -14,10 +14,11 @@ use crate::tree::{
     get_requirement_met_status, get_result_reference_is_stale, resolve_module_mut,
 };
 use crate::{
-    AddChildError, AddLocalPoolError, AddPoolChildError, AddPoolFileError, Command, CommitAllError, EntryKind, Event,
-    GetChangedFilesError, GetDiffError, LogicalPath, Outcome, ProjectState, PushError, RedoError, ReferencePath,
-    RefreshStaleTestReferencesError, RenameModuleError, RenameProjectError, RequestId, ResolveLocalCommitError, SaveError,
-    UndoError, UpdateChildError,
+    AddChildError, AddLocalPoolError, AddPoolChildError, AddPoolFileError, Command, CommitAllError, EntryPath, Event,
+    GetChangedFilesError, GetCommitFileDiffError, GetCommitFilesError, GetCommitLogError, GetDiffError,
+    GetUnpushedCommitsError, LocalCommitKind, LogicalPath, Outcome, ProjectState, PushError, RedoError,
+    ReferencePath, RefreshStaleTestReferencesError, RenameModuleError, RenameProjectError, RequestId,
+    ResolveLocalCommitError, SaveError, UndoError, UpdateChildError,
 };
 
 /// The boundary `gui-ui` talks across. Plain `Send + Sync`, non-blocking
@@ -36,11 +37,8 @@ impl CoreHandle {
     /// over `Filesystem`/`Git`/`RemoteGit` specifically so tests can
     /// exercise `Validate`/`Save`/`LoadProject` against fakes instead —
     /// see the `test` module below and README's Testing strategy.
-    pub fn start() -> CoreHandle {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_time()
-            .build()
-            .expect("failed to start gui-core's tokio runtime");
+    pub fn start() -> Result<CoreHandle, crate::StartError> {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_time().build()?;
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -52,11 +50,11 @@ impl CoreHandle {
             syscalls::SystemGit,
         ));
 
-        CoreHandle {
+        Ok(CoreHandle {
             commands: command_tx,
             events: event_rx,
             _runtime: runtime,
-        }
+        })
     }
 
     /// Same actor loop as `start()`, but against caller-supplied
@@ -68,26 +66,23 @@ impl CoreHandle {
     /// `start()` can't, like making a real `Save` artificially slow via
     /// `syscalls::SlowFilesystem` to exercise the exit dialog's
     /// Saving/TimedOut states deterministically.
-    pub fn start_with<F, G>(fs: F, git: G) -> CoreHandle
+    pub fn start_with<F, G>(fs: F, git: G) -> Result<CoreHandle, crate::StartError>
     where
         F: Filesystem + Clone + Send + Sync + 'static,
         G: Git + RemoteGit + Clone + Send + Sync + 'static,
     {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_time()
-            .build()
-            .expect("failed to start gui-core's tokio runtime");
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_time().build()?;
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         runtime.spawn(run_actor(command_rx, event_tx, fs, git));
 
-        CoreHandle {
+        Ok(CoreHandle {
             commands: command_tx,
             events: event_rx,
             _runtime: runtime,
-        }
+        })
     }
 
     /// Never blocks — the channel is unbounded specifically so this can't
@@ -309,8 +304,19 @@ where
             Command::ResolveRemoteCommit { url, path, request } => self.spawn_resolve_remote_commit(url, path, request),
             Command::GetChangedFiles { request } => self.spawn_get_changed_files(request),
             Command::GetDiff { path, request } => self.spawn_get_diff(path, request),
+            Command::GetCommitLog { target, request } => self.spawn_get_commit_log(target, request),
+            Command::GetCommitFiles { target, commit, request } => {
+                self.spawn_get_commit_files(target, commit, request)
+            }
+            Command::GetCommitFileDiff {
+                target,
+                commit,
+                path,
+                request,
+            } => self.spawn_get_commit_file_diff(target, commit, path, request),
             Command::CommitAll { message, request } => self.spawn_commit_all(message, request),
             Command::Push { request } => self.spawn_push(request),
+            Command::GetUnpushedCommits { request } => self.spawn_get_unpushed_commits(request),
             Command::FindReferences { target, request } => {
                 self.spawn_read(request, move |state| find_references(&state, &target))
             }
@@ -320,7 +326,14 @@ where
                 actions,
                 request,
             } => self.repair_references(old_target, new_target, actions, request),
-            Command::Shutdown => unreachable!("handled in run_actor's select! before dispatch is called"),
+            // `run_actor`'s own `select!` loop intercepts `Shutdown` with a
+            // `break` before ever calling `dispatch`, and `dispatch` never
+            // queues a command it wouldn't otherwise have matched, so
+            // `drain_queue`'s redispatch can't reach this either — but
+            // that's proven by reading two other functions, not by
+            // anything local to this match, so a stray `Shutdown` here is
+            // ignored rather than taking down the actor's whole task.
+            Command::Shutdown => {}
         }
     }
 
@@ -335,6 +348,41 @@ where
             };
             self.state = Some(ProjectState::Draft(validated.into_draft()));
         }
+    }
+
+    /// Ensures `self.state` is `Draft` (demoting from `Validated` via
+    /// `ensure_draft()` first if needed) and returns `&mut ProjectDraft` —
+    /// or, if no project is loaded at all, completes `request` with
+    /// `Outcome::NoProjectLoaded` on the caller's behalf and returns
+    /// `None`. Every mutating command handler that needs to edit a `Draft`
+    /// in place goes through this one accessor instead of separately
+    /// hand-checking `self.state.is_none()`, calling `ensure_draft()`, and
+    /// re-deriving "so this is `Some(Draft)`" via a `let-else` `.expect()`
+    /// on the next line — the single point where that invariant is
+    /// established is now the same single point where it's consumed,
+    /// instead of the two being copied in lockstep across many call sites.
+    fn draft_mut(&mut self, request: RequestId) -> Option<&mut logical::draft::ProjectDraft> {
+        if self.state.is_none() {
+            self.complete(request, Outcome::NoProjectLoaded);
+            return None;
+        }
+        self.ensure_draft();
+        let Some(ProjectState::Draft(draft)) = self.state.as_mut() else {
+            unreachable!("ensure_draft leaves state as Draft")
+        };
+        Some(draft)
+    }
+
+    /// Moves `self.state`'s `Draft` out by value — the owned counterpart
+    /// to `draft_mut`, for call sites that need to hand the draft to a
+    /// `spawn_blocking` closure rather than mutate it in place. Callers
+    /// must have already established `self.state` is `Some(Draft)`
+    /// (typically via a prior `draft_mut` call in the same function).
+    fn take_draft(&mut self) -> logical::draft::ProjectDraft {
+        let Some(ProjectState::Draft(draft)) = self.state.take() else {
+            unreachable!("caller already confirmed Some(Draft)")
+        };
+        draft
     }
 
     fn complete(&self, request: RequestId, outcome: Outcome) {
@@ -439,15 +487,8 @@ where
         no_module_outcome: impl FnOnce() -> Outcome,
         f: impl FnOnce(&mut logical::draft::ModuleDraft) -> Outcome,
     ) {
-        if self.state.is_none() {
-            self.complete(request, Outcome::NoProjectLoaded);
-            return;
-        }
         self.push_undo_snapshot();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let outcome = match resolve_module_mut(&mut draft.tree, module) {
             None => no_module_outcome(),
             Some(target_module) => f(target_module),
@@ -469,15 +510,8 @@ where
         f: impl FnOnce(&mut logical::draft::ModuleDraft) -> bool,
         outcome: impl FnOnce(bool) -> Outcome,
     ) {
-        if self.state.is_none() {
-            self.complete(request, Outcome::NoProjectLoaded);
-            return;
-        }
         let undo_snapshot = self.snapshot_state();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let removed = match resolve_module_mut(&mut draft.tree, module) {
             None => false,
             Some(target_module) => f(target_module),
@@ -505,15 +539,8 @@ where
         f: impl FnOnce(&mut logical::draft::ModuleDraft) -> Result<(), UpdateChildError>,
         outcome: impl FnOnce(Result<(), UpdateChildError>) -> Outcome,
     ) {
-        if self.state.is_none() {
-            self.complete(request, Outcome::NoProjectLoaded);
-            return;
-        }
         let undo_snapshot = self.snapshot_state();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let result = match resolve_module_mut(&mut draft.tree, module) {
             None => Err(UpdateChildError::ModuleNotFound),
             Some(target_module) => f(target_module),
@@ -592,10 +619,7 @@ where
 
         let logical::LogicalPath { modules, name } = target;
         let undo_snapshot = self.snapshot_state();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let result = match resolve_module_mut(&mut draft.tree, &modules) {
             None => Err(UpdateChildError::ModuleNotFound),
             Some(target_module) => match target_module.requirements.get_mut(&name) {
@@ -626,9 +650,7 @@ where
         // rather than just fixed one reference. So immediately revalidate,
         // same as a manual `Validate` would, instead of leaving that
         // demotion for the user to notice and undo themselves.
-        let ProjectState::Draft(draft) = self.state.take().expect("just confirmed Some(Draft) above") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let draft = self.take_draft();
         self.mutation_in_flight = true;
         let completions = self.completions.clone();
         let remote_git = self.git.clone();
@@ -676,10 +698,7 @@ where
         let logical::ResultPath { requirement, name } = target;
         let logical::LogicalPath { modules, name: requirement_name } = requirement;
         let undo_snapshot = self.snapshot_state();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let result = match resolve_module_mut(&mut draft.tree, &modules) {
             None => Err(UpdateChildError::ModuleNotFound),
             Some(target_module) => match target_module.requirements.get_mut(&requirement_name) {
@@ -710,9 +729,7 @@ where
         // Same "an edit just demoted to `Draft`; revalidate immediately so
         // this doesn't read as having wiped the whole project's validation
         // results" reasoning as `refresh_stale_test_references`.
-        let ProjectState::Draft(draft) = self.state.take().expect("just confirmed Some(Draft) above") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let draft = self.take_draft();
         self.mutation_in_flight = true;
         let completions = self.completions.clone();
         let remote_git = self.git.clone();
@@ -906,15 +923,8 @@ where
         let mut new_path = parent_path.clone();
         new_path.push(new_name.clone());
 
-        if self.state.is_none() {
-            self.complete(request, Outcome::NoProjectLoaded);
-            return;
-        }
         self.push_undo_snapshot();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
 
         let rename_result = match resolve_module_mut(&mut draft.tree, &parent_path) {
             None => Err(RenameModuleError::ModuleNotFound),
@@ -924,9 +934,18 @@ where
                 } else if let Err(err) = parent.add_module(new_name.as_str()) {
                     Err(RenameModuleError::Add(err))
                 } else {
-                    let renamed = parent.modules.remove(&old_name).expect("just confirmed present above");
-                    parent.modules.insert(new_name.clone(), renamed);
-                    Ok(())
+                    // `remove` returning `None` here would mean `old_name`
+                    // vanished between the `contains_key` check above and
+                    // here — impossible today (nothing else touches
+                    // `parent` in between) but reported as `NotFound`
+                    // instead of panicking if that ever stops being true.
+                    match parent.modules.remove(&old_name) {
+                        Some(renamed) => {
+                            parent.modules.insert(new_name.clone(), renamed);
+                            Ok(())
+                        }
+                        None => Err(RenameModuleError::NotFound),
+                    }
                 }
             }
         };
@@ -959,14 +978,7 @@ where
         actions: Vec<(logical::ReferenceSite, logical::ReferenceAction)>,
         request: RequestId,
     ) {
-        if self.state.is_none() {
-            self.complete(request, Outcome::NoProjectLoaded);
-            return;
-        }
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let result = logical::apply_reference_actions(draft, &old_target, new_target.as_ref(), &actions);
         self.complete(request, Outcome::RepairReferences(result));
         self.push_tree_changed();
@@ -987,10 +999,7 @@ where
             return;
         }
         let undo_snapshot = self.snapshot_state();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         draft.definition.name = new_name;
         self.complete(request, Outcome::RenameProject(Ok(())));
         if let Some(undo_snapshot) = undo_snapshot {
@@ -1057,15 +1066,8 @@ where
         f: impl FnOnce(&mut T) -> Result<(), AddPoolFileError>,
         outcome: impl FnOnce(Result<(), AddLocalPoolError>) -> Outcome,
     ) {
-        if self.state.is_none() {
-            self.complete(request, Outcome::NoProjectLoaded);
-            return;
-        }
         let undo_snapshot = self.snapshot_state();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let result = match resolve_module_mut(&mut draft.tree, module) {
             None => Err(AddLocalPoolError::ModuleNotFound),
             Some(module) => match get_entry(module) {
@@ -1095,15 +1097,8 @@ where
         f: impl FnOnce(&mut T) -> bool,
         outcome: impl FnOnce(bool) -> Outcome,
     ) {
-        if self.state.is_none() {
-            self.complete(request, Outcome::NoProjectLoaded);
-            return;
-        }
         let undo_snapshot = self.snapshot_state();
-        self.ensure_draft();
-        let ProjectState::Draft(draft) = self.state.as_mut().expect("just ensured Some(Draft)") else {
-            unreachable!("ensure_draft leaves state as Draft")
-        };
+        let Some(draft) = self.draft_mut(request) else { return };
         let removed = match resolve_module_mut(&mut draft.tree, module) {
             None => false,
             Some(module) => match get_entry(module) {
@@ -1249,7 +1244,7 @@ where
     /// `Completion`/`mutation_in_flight` at all) but still shells out to
     /// `git`, so it runs on a blocking-pool thread rather than inline like
     /// `spawn_read`'s in-memory reads do.
-    fn spawn_resolve_local_commit(&self, target: LogicalPath, kind: EntryKind, request: RequestId) {
+    fn spawn_resolve_local_commit(&self, target: LogicalPath, kind: LocalCommitKind, request: RequestId) {
         let Some(project_path) = self.project_path.clone() else {
             self.complete(request, Outcome::ResolveLocalCommit(Err(ResolveLocalCommitError::NoProjectPath)));
             return;
@@ -1308,6 +1303,74 @@ where
         });
     }
 
+    /// See `Command::GetCommitLog`'s own doc comment — same "no project
+    /// state touched, still shells out to `git`, so it's spawned" shape as
+    /// `spawn_get_diff`, against `commit_log_directory(&target)` and a
+    /// fixed exclude set (`commit_log_excludes`) instead of a caller-
+    /// supplied path.
+    fn spawn_get_commit_log(&self, target: EntryPath, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(request, Outcome::GetCommitLog(Err(GetCommitLogError::NoProjectPath)));
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let dir = commit_log_directory(&project_path, &target);
+            let excludes = commit_log_excludes(&dir, &target);
+            let exclude_refs: Vec<&Path> = excludes.iter().map(PathBuf::as_path).collect();
+            let outcome = Outcome::GetCommitLog(
+                git.commit_log_for_path(&dir, &exclude_refs, COMMIT_LOG_LIMIT)
+                    .map_err(GetCommitLogError::from),
+            );
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
+    /// See `Command::GetCommitFiles`'s own doc comment — same shape as
+    /// `spawn_get_commit_log`, reusing the exact same `commit_log_directory`/
+    /// `commit_log_excludes` helpers so the file list stays in
+    /// scope-agreement with the log entry (`commit`) it's opened from.
+    fn spawn_get_commit_files(&self, target: EntryPath, commit: String, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(request, Outcome::GetCommitFiles(Err(GetCommitFilesError::NoProjectPath)));
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let dir = commit_log_directory(&project_path, &target);
+            let excludes = commit_log_excludes(&dir, &target);
+            let exclude_refs: Vec<&Path> = excludes.iter().map(PathBuf::as_path).collect();
+            let outcome = Outcome::GetCommitFiles(
+                git.files_changed_in_commit(&dir, &commit, &exclude_refs)
+                    .map_err(GetCommitFilesError::from),
+            );
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
+    /// See `Command::GetCommitFileDiff`'s own doc comment — same shape as
+    /// `spawn_get_diff`, against `commit_log_directory(&target)` (`path` is
+    /// already relative to that directory, per `GetCommitFiles`'s own
+    /// contract) and `commit` instead of always diffing the working tree.
+    fn spawn_get_commit_file_diff(&self, target: EntryPath, commit: String, path: PathBuf, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(request, Outcome::GetCommitFileDiff(Err(GetCommitFileDiffError::NoProjectPath)));
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let dir = commit_log_directory(&project_path, &target);
+            let outcome = Outcome::GetCommitFileDiff(
+                git.diff_for_commit(&dir, &commit, &path)
+                    .map_err(GetCommitFileDiffError::from),
+            );
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
     /// See `Command::CommitAll`'s own doc comment.
     fn spawn_commit_all(&self, message: String, request: RequestId) {
         let Some(project_path) = self.project_path.clone() else {
@@ -1332,6 +1395,28 @@ where
         let events = self.events.clone();
         tokio::task::spawn_blocking(move || {
             let outcome = Outcome::Push(git.push(&project_path).map_err(PushError::from));
+            let _ = events.send(Event::Completed { request, outcome });
+        });
+    }
+
+    /// See `Command::GetUnpushedCommits`'s own doc comment — same shape as
+    /// `spawn_get_changed_files`, against `syscalls::Git::unpushed_commits`
+    /// instead of `changed_paths`.
+    fn spawn_get_unpushed_commits(&self, request: RequestId) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.complete(
+                request,
+                Outcome::GetUnpushedCommits(Err(GetUnpushedCommitsError::NoProjectPath)),
+            );
+            return;
+        };
+        let git = self.git.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = Outcome::GetUnpushedCommits(
+                git.unpushed_commits(&project_path)
+                    .map_err(GetUnpushedCommitsError::from),
+            );
             let _ = events.send(Event::Completed { request, outcome });
         });
     }
@@ -1524,38 +1609,83 @@ where
 /// layout `disk::module::operations` reads/writes
 /// (`[modules/<sub>/]*<kind_segment>/<name>`), the same shape `gui-ui`'s
 /// own `absolute_reference_path` builds as a logical reference path string
-/// rather than a real filesystem path. Used only by `spawn_resolve_local_commit`
-/// — every other place gui-core touches disk paths goes through `disk`
+/// rather than a real filesystem path. Used by `spawn_resolve_local_commit`
+/// and (for the `Requirement`/`Test` cases) `commit_log_directory` below —
+/// every other place gui-core touches disk paths goes through `disk`
 /// itself instead of reimplementing its layout, but there's no existing
 /// `disk`-level "path for this entry" function to call into here.
 ///
-/// `kind` is only ever `Requirement`/`Test` in practice — nothing
-/// references a result by path (a `LocalGitReference`/dependency only ever
-/// names a requirement or test), so `ResolveLocalCommit` never requests a
-/// result's directory, and a result couldn't be addressed by a bare
-/// `LogicalPath` here anyway (its own directory nests under its
-/// requirement's — see `logical::ResultPath`).
-fn entry_directory(project_path: &Path, target: &LogicalPath, kind: EntryKind) -> PathBuf {
+fn entry_directory(project_path: &Path, target: &LogicalPath, kind: LocalCommitKind) -> PathBuf {
     let mut dir = project_path.to_path_buf();
     for module in &target.modules {
         dir.push("modules");
         dir.push(module.as_str());
     }
     dir.push(match kind {
-        EntryKind::Requirement => "requirements",
-        EntryKind::Test => "tests",
-        EntryKind::Result => unreachable!("ResolveLocalCommit is never requested for a result"),
-        EntryKind::Module => unreachable!("a module has no leaf directory of its own"),
+        LocalCommitKind::Requirement => "requirements",
+        LocalCommitKind::Test => "tests",
     });
     dir.push(target.name.as_str());
     dir
 }
 
+/// The maximum number of entries `spawn_get_commit_log` asks
+/// `Git::commit_log_for_path` for — a "Commit history" section is a
+/// browsing aid, not a paged view, so this is a fixed cap rather than
+/// something `gui-ui` gets to configure.
+const COMMIT_LOG_LIMIT: usize = 50;
+
+/// `target`'s own directory, generalizing `entry_directory` to also cover a
+/// `Result` — unlike `LocalCommitKind`, `EntryPath` (`Command::GetCommitLog`'s
+/// own address type) can name a result, which lives at
+/// `<its requirement's directory>/results/<name>` (see `disk::result::
+/// operations`) even though, unlike a requirement/test, it has no
+/// `LocalCommitKind` of its own to pass to `entry_directory`.
+fn commit_log_directory(project_path: &Path, target: &EntryPath) -> PathBuf {
+    match target {
+        EntryPath::Requirement(path) => entry_directory(project_path, path, LocalCommitKind::Requirement),
+        EntryPath::Test(path) => entry_directory(project_path, path, LocalCommitKind::Test),
+        EntryPath::Result(result_path) => {
+            let mut dir = entry_directory(project_path, &result_path.requirement, LocalCommitKind::Requirement);
+            dir.push("results");
+            dir.push(result_path.name.as_str());
+            dir
+        }
+    }
+}
+
+/// The subdirectories of `dir` a "Commit history" log excludes, per entry
+/// kind — a fixed approximation of what `disk::load` itself excludes when
+/// computing a requirement's/test's single "current commit" field
+/// (`crates/disk/src/requirement/operations/load.rs`,
+/// `crates/disk/src/test/operations/load.rs`): a requirement always
+/// excludes its own `results/` (nested children, not part of its own
+/// text) and, unconditionally here, `attachments/`; a test unconditionally
+/// excludes `attachments/`/`template/`. `disk::load` only excludes
+/// attachments/template when each entry's own `include_attachments_in_commit`/
+/// `include_template_in_commit` toggle says not to include them — reading
+/// that live per-entry setting would mean this stateless, `GetDiff`-style
+/// read needs project state too, so it's deliberately not replicated here.
+/// The log is a browsing aid, not the source of truth for staleness (which
+/// stays exactly as computed today); a result has no such toggle and
+/// excludes nothing.
+fn commit_log_excludes(dir: &Path, target: &EntryPath) -> Vec<PathBuf> {
+    match target {
+        EntryPath::Requirement(_) => vec![dir.join("results"), dir.join("attachments")],
+        EntryPath::Test(_) => vec![dir.join("attachments"), dir.join("template")],
+        EntryPath::Result(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use disk::{DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, TestReferenceKind};
+    use disk::{
+        DependencyReferenceKind, EntryName, LocalGitReference, ReferencePath, RemoteGitReference, TestReferenceKind,
+    };
     use logical::LogicalPath;
     use logical::draft::RequirementDraft;
     use syscalls::{
@@ -1565,7 +1695,7 @@ mod test {
     use logical::draft::AddNamedChildError;
 
     use crate::{
-        AddPoolFileError, EntryDetail, EntryKind, EntryPath, GetChangedFilesError, GetDiffError,
+        AddPoolFileError, EntryDetail, EntryPath, GetChangedFilesError, GetCommitLogError, GetDiffError,
         RefreshStaleTestReferencesError, RequirementMetStatus, TestUnmetReason, TreeSnapshot, UnmetReason,
     };
 
@@ -1596,6 +1726,14 @@ mod test {
 
         fn push(&self, _dir: &Path) -> Result<String, PushError> {
             Ok("pushed".to_string())
+        }
+
+        fn unpushed_commits(&self, _dir: &Path) -> Result<Vec<syscalls::CommitInfo>, syscalls::UnpushedCommitsError> {
+            Ok(vec![syscalls::CommitInfo {
+                hash: "deadbeef".to_string(),
+                subject: "a local commit".to_string(),
+                date: "2024-01-01".to_string(),
+            }])
         }
     }
 
@@ -1672,11 +1810,156 @@ mod test {
         fn diff(&self, dir: &Path, path: &Path) -> Result<String, DiffError> {
             Ok(format!("{}:{}", dir.display(), path.display()))
         }
+
+        fn files_changed_in_commit(
+            &self,
+            dir: &Path,
+            _commit: &str,
+            _excludes: &[&Path],
+        ) -> Result<Vec<PathBuf>, CommitForPathError> {
+            Ok(vec![dir.to_path_buf()])
+        }
+
+        fn diff_for_commit(&self, dir: &Path, commit: &str, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("{}:{commit}:{}", dir.display(), path.display()))
+        }
     }
 
     impl syscalls::RemoteGit for PathEchoingGit {
         fn commit_for_remote(&self, url: &str, path: Option<&Path>) -> Result<String, CommitForRemoteError> {
             Ok(format!("{url}|{}", path.map(|p| p.display().to_string()).unwrap_or_default()))
+        }
+    }
+
+    /// A controllable block point used by the mutation-exclusion/concurrent-
+    /// reads tests below, in place of `FixedGit`'s instant fixed replies —
+    /// see README's Testing strategy: proving exclusion actually holds
+    /// during execution needs "a deliberately slow/never-resolving fake",
+    /// not just fakes that happen to finish in send order (which is all
+    /// `commands_sent_during_a_mutation_queue_and_drain_in_order` above can
+    /// prove — see its own doc comment). `wait()` blocks the calling
+    /// blocking-pool thread on a real `std::sync::mpsc` channel — not a
+    /// tokio primitive — since it's called from inside `spawn_blocking`,
+    /// off the async runtime entirely.
+    #[derive(Clone)]
+    struct Gate {
+        started: Arc<AtomicBool>,
+        release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    }
+
+    impl Gate {
+        fn new() -> (Self, std::sync::mpsc::Sender<()>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (
+                Gate {
+                    started: Arc::new(AtomicBool::new(false)),
+                    release: Arc::new(Mutex::new(Some(rx))),
+                },
+                tx,
+            )
+        }
+
+        /// Blocks until the test's sender fires (or is dropped). Panics if
+        /// called more than once — each test's `Gate` is single-use, built
+        /// fresh per scenario.
+        fn wait(&self) {
+            self.started.store(true, Ordering::SeqCst);
+            let rx = self
+                .release
+                .lock()
+                .unwrap()
+                .take()
+                .expect("Gate::wait called more than once");
+            rx.recv().ok();
+        }
+    }
+
+    /// Blocks on `Gate::wait` inside `commit_for_remote` — everything else
+    /// behaves like `FixedGit`. Used to hold a `Validate` open long enough
+    /// for a test to observe what else does (or doesn't) run while it's in
+    /// flight.
+    #[derive(Clone)]
+    struct HangingRemoteGit {
+        gate: Gate,
+    }
+
+    impl syscalls::Git for HangingRemoteGit {
+        fn commit_for_path_excluding(&self, _path: &Path, _excludes: &[&Path]) -> Result<String, CommitForPathError> {
+            Ok("deadbeef".to_string())
+        }
+
+        fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+            Ok(Vec::new())
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
+        }
+
+        fn diff(&self, _dir: &Path, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("diff for {}", path.display()))
+        }
+    }
+
+    impl syscalls::RemoteGit for HangingRemoteGit {
+        fn commit_for_remote(&self, _url: &str, _path: Option<&Path>) -> Result<String, CommitForRemoteError> {
+            self.gate.wait();
+            Ok("deadbeef".to_string())
+        }
+    }
+
+    /// Blocks on `Gate::wait` inside `changed_paths` — everything else
+    /// behaves like `FixedGit`. Used to hold a read-only, git-backed
+    /// command (`GetChangedFiles`) open to prove a second read doesn't
+    /// queue behind it.
+    #[derive(Clone)]
+    struct HangingChangedPathsGit {
+        gate: Gate,
+    }
+
+    impl syscalls::Git for HangingChangedPathsGit {
+        fn commit_for_path_excluding(&self, _path: &Path, _excludes: &[&Path]) -> Result<String, CommitForPathError> {
+            Ok("deadbeef".to_string())
+        }
+
+        fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+            self.gate.wait();
+            Ok(Vec::new())
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
+        }
+
+        fn diff(&self, _dir: &Path, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("diff for {}", path.display()))
+        }
+    }
+
+    impl syscalls::RemoteGit for HangingChangedPathsGit {
+        fn commit_for_remote(&self, _url: &str, _path: Option<&Path>) -> Result<String, CommitForRemoteError> {
+            Ok("deadbeef".to_string())
+        }
+    }
+
+    /// A remote dependency `Validate` must resolve — attached to a fresh
+    /// requirement so any `Git`/`RemoteGit` fake's `commit_for_remote` is
+    /// guaranteed to run during validation.
+    fn add_requirement_with_remote_dependency_command(name: &str, request: RequestId) -> Command {
+        let mut requirement = RequirementDraft::new("Needs Remote");
+        requirement.requirement_text = "Text".to_string();
+        requirement
+            .dependencies
+            .push(DependencyReferenceKind::RemoteReferenceV1(RemoteGitReference {
+                url: "https://example.com/repo.git".to_string(),
+                path: None,
+                commit: "deadbeef".to_string(),
+            }));
+        Command::AddRequirement {
+            module: vec![],
+            name: entry_name(name),
+            requirement: Box::new(requirement),
+            request,
         }
     }
 
@@ -1701,6 +1984,29 @@ mod test {
             match events.recv().await.expect("actor task ended without a TreeChanged") {
                 Event::TreeChanged(snapshot) => return snapshot,
                 _ => continue,
+            }
+        }
+    }
+
+    /// Waits out a fixed window asserting none of `requests` completes in
+    /// it — used by the `Gate`-based tests to prove something stayed
+    /// blocked, not just "hadn't been polled yet." Ignores unrelated events
+    /// (e.g. a stray `TreeChanged` left over from an earlier command) rather
+    /// than treating any activity on the channel as a completion.
+    async fn assert_none_complete_within(
+        events: &mut mpsc::UnboundedReceiver<Event>,
+        requests: &[RequestId],
+        duration: std::time::Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(Event::Completed { request, .. })) if requests.contains(&request) => {
+                    panic!("request {request} completed before it should have");
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("actor task ended without completing"),
+                Err(_) => return,
             }
         }
     }
@@ -2001,6 +2307,128 @@ mod test {
             }
             other => panic!("expected EntryDetail(Some(_)), got {other:?}"),
         }
+    }
+
+    /// Closes the gap the test above's own doc comment names: with
+    /// `HangingRemoteGit` deliberately holding `Validate` open, a second
+    /// mutating command sent while it's in flight must not even start —
+    /// not just "happens to finish after" — until `Validate` completes.
+    #[tokio::test]
+    async fn a_mutation_is_excluded_while_another_is_in_flight() {
+        let (git, release) = Gate::new();
+        let (commands, mut events) = spawn_test_actor_with_git(HangingRemoteGit { gate: git });
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(add_requirement_with_remote_dependency_command("needs_remote", 2))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
+
+        commands.send(Command::Validate { request: 3 }).unwrap();
+        commands
+            .send(add_requirement_command(vec![], "queued", "Queued", 4))
+            .unwrap();
+
+        // `Validate` is genuinely blocked inside `commit_for_remote` right
+        // now (not just "hasn't been polled yet") — so this window isn't
+        // racing a real duration, it's asserting against a hold that only
+        // this test's `release` can end.
+        assert_none_complete_within(&mut events, &[3, 4], std::time::Duration::from_millis(200)).await;
+
+        release.send(()).unwrap();
+
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::Validate(Ok(()))));
+        assert!(matches!(recv_completed(&mut events, 4).await, Outcome::AddRequirement(Ok(()))));
+    }
+
+    /// The flip side of the test above, and the crate's own documented
+    /// "Known gap": `dispatch`'s exclusion check queues *every* command
+    /// while a mutation is in flight, including read-only ones — even
+    /// though `spawn_read`'s own doc comment says reads never race the
+    /// actor and could in principle run concurrently with anything. This
+    /// pins that current behavior down as a regression test, not a fix
+    /// (the README treats fixing it as `syscalls`/`logical`-layer work).
+    #[tokio::test]
+    async fn a_read_queues_behind_an_in_flight_mutation() {
+        let (git, release) = Gate::new();
+        let (commands, mut events) = spawn_test_actor_with_git(HangingRemoteGit { gate: git });
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(add_requirement_with_remote_dependency_command("needs_remote", 2))
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::AddRequirement(Ok(()))));
+
+        commands.send(Command::Validate { request: 3 }).unwrap();
+        commands
+            .send(Command::GetEntryDetail {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("needs_remote"))),
+                request: 4,
+            })
+            .unwrap();
+
+        assert_none_complete_within(&mut events, &[3, 4], std::time::Duration::from_millis(200)).await;
+
+        release.send(()).unwrap();
+
+        assert!(matches!(recv_completed(&mut events, 3).await, Outcome::Validate(Ok(()))));
+        assert!(matches!(
+            recv_completed(&mut events, 4).await,
+            Outcome::EntryDetail(Some(EntryDetail::Requirement { .. }))
+        ));
+    }
+
+    /// Unlike a command queued behind an in-flight mutation (the two tests
+    /// above), two reads sent with nothing in flight aren't serialized
+    /// against each other — `spawn_read` gives each its own task, so a
+    /// slower one doesn't hold up a faster one behind it. Proven with
+    /// `HangingChangedPathsGit` rather than send order, since send order
+    /// alone can't distinguish "ran concurrently" from "happened to finish
+    /// fast."
+    #[tokio::test]
+    async fn independent_reads_are_not_serialized_against_each_other() {
+        let (git, release) = Gate::new();
+        let (commands, mut events) = spawn_test_actor_with_git(HangingChangedPathsGit { gate: git });
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        // Slow (blocked on `release`), sent first.
+        commands.send(Command::GetChangedFiles { request: 2 }).unwrap();
+        // Fast (pure in-memory), sent second — must not wait for request 2.
+        commands
+            .send(Command::GetEntryDetail {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                request: 3,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            recv_completed(&mut events, 3).await,
+            Outcome::EntryDetail(Some(EntryDetail::Requirement { .. }))
+        ));
+
+        release.send(()).unwrap();
+        assert!(matches!(recv_completed(&mut events, 2).await, Outcome::GetChangedFiles(Ok(_))));
     }
 
     /// `logical::validate::validate` drops the draft on `Err` (see the
@@ -4101,7 +4529,7 @@ mod test {
         commands
             .send(Command::ResolveLocalCommit {
                 target: LogicalPath::root(entry_name("design")),
-                kind: EntryKind::Requirement,
+                kind: LocalCommitKind::Requirement,
                 request: 1,
             })
             .unwrap();
@@ -4126,7 +4554,7 @@ mod test {
         commands
             .send(Command::ResolveLocalCommit {
                 target: LogicalPath::root(entry_name("design")),
-                kind: EntryKind::Requirement,
+                kind: LocalCommitKind::Requirement,
                 request: 2,
             })
             .unwrap();
@@ -4166,7 +4594,7 @@ mod test {
                     modules: vec![entry_name("beta")],
                     name: entry_name("marker"),
                 },
-                kind: EntryKind::Requirement,
+                kind: LocalCommitKind::Requirement,
                 request: 3,
             })
             .unwrap();
@@ -4268,6 +4696,238 @@ mod test {
     }
 
     #[tokio::test]
+    async fn get_commit_log_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands
+            .send(Command::GetCommitLog {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::GetCommitLog(Err(GetCommitLogError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_commit_log_returns_gits_reply() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitLog {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitLog(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitLog");
+        };
+        // `FixedGit` doesn't override `commit_log_for_path`, so this
+        // exercises the trait's own default impl built from
+        // `commit_for_path_excluding`'s fixed "deadbeef" reply.
+        let log = result.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].hash, "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn get_commit_log_for_a_result_resolves_the_nested_directory() {
+        let (commands, mut events) = spawn_test_actor_with_git(PathEchoingGit);
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitLog {
+                target: EntryPath::Result(logical::ResultPath {
+                    requirement: LogicalPath::root(entry_name("design")),
+                    name: entry_name("some_result"),
+                }),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitLog(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitLog");
+        };
+        // `PathEchoingGit` echoes back whatever path it was asked about
+        // (via `commit_log_for_path`'s default impl, same as
+        // `resolve_local_commit_builds_the_right_directory_for_a_nested_module`
+        // does for `entry_directory`) — asserts `commit_log_directory`
+        // built the result's own nested `results/<name>` directory, not
+        // its owning requirement's.
+        let expected = test_project_dir().join("requirements/design/results/some_result");
+        assert_eq!(result.unwrap()[0].hash, expected.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn get_commit_files_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands
+            .send(Command::GetCommitFiles {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                commit: "deadbeef".to_string(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::GetCommitFiles(Err(GetCommitFilesError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_commit_files_returns_gits_reply() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitFiles {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                commit: "deadbeef".to_string(),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitFiles(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitFiles");
+        };
+        // `FixedGit` doesn't override `files_changed_in_commit`, so this
+        // exercises the trait's own trivial default (`Ok(Vec::new())`).
+        assert_eq!(result.unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn get_commit_files_resolves_the_same_directory_as_get_commit_log() {
+        let (commands, mut events) = spawn_test_actor_with_git(PathEchoingGit);
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitFiles {
+                target: EntryPath::Result(logical::ResultPath {
+                    requirement: LogicalPath::root(entry_name("design")),
+                    name: entry_name("some_result"),
+                }),
+                commit: "deadbeef".to_string(),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitFiles(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitFiles");
+        };
+        // `PathEchoingGit::files_changed_in_commit` echoes `dir` back —
+        // same "proves `commit_log_directory` built the right nested
+        // directory" reasoning as `get_commit_log_for_a_result_resolves_
+        // the_nested_directory` above.
+        let expected = test_project_dir().join("requirements/design/results/some_result");
+        assert_eq!(result.unwrap(), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn get_commit_file_diff_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands
+            .send(Command::GetCommitFileDiff {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                commit: "deadbeef".to_string(),
+                path: PathBuf::from("requirement.ron"),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::GetCommitFileDiff(Err(GetCommitFileDiffError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_commit_file_diff_returns_gits_reply() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitFileDiff {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                commit: "deadbeef".to_string(),
+                path: PathBuf::from("requirement.ron"),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitFileDiff(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitFileDiff");
+        };
+        // `FixedGit` doesn't override `diff_for_commit`, so this exercises
+        // the trait's own default (delegates to `diff`, ignoring `commit`).
+        assert_eq!(result.unwrap(), "diff for requirement.ron");
+    }
+
+    #[tokio::test]
+    async fn get_commit_file_diff_resolves_the_same_directory_as_get_commit_log() {
+        let (commands, mut events) = spawn_test_actor_with_git(PathEchoingGit);
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitFileDiff {
+                target: EntryPath::Result(logical::ResultPath {
+                    requirement: LogicalPath::root(entry_name("design")),
+                    name: entry_name("some_result"),
+                }),
+                commit: "deadbeef".to_string(),
+                path: PathBuf::from("result.ron"),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitFileDiff(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitFileDiff");
+        };
+        let expected_dir = test_project_dir().join("requirements/design/results/some_result");
+        assert_eq!(
+            result.unwrap(),
+            format!("{}:deadbeef:result.ron", expected_dir.display())
+        );
+    }
+
+    #[tokio::test]
     async fn commit_all_without_a_loaded_project_reports_no_project_path() {
         let (commands, mut events) = spawn_test_actor();
         commands
@@ -4329,6 +4989,38 @@ mod test {
         match recv_completed(&mut events, 2).await {
             Outcome::Push(Ok(output)) => assert_eq!(output, "pushed"),
             other => panic!("expected Outcome::Push(Ok(_)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_unpushed_commits_without_a_loaded_project_reports_no_project_path() {
+        let (commands, mut events) = spawn_test_actor();
+        commands.send(Command::GetUnpushedCommits { request: 1 }).unwrap();
+        assert!(matches!(
+            recv_completed(&mut events, 1).await,
+            Outcome::GetUnpushedCommits(Err(crate::GetUnpushedCommitsError::NoProjectPath))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_unpushed_commits_succeeds_against_a_loaded_project() {
+        let (commands, mut events) = spawn_test_actor();
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands.send(Command::GetUnpushedCommits { request: 2 }).unwrap();
+        match recv_completed(&mut events, 2).await {
+            Outcome::GetUnpushedCommits(Ok(commits)) => {
+                assert_eq!(commits.len(), 1);
+                assert_eq!(commits[0].subject, "a local commit");
+            }
+            other => panic!("expected Outcome::GetUnpushedCommits(Ok(_)), got {other:?}"),
         }
     }
 

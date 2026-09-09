@@ -130,6 +130,7 @@ impl FieldSpellCache {
         self.checked_text = text.to_owned();
         self.misspellings = dict
             .check_indices(text)
+            .filter(|(_offset, word)| word.chars().any(|c| c.is_alphabetic()))
             .filter(|(_offset, word)| !custom_words.contains(*word))
             .map(|(offset, word)| Misspelling {
                 range: offset..offset + word.len(),
@@ -158,10 +159,29 @@ pub fn word_at_byte_offset(misspellings: &[Misspelling], offset: usize) -> Optio
     misspellings.iter().find(|m| m.range.contains(&offset))
 }
 
+/// Whether `range` can still be sliced out of `text` — guards against a
+/// `Misspelling` captured (in a `SpellPopupState`, when the popup opened)
+/// against an earlier revision of the field's text: the popup can sit open
+/// across frames in which the user keeps typing, so by the time they click
+/// a suggestion, `range` may run past the buffer's new length or land
+/// inside a multi-byte character rather than on its boundary. Both `String`
+/// indexing and `replace_range` panic on either condition, so callers must
+/// check this before slicing/replacing with a range that isn't fresh from
+/// the same `refresh` call.
+pub fn range_is_valid_for(text: &str, range: &Range<usize>) -> bool {
+    range.start <= range.end
+        && range.end <= text.len()
+        && text.is_char_boundary(range.start)
+        && text.is_char_boundary(range.end)
+}
+
 /// Replaces `range` in `text` with `replacement` — the "click a
 /// suggestion" action's actual string surgery, factored out mainly so a
 /// replacement of different length than the original word has one
-/// obviously-correct place to be tested.
+/// obviously-correct place to be tested. Callers must check
+/// `range_is_valid_for(text, range)` first — this does no validation of its
+/// own and panics on an out-of-bounds or non-char-boundary range, same as
+/// `String::replace_range`.
 pub fn replace_word_in_place(text: &mut String, range: &Range<usize>, replacement: &str) {
     text.replace_range(range.clone(), replacement);
 }
@@ -343,6 +363,14 @@ mod test {
         cache.refresh("a tre", &checker, &BTreeSet::new());
         assert_eq!(cache.misspellings().len(), 1);
         assert_eq!(cache.misspellings()[0].word, "tre");
+    }
+
+    #[test]
+    fn numbers_are_not_flagged_as_misspelled() {
+        let checker = ready_checker();
+        let mut cache = FieldSpellCache::default();
+        cache.refresh("100 cat", &checker, &BTreeSet::new());
+        assert!(cache.misspellings().is_empty());
     }
 
     #[test]

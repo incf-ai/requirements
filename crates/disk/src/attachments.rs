@@ -70,6 +70,8 @@ pub(crate) enum ReadAttachmentsError {
         #[source]
         source: CommitForPathError,
     },
+    #[error("attachment entry {entry} is not under its own root {root}")]
+    PathNotUnderRoot { entry: PathBuf, root: PathBuf },
 }
 
 /// Reads every file under `dir`, recursively, as an `AttachmentFile` with a
@@ -128,7 +130,10 @@ fn read_attachments_into(
                     })?;
             let path = entry
                 .strip_prefix(root)
-                .expect("attachment entry is under its own root")
+                .map_err(|_| ReadAttachmentsError::PathNotUnderRoot {
+                    entry: entry.clone(),
+                    root: root.to_path_buf(),
+                })?
                 .to_path_buf();
             out.push(AttachmentFile { path, commit });
         }
