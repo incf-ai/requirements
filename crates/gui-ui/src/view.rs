@@ -2967,6 +2967,9 @@ impl GuiApp {
             ui.heading("Commit all changes");
 
             if dialog.loading {
+                // Reserve the same footprint the loaded form below would
+                // take — see `render_diff_dialog`'s matching comment.
+                ui.set_min_height(resizable_budget);
                 ui.label("Loading…");
             } else {
                 // Reserve exactly `resizable_budget` of vertical space for
@@ -3084,6 +3087,9 @@ impl GuiApp {
             ui.separator();
 
             if dialog.loading {
+                // Reserve the same footprint the loaded file list below
+                // would take — see `render_diff_dialog`'s matching comment.
+                ui.set_min_height(max_height);
                 ui.label("Loading…");
             } else if let Some(error) = &dialog.error {
                 ui.colored_label(egui::Color32::RED, error);
@@ -3156,6 +3162,12 @@ impl GuiApp {
             ui.separator();
 
             if dialog.loading {
+                // Reserve the same footprint the loaded diff below would
+                // take, so the modal opens at its eventual size instead of
+                // popping larger once `GetDiff`/`GetCommitFileDiff`
+                // completes (that completion latency previously read as
+                // the modal "growing" once the diff arrived).
+                ui.set_min_height(max_height);
                 ui.label("Loading…");
             } else if let Some(error) = &dialog.error {
                 ui.colored_label(egui::Color32::RED, error);

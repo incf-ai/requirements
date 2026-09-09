@@ -28,6 +28,12 @@ fn main() {
         eframe::NativeOptions::default(),
         Box::new(|cc| {
             gui_ui::install_icon_font(&cc.egui_ctx);
+            // Disable egui's animations (fades, collapsing, and the
+            // grow-to-content-size animation new windows/modals play on
+            // their first frame) — modals like the commit/diff dialogs
+            // otherwise visibly grow to full screen height over ~0.25s.
+            cc.egui_ctx
+                .all_styles_mut(|style| style.animation_time = 0.0);
             Ok(Box::new(app))
         }),
     ) {
