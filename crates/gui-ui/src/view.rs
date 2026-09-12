@@ -20,9 +20,9 @@ use crate::{
     AutoCommitKind, DependencyDraft, DependencySlot, EditorState, ExitDialogState, GuiApp,
     LeafKind, LocalPoolKind, PathPickerScope, PathPickerTarget, PendingNavigation,
     PendingProjectAction, PushDialogState, TestRefDraft, TestRefSlot, ThemeChoice,
-    ValidateBeforeSaveDialogState, absolute_reference_path, default_result_name,
-    direct_submodule_names, flatten_leaf_paths, icons, leaf_kind_segment, scoped_leaf_paths,
-    theme_colors, today_iso_date,
+    ValidateBeforeSaveDialogState, absolute_reference_path, absolute_result_path,
+    default_result_name, direct_submodule_names, flatten_leaf_paths, icons, leaf_kind_segment,
+    scoped_leaf_paths, theme_colors, today_iso_date,
 };
 
 /// A short label for a `ReferenceSiteKind`, for the broken-references
@@ -832,6 +832,17 @@ impl GuiApp {
                             self.clear_center_pane_clicked();
                         }
                     }
+                    // "Refresh", immediately left of "Clear" (this
+                    // `right_to_left` layout renders right-to-left, so this
+                    // call lands just to Clear's left) — re-fetches the
+                    // currently open view's cached data in place. Doesn't
+                    // touch `editor_has_unsaved_edits`/`PendingNavigation`
+                    // the way Back/Forward/Clear/the "New ___" buttons do:
+                    // it never replaces or clears `self.editor`, so there's
+                    // nothing here that could clobber an in-progress edit.
+                    if icon_button(ui, self.tree.is_some(), icons::REFRESH, "Refresh").clicked() {
+                        self.refresh_clicked();
+                    }
                 });
             });
         });
@@ -1127,16 +1138,23 @@ impl GuiApp {
             // that scrolling body. `Pane::Empty` has nothing worth
             // pinning a header above, so it's left unwrapped.
             match pane {
-                // `self.editor` being `None` here means either nothing is
-                // selected, or a selection's `GetEntryDetail` reply
-                // hasn't landed yet — `select` clears `editor` up front
-                // specifically so this branch can tell "nothing to show
-                // yet" apart from "showing something."
-                Pane::Empty => match &self.selection {
-                    None => {
+                // `self.editor` being `None` here means nothing is
+                // selected, a selection's `GetEntryDetail` reply hasn't
+                // landed yet, or that reply came back empty (the entry was
+                // deleted between being selected and the reply arriving —
+                // most commonly hit via Back/Forward) — `select` clears
+                // `editor` up front specifically so this branch can tell
+                // "nothing to show yet" apart from "showing something," and
+                // `selection_not_found` (set by `apply_entry_detail`) tells
+                // the empty reply apart from one still in flight.
+                Pane::Empty => match (&self.selection, self.selection_not_found) {
+                    (None, _) => {
                         ui.label("Select an entry in the tree to view it, or use the toolbar to create a new one.");
                     }
-                    Some(_) => {
+                    (Some(_), true) => {
+                        ui.label("This entry no longer exists.");
+                    }
+                    (Some(_), false) => {
                         ui.label("Loading…");
                     }
                 },
@@ -1298,6 +1316,23 @@ impl GuiApp {
                         }
                     }
                 });
+                // Only a saved entry has a real on-disk path to show —
+                // `read_only` (see `render_requirement_form`'s own module
+                // doc comment) always implies `editing_target: Some(_)`,
+                // so this and `read_only`'s own check are equivalent, but
+                // spelled out explicitly here since it's what the path
+                // itself is actually built from. `.selectable(true)` lets
+                // the user drag-select and copy it directly, the point of
+                // showing it at all.
+                if let Some(target) = &form.editing_target {
+                    ui.horizontal(|ui| {
+                        ui.label("Path:");
+                        ui.add(
+                            egui::Label::new(absolute_reference_path(target, "requirements"))
+                                .selectable(true),
+                        );
+                    });
+                }
                 // Never editable, so it lives outside the read_only/editable
                 // split below — but only meaningful once something's actually
                 // been saved to check `met_status` against (a create-mode
@@ -1818,6 +1853,7 @@ impl GuiApp {
                         self.commit_log_target.as_ref(),
                         self.commit_log.as_deref(),
                         self.commit_log_error.as_deref(),
+                        self.dirty,
                         &mut commit_log_expand_requested,
                         &mut commit_log_commit_clicked,
                     );
@@ -1955,6 +1991,19 @@ impl GuiApp {
                         form.edited = true;
                     }
                 });
+                // See the Requirement form's own comment on this.
+                if let Some(target) = &form.editing_target {
+                    ui.horizontal(|ui| {
+                        ui.label("Path:");
+                        ui.add(
+                            egui::Label::new(absolute_reference_path(
+                                target,
+                                leaf_kind_segment(LeafKind::Test),
+                            ))
+                            .selectable(true),
+                        );
+                    });
+                }
                 if read_only {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
@@ -2111,6 +2160,7 @@ impl GuiApp {
                         self.commit_log_target.as_ref(),
                         self.commit_log.as_deref(),
                         self.commit_log_error.as_deref(),
+                        self.dirty,
                         &mut commit_log_expand_requested,
                         &mut commit_log_commit_clicked,
                     );
@@ -2245,6 +2295,13 @@ impl GuiApp {
                         form.edited = true;
                     }
                 });
+                // See the Requirement form's own comment on this.
+                if let Some(target) = &form.editing_target {
+                    ui.horizontal(|ui| {
+                        ui.label("Path:");
+                        ui.add(egui::Label::new(absolute_result_path(target)).selectable(true));
+                    });
+                }
                 if read_only {
                     ui.horizontal(|ui| {
                         ui.label("Title:");
@@ -2432,6 +2489,7 @@ impl GuiApp {
                         self.commit_log_target.as_ref(),
                         self.commit_log.as_deref(),
                         self.commit_log_error.as_deref(),
+                        self.dirty,
                         &mut commit_log_expand_requested,
                         &mut commit_log_commit_clicked,
                     );
@@ -2517,11 +2575,7 @@ impl GuiApp {
             };
             let is_root = form.path.is_empty();
             ui.horizontal(|ui| {
-                ui.heading(if is_root {
-                    format!("Project: {}", form.display_name)
-                } else {
-                    format!("Module: {}", form.display_name)
-                });
+                ui.heading(if is_root { "Project" } else { "Module" });
                 if form.read_only {
                     if ui.button("Edit").clicked() {
                         edit_clicked = true;
@@ -2542,6 +2596,30 @@ impl GuiApp {
                     }
                 }
             });
+            // See the Requirement form's own comment on giving the
+            // identifier its own row rather than folding it into the
+            // heading.
+            ui.horizontal(|ui| {
+                ui.label("Identifier:");
+                if form.read_only {
+                    ui.label(&form.display_name);
+                } else if ui.text_edit_singleline(&mut form.new_name).changed() {
+                    form.edited = true;
+                }
+            });
+            // See the Requirement form's own comment on this.
+            if !is_root {
+                let path_label = form
+                    .path
+                    .iter()
+                    .map(EntryName::as_str)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                ui.horizontal(|ui| {
+                    ui.label("Path:");
+                    ui.add(egui::Label::new(path_label).selectable(true));
+                });
+            }
         }
         // See the Requirement form's own comment on why the header
         // renders outside this `ScrollArea`.
@@ -2594,16 +2672,8 @@ impl GuiApp {
                             }
                         }
                     }
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Identifier:");
-                        if ui.text_edit_singleline(&mut form.new_name).changed() {
-                            form.edited = true;
-                        }
-                    });
-                    if let Some(error) = &form.error {
-                        ui.colored_label(egui::Color32::RED, error);
-                    }
+                } else if let Some(error) = &form.error {
+                    ui.colored_label(egui::Color32::RED, error);
                 }
             });
         if edit_clicked {
@@ -4471,18 +4541,41 @@ fn render_pool_group(ui: &mut egui::Ui, title: &str, paths: &[PathBuf]) {
 /// commit.hash.clone())` into `*commit_clicked`, the same deferred idiom,
 /// for the caller to open the per-commit file-list modal
 /// (`GuiApp::commit_files_dialog_opened`) once `self.editor`'s borrow ends.
+/// A `commit.hash` empty string is `gui-core`'s synthetic "Uncommitted
+/// changes" marker (see `has_uncommitted_changes` in `gui-core::actor`) —
+/// there's no real commit for it to open a file list for, so that row is
+/// a plain colored label instead of a link and never writes to
+/// `commit_clicked`.
 fn render_commit_log_section(
     ui: &mut egui::Ui,
     entry_path: &gui_core::EntryPath,
     commit_log_target: Option<&gui_core::EntryPath>,
     commit_log: Option<&[gui_core::CommitInfo]>,
     commit_log_error: Option<&str>,
+    dirty: bool,
     expand_requested: &mut Option<gui_core::EntryPath>,
     commit_clicked: &mut Option<(gui_core::EntryPath, String)>,
 ) {
     egui::CollapsingHeader::new("Commit history")
         .default_open(false)
         .show(ui, |ui| {
+            // `dirty` (`GuiApp::dirty`'s own doc comment) reflects whether
+            // *any* edit anywhere in the project has reached `gui-core`
+            // without yet being saved to disk. A brand new, never-saved
+            // entry in particular has no on-disk file at all until Save —
+            // the `git`-backed rows below only ever see what's actually on
+            // disk (see `has_uncommitted_changes` in `gui-core::actor`), so
+            // they have nothing to find for it and, left alone, this
+            // section would show only "No commits yet." with no hint that
+            // unsaved work exists. Shown unconditionally, ahead of every
+            // fetch-dependent branch below, since it's local app state —
+            // not something `GetCommitLog` itself reports.
+            if dirty {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "The project has unsaved changes not yet written to disk.",
+                );
+            }
             if commit_log_target != Some(entry_path) {
                 *expand_requested = Some(entry_path.clone());
                 ui.spinner();
@@ -4504,6 +4597,13 @@ fn render_commit_log_section(
             }
             egui::Grid::new("commit_log_grid").striped(true).show(ui, |ui| {
                 for commit in commits {
+                    if commit.hash.is_empty() {
+                        ui.colored_label(egui::Color32::YELLOW, &commit.subject);
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                        continue;
+                    }
                     if ui.link(&commit.hash[..commit.hash.len().min(8)]).clicked() {
                         *commit_clicked = Some((entry_path.clone(), commit.hash.clone()));
                     }

@@ -383,7 +383,7 @@ fn new_project_menu_creates_a_blank_project_and_marks_it_dirty() {
     // `Command::NewProject` round-tripped through the actor and came back
     // as a real `Event::TreeChanged`, not just that the empty-state
     // message went away.
-    assert!(harness.query_by_label("Scratch Project").is_some());
+    assert!(harness.query_all_by_label("Scratch Project").next().is_some());
     // A brand new project has no on-disk home yet — unlike a freshly
     // loaded one, closing without saving would destroy it outright, so
     // it starts dirty (see `apply_outcome`'s `Outcome::NewProject` arm).
@@ -484,7 +484,7 @@ fn new_project_then_save_as_creates_and_persists_a_project_from_scratch() {
     harness.step();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_label("Scratch Project").is_some()
+        h.query_all_by_label("Scratch Project").next().is_some()
     });
 
     harness
@@ -618,7 +618,7 @@ fn clicking_a_recent_project_loads_it() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     harness.get_by_role_and_label(Role::Button, "File").click();
     harness.step();
@@ -640,8 +640,8 @@ fn clicking_a_recent_project_loads_it() {
     // trip, not a no-op; "Test Project" reappearing after the tree
     // momentarily clears confirms a real reload happened, not that the
     // click did nothing.
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
-    assert!(harness.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
+    assert!(harness.query_all_by_label("Test Project").next().is_some());
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn unsaved_changes_prompts_before_new_project_and_cancel_leaves_everything_alone
     // Still the original, still-dirty project — Cancel didn't discard
     // anything.
     assert!(harness.query_by_label("\u{e18a} unsaved changes").is_some());
-    assert!(harness.query_by_label("Test Project").is_some());
+    assert!(harness.query_all_by_label("Test Project").next().is_some());
 }
 
 #[test]
@@ -1272,7 +1272,7 @@ fn clicking_save_with_a_known_path_sends_a_real_save_command() {
     // didn't panic, didn't pop a picker, and the app is still showing
     // the loaded project afterward, not stuck on some broken state.
     assert!(harness.query_by_label("No project loaded.").is_none());
-    assert!(harness.query_by_label("Test Project").is_some());
+    assert!(harness.query_all_by_label("Test Project").next().is_some());
 }
 
 #[test]
@@ -1745,7 +1745,7 @@ fn opening_a_real_project_populates_the_tree() {
     // The project's own name, from `test_project/project.ron` — proves
     // real data came back from a real `LoadProject`, not just that the
     // placeholder message went away.
-    assert!(harness.query_by_label("Test Project").is_some());
+    assert!(harness.query_all_by_label("Test Project").next().is_some());
 }
 
 /// Creates a real requirement named "scratchreq" at the project root with
@@ -2377,7 +2377,7 @@ fn the_tree_starts_fully_collapsed_when_a_project_first_opens() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_project");
     harness.state_mut().open_project(path);
     harness.step();
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     // The tree loaded at all — "beta" (a childless module, so a plain
     // `Label` rather than a collapsible `CollapsingHeader`, see
@@ -2418,7 +2418,7 @@ fn the_tree_groups_leaves_under_requirements_and_test_procedures_folders() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     // The two folders themselves — root-level, since `test_project` has
     // root-level requirements/tests, not just ones nested in a submodule.
@@ -2520,7 +2520,7 @@ fn typing_into_the_filter_bar_hides_non_matching_leaves_and_modules() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     // Both the "design" requirement and the "external" requirement are
     // real root-level leaves in `test_project` before any filtering.
@@ -2593,7 +2593,7 @@ fn filtering_by_module_name_hides_non_matching_modules_in_top_tree() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     assert!(
         harness
@@ -2657,7 +2657,7 @@ fn the_top_tree_shows_empty_modules_and_no_leaves() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     // "beta" is a real root-level module in `test_project` with no
     // requirements/tests/results/submodules of its own — it still shows
@@ -2711,7 +2711,7 @@ fn selecting_a_module_shows_its_own_leaves_in_the_bottom_pane() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     // Root is selected by default right after load — its own real
     // root-level leaves are showing in the bottom pane.
@@ -2758,7 +2758,7 @@ fn switching_selected_module_updates_the_bottom_pane() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     assert!(
         harness
@@ -2782,7 +2782,7 @@ fn switching_selected_module_updates_the_bottom_pane() {
     // that frame's render, after the tree itself (including this very row)
     // has already been drawn with the old value — the click only lands in
     // time for widgets rendered later that same frame, like the module
-    // page's own heading. A second `step()` lets the tree pane repaint
+    // page's own Identifier row. A second `step()` lets the tree pane repaint
     // with the now-current `selected_module`, matching the pattern already
     // used by `module_page_shows_summary_then_renames_a_real_module` and
     // `the_top_tree_shows_empty_modules_and_no_leaves`.
@@ -2822,7 +2822,7 @@ fn back_forward_navigation_updates_the_bottom_pane() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     assert!(
         harness
@@ -2878,7 +2878,7 @@ fn the_bottom_pane_lists_attachments_and_templates_read_only() {
     let mut harness = harness();
     harness.step();
     open_test_project(&mut harness);
-    wait_until(&mut harness, |h| h.query_by_label("Test Project").is_some());
+    wait_until(&mut harness, |h| h.query_all_by_label("Test Project").next().is_some());
 
     // Root is selected by default; `sidebar_pools`' own `GetModulePools`
     // fetch is a separate round trip from the tree data itself (fired
@@ -2973,10 +2973,15 @@ fn undo_and_redo_round_trip_a_real_module_creation() {
 
     // `dirty_harness` already created "interaction_test_module" through
     // the real toolbar/form flow — a real `AddModule` that pushed a real
-    // undo snapshot in `gui-core`.
+    // undo snapshot in `gui-core`, and its create flow navigates straight
+    // to the new module's own page, whose "Identifier:" and "Path:" fields
+    // both read the same text as the tree row for a root-level module —
+    // `query_all_by_...` sidesteps the resulting ambiguous-match panic,
+    // same as `module_page_shows_summary_then_renames_a_real_module`.
     assert!(
         harness
-            .query_by_role_and_label(Role::Label, "interaction_test_module")
+            .query_all_by_role_and_label(Role::Label, "interaction_test_module")
+            .next()
             .is_some()
     );
     assert!(
@@ -2994,9 +2999,15 @@ fn undo_and_redo_round_trip_a_real_module_creation() {
 
     harness.get_by_role_and_label(Role::Button, "Undo").click();
     harness.step();
+    // Undo doesn't touch `self.editor` (see `undo_clicked`), so the
+    // still-open module page's own "Identifier:" and "Path:" fields keep
+    // reading "interaction_test_module" even after the module itself is
+    // gone — only the tree's own row disappears, dropping the match count
+    // from three down to two rather than zero.
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "interaction_test_module")
-            .is_none()
+        h.query_all_by_role_and_label(Role::Label, "interaction_test_module")
+            .count()
+            == 2
     });
 
     assert!(
@@ -3009,7 +3020,8 @@ fn undo_and_redo_round_trip_a_real_module_creation() {
     harness.get_by_role_and_label(Role::Button, "Redo").click();
     harness.step();
     wait_until(&mut harness, |h| {
-        h.query_by_role_and_label(Role::Label, "interaction_test_module")
+        h.query_all_by_role_and_label(Role::Label, "interaction_test_module")
+            .next()
             .is_some()
     });
 }
@@ -3664,6 +3676,47 @@ fn expanding_commit_history_shows_the_entrys_real_git_log() {
     // years, so "202" is a safe (not over-fitted) substring to wait on.
     wait_until(&mut harness, |h| h.query_by_label_contains("202").is_some());
     assert!(harness.query_by_label("No commits yet.").is_none());
+}
+
+#[test]
+fn commit_history_notes_unsaved_changes_for_an_entry_never_written_to_disk() {
+    let mut harness = harness();
+    harness.step();
+    open_test_project(&mut harness);
+    // `create_scratch_requirement` only reaches `Command::AddRequirement`,
+    // which mutates `gui-core`'s in-memory draft and nothing else (see that
+    // command's own doc comment) — no file for "scratchreq" ever reaches
+    // disk until a `Save`. So real `git`, run against `test_project`
+    // itself further down, has nothing at all to report for it: no commit
+    // history, and no on-disk diff for `has_uncommitted_changes` to find
+    // either (there's no file there for it to see). Before this test's own
+    // fix, that silently produced a bare "No commits yet." with no hint
+    // that unsaved work exists at all.
+    create_scratch_requirement(&mut harness);
+
+    harness
+        .get_by_role_and_label(Role::Button, "\u{e32c} scratchreq")
+        .click();
+    harness.step();
+    wait_until(&mut harness, |h| {
+        h.query_by_role_and_label(Role::Label, "Requirement")
+            .is_some()
+    });
+
+    harness
+        .get_by_role_and_label(Role::Button, "Commit history")
+        .click();
+    harness.step();
+    harness.step();
+
+    wait_until(&mut harness, |h| {
+        h.query_by_label("No commits yet.").is_some()
+    });
+    assert!(
+        harness
+            .query_by_label("The project has unsaved changes not yet written to disk.")
+            .is_some()
+    );
 }
 
 #[test]
@@ -5632,7 +5685,8 @@ fn opening_a_project_defaults_to_the_root_view_page() {
     harness.step();
     open_test_project(&mut harness);
 
-    assert!(harness.query_by_label("Project: Test Project").is_some());
+    assert!(harness.query_all_by_label("Project").next().is_some());
+    assert!(harness.query_all_by_label("Test Project").next().is_some());
     // Recursive totals across the whole tree, not just root-level counts:
     // `test_project`'s root has 3 requirements/tests/results of its own
     // (design/external/integration, contract/plain/smoke,
@@ -5715,10 +5769,18 @@ fn module_page_shows_summary_then_renames_a_real_module() {
         .click();
     harness.step();
 
-    // Status bar and the module page's own heading can both read "Module:
-    // beta" simultaneously — `query_all_by_label` sidesteps
-    // `query_by_label`'s panic-on-ambiguous-match behavior.
-    assert!(harness.query_all_by_label("Module: beta").next().is_some());
+    // The status bar reads "Module: beta"; the module page itself shows the
+    // same name in its own Identifier row instead of its (generic) heading
+    // — "beta" is ambiguous with the still-visible tree row of the same
+    // name, so `query_all_by_label` (not `query_by_label`) here too. The
+    // status bar and the module page's Identifier row aren't guaranteed to
+    // repaint in the same frame the click lands in (see
+    // `switching_selected_module_updates_the_bottom_pane`'s own comment on
+    // render order), so wait rather than asserting immediately.
+    wait_until(&mut harness, |h| {
+        h.query_all_by_label("Module: beta").next().is_some()
+    });
+    assert!(harness.query_all_by_label("beta").next().is_some());
     // `GetModuleSummary`'s reply goes through the real background actor —
     // wait for it rather than assuming it's already landed after one step.
     wait_until(&mut harness, |h| {
@@ -5781,7 +5843,12 @@ fn module_page_shows_summary_then_renames_a_real_module() {
     wait_until(&mut harness, |h| {
         h.query_by_role_and_label(Role::Button, "Edit").is_some()
     });
-    assert!(harness.query_by_label("beta_renamed").is_some());
+    // The tree's own row and the module page's own "Path:" field (a
+    // single-segment root-level module's path is just its own name) both
+    // now read "beta_renamed" — `query_all_by_label` sidesteps
+    // `query_by_label`'s panic-on-ambiguous-match behavior, same as the
+    // "Module: beta" check above.
+    assert!(harness.query_all_by_label("beta_renamed").next().is_some());
     assert!(harness.query_by_label("\u{e18a} unsaved changes").is_some());
 }
 

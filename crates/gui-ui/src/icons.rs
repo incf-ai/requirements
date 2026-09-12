@@ -33,6 +33,11 @@ pub const ATTACHMENTS: &str = egui_phosphor::regular::PAPERCLIP;
 pub const COMMIT_ALL: &str = egui_phosphor::regular::GIT_COMMIT;
 pub const PUSH: &str = egui_phosphor::regular::CLOUD_ARROW_UP;
 pub const CLEAR: &str = egui_phosphor::regular::ERASER;
+/// Same "resync from source" glyph family as `UPDATE_STALE_REFERENCES`/
+/// `REGENERATE_TITLE` — re-fetches whatever the currently open view is
+/// showing rather than anything Undo-related, so it gets its own constant
+/// even though the glyph is shared.
+pub const REFRESH: &str = egui_phosphor::regular::ARROWS_CLOCKWISE;
 
 // Menu bar (`render_menu_bar`'s File menu).
 pub const NEW_PROJECT: &str = egui_phosphor::regular::FILE_PLUS;

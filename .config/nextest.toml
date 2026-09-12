@@ -1,0 +1,25 @@
+[store]
+dir = "target/nextest"
+
+# `cargo nextest run` gives every test its own process, so a hung test
+# can be terminated on its own without taking the rest of the suite with
+# it the way a hang inside a single shared `cargo test` process can (see
+# `exit_dialog_saving_then_timeout_lets_the_user_exit_anyway_or_keep_waiting`
+# in `crates/gui-ui/tests/interaction.rs`, which once stalled — under
+# this environment's shared-container contention, not a real code bug —
+# for the better part of an hour inside plain `cargo test` before being
+# killed by hand). No test in this workspace legitimately runs anywhere
+# near this long: the full `gui-ui` interaction suite (117 tests, real
+# headless egui rendering, real git subprocesses for its commit-history
+# tests) normally finishes in well under a minute total. `slow-timeout`
+# logs a warning at each `period` a still-running test crosses, then
+# terminates it once `terminate-after` periods have elapsed — turning a
+# silent, indefinite hang into a loud, bounded failure instead.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 3 }
+# Matches the devcontainer's own `RUST_TEST_THREADS=1` (see root
+# CLAUDE.md's "Devcontainer environment note") — keeps `cargo nextest
+# run`'s concurrency profile the same as plain `cargo test`'s rather than
+# introducing new test-vs-test parallelism this workspace's tests were
+# never written against.
+test-threads = 1

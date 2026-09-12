@@ -1307,7 +1307,12 @@ where
     /// state touched, still shells out to `git`, so it's spawned" shape as
     /// `spawn_get_diff`, against `commit_log_directory(&target)` and a
     /// fixed exclude set (`commit_log_excludes`) instead of a caller-
-    /// supplied path.
+    /// supplied path. Also prepends a synthetic, hash-less `CommitInfo`
+    /// (see `has_uncommitted_changes`) when `target`'s own directory has
+    /// pending changes not yet committed — `gui-ui`'s
+    /// `render_commit_log_section` recognizes the empty hash and renders
+    /// it as a plain "Uncommitted changes" marker rather than a commit
+    /// link, since there's no commit for it to open a file list for.
     fn spawn_get_commit_log(&self, target: EntryPath, request: RequestId) {
         let Some(project_path) = self.project_path.clone() else {
             self.complete(request, Outcome::GetCommitLog(Err(GetCommitLogError::NoProjectPath)));
@@ -1321,6 +1326,19 @@ where
             let exclude_refs: Vec<&Path> = excludes.iter().map(PathBuf::as_path).collect();
             let outcome = Outcome::GetCommitLog(
                 git.commit_log_for_path(&dir, &exclude_refs, COMMIT_LOG_LIMIT)
+                    .map(|mut commits| {
+                        if has_uncommitted_changes(&git, &project_path, &dir, &excludes) {
+                            commits.insert(
+                                0,
+                                syscalls::CommitInfo {
+                                    hash: String::new(),
+                                    subject: "Uncommitted changes".to_string(),
+                                    date: String::new(),
+                                },
+                            );
+                        }
+                        commits
+                    })
                     .map_err(GetCommitLogError::from),
             );
             let _ = events.send(Event::Completed { request, outcome });
@@ -1675,6 +1693,38 @@ fn commit_log_excludes(dir: &Path, target: &EntryPath) -> Vec<PathBuf> {
         EntryPath::Test(_) => vec![dir.join("attachments"), dir.join("template")],
         EntryPath::Result(_) => Vec::new(),
     }
+}
+
+/// Whether `dir` (`target`'s own directory, same `excludes` as
+/// `commit_log_excludes` produced for it) has any pending change —
+/// staged, unstaged, or untracked — that a `CommitAll` would sweep up.
+/// Powers `spawn_get_commit_log`'s synthetic "Uncommitted changes" row.
+///
+/// Deliberately reuses `Git::changed_paths` against `project_path` (the
+/// same call `spawn_get_changed_files` already makes for the whole
+/// project) rather than calling it with `dir` directly: unlike its own
+/// doc comment's "relative to dir" framing, `SystemGit`'s real
+/// implementation shells out to `git status` without a pathspec, which
+/// reports every path in the repository relative to the repository root
+/// regardless of `dir` — calling it with an arbitrary subdirectory would
+/// silently return the *whole project's* pending paths, not `dir`'s own,
+/// flagging every entry as having uncommitted changes the moment
+/// anything anywhere in the project was touched. Re-anchoring each
+/// returned path at `project_path` and checking it against `dir` here
+/// does the scoping this function actually needs instead.
+///
+/// A `changed_paths` failure is treated as "nothing pending" rather than
+/// failing the whole request — `spawn_get_commit_log`'s real commit log
+/// has already succeeded by the time this runs, and this is a bonus
+/// indicator on top of it, not the reason the read was made.
+fn has_uncommitted_changes<G: syscalls::Git>(git: &G, project_path: &Path, dir: &Path, excludes: &[PathBuf]) -> bool {
+    let Ok(changed) = git.changed_paths(project_path) else {
+        return false;
+    };
+    changed.iter().any(|relative| {
+        let absolute = project_path.join(relative);
+        absolute.starts_with(dir) && !excludes.iter().any(|exclude| absolute.starts_with(exclude))
+    })
 }
 
 #[cfg(test)]
@@ -4771,6 +4821,215 @@ mod test {
         // its owning requirement's.
         let expected = test_project_dir().join("requirements/design/results/some_result");
         assert_eq!(result.unwrap()[0].hash, expected.display().to_string());
+    }
+
+    /// Reports pending changes under `requirements/design` itself as
+    /// present, a change confined to its excluded `attachments/`
+    /// subdirectory as absent, and a change elsewhere in the project
+    /// (`requirements/other`) as absent too — same scoping
+    /// `has_uncommitted_changes`'s own doc comment describes. `commit_for_
+    /// path_excluding` still returns the fixed `"deadbeef"` (this fake
+    /// doesn't override `commit_log_for_path`, so the same trait default
+    /// `FixedGit`-backed tests above rely on applies here).
+    #[derive(Debug, Clone, Copy, Default)]
+    struct ChangedPathsGit;
+
+    impl syscalls::Git for ChangedPathsGit {
+        fn commit_for_path_excluding(&self, _path: &Path, _excludes: &[&Path]) -> Result<String, CommitForPathError> {
+            Ok("deadbeef".to_string())
+        }
+
+        fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+            Ok(vec![
+                PathBuf::from("requirements/design/definition.typ"),
+                PathBuf::from("requirements/design/attachments/notes.txt"),
+                PathBuf::from("requirements/other/definition.typ"),
+            ])
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
+        }
+
+        fn diff(&self, _dir: &Path, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("diff for {}", path.display()))
+        }
+    }
+
+    impl syscalls::RemoteGit for ChangedPathsGit {
+        fn commit_for_remote(&self, _url: &str, _path: Option<&Path>) -> Result<String, CommitForRemoteError> {
+            Ok("deadbeef".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn get_commit_log_prepends_an_uncommitted_changes_entry_when_the_targets_own_directory_has_pending_changes() {
+        let (commands, mut events) = spawn_test_actor_with_git(ChangedPathsGit);
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitLog {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitLog(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitLog");
+        };
+        // `requirements/design/definition.typ` is a real pending change
+        // under `design`'s own directory and outside its excludes, so the
+        // synthetic marker goes in first — ahead of the real (fixed
+        // "deadbeef") commit `commit_log_for_path`'s default impl
+        // reports. `requirements/design/attachments/notes.txt` (excluded)
+        // and `requirements/other/definition.typ` (a different
+        // requirement entirely) must not, on their own, cause this — but
+        // since they can't be distinguished from the one that legitimately
+        // does just by the list's length, that's covered by the dedicated
+        // exclusion test below instead.
+        let log = result.unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].hash, "");
+        assert_eq!(log[0].subject, "Uncommitted changes");
+        assert_eq!(log[1].hash, "deadbeef");
+    }
+
+    /// Only ever reports a pending change under `requirements/design/
+    /// attachments/` — `design`'s own excluded subdirectory (see
+    /// `commit_log_excludes`) — never anything under `design` itself.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct AttachmentsOnlyChangedGit;
+
+    impl syscalls::Git for AttachmentsOnlyChangedGit {
+        fn commit_for_path_excluding(&self, _path: &Path, _excludes: &[&Path]) -> Result<String, CommitForPathError> {
+            Ok("deadbeef".to_string())
+        }
+
+        fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+            Ok(vec![PathBuf::from("requirements/design/attachments/notes.txt")])
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
+        }
+
+        fn diff(&self, _dir: &Path, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("diff for {}", path.display()))
+        }
+    }
+
+    impl syscalls::RemoteGit for AttachmentsOnlyChangedGit {
+        fn commit_for_remote(&self, _url: &str, _path: Option<&Path>) -> Result<String, CommitForRemoteError> {
+            Ok("deadbeef".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn get_commit_log_ignores_a_pending_change_confined_to_an_excluded_subdirectory() {
+        let (commands, mut events) = spawn_test_actor_with_git(AttachmentsOnlyChangedGit);
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitLog {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitLog(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitLog");
+        };
+        // `requirements/design/attachments/notes.txt` is under `design`'s
+        // own directory, but `attachments/` is one of `design`'s own
+        // `commit_log_excludes` — same reasoning `commit_log_for_path`
+        // itself already applies to real commits, extended here to
+        // pending ones — so no synthetic entry, just the fixed "deadbeef"
+        // `commit_log_for_path` default reports.
+        let log = result.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].hash, "deadbeef");
+    }
+
+    /// Reports `requirements/design` itself as pending (same paths as
+    /// `ChangedPathsGit`), but has no real commit history for it at all —
+    /// `commit_log_for_path` returns `Ok(Vec::new())`, the shape a brand
+    /// new, never-before-committed entry actually produces (an "untracked
+    /// path" `commit_for_path_excluding` error, or an unborn-HEAD repo,
+    /// both surface this way — see `SystemGit::commit_log_for_path`'s own
+    /// doc comment).
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NeverCommittedButChangedGit;
+
+    impl syscalls::Git for NeverCommittedButChangedGit {
+        fn commit_for_path_excluding(&self, _path: &Path, _excludes: &[&Path]) -> Result<String, CommitForPathError> {
+            Ok("deadbeef".to_string())
+        }
+
+        fn commit_log_for_path(
+            &self,
+            _path: &Path,
+            _excludes: &[&Path],
+            _limit: usize,
+        ) -> Result<Vec<syscalls::CommitInfo>, CommitForPathError> {
+            Ok(Vec::new())
+        }
+
+        fn changed_paths(&self, _dir: &Path) -> Result<Vec<PathBuf>, ChangedPathsError> {
+            Ok(vec![PathBuf::from("requirements/design/definition.typ")])
+        }
+
+        fn commit_all(&self, _dir: &Path, _message: &str) -> Result<(), CommitAllError> {
+            Ok(())
+        }
+
+        fn diff(&self, _dir: &Path, path: &Path) -> Result<String, DiffError> {
+            Ok(format!("diff for {}", path.display()))
+        }
+    }
+
+    impl syscalls::RemoteGit for NeverCommittedButChangedGit {
+        fn commit_for_remote(&self, _url: &str, _path: Option<&Path>) -> Result<String, CommitForRemoteError> {
+            Ok("deadbeef".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn get_commit_log_still_shows_uncommitted_changes_for_an_entry_with_no_commit_history_at_all() {
+        let (commands, mut events) = spawn_test_actor_with_git(NeverCommittedButChangedGit);
+
+        commands
+            .send(Command::LoadProject {
+                path: test_project_dir(),
+                request: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv_completed(&mut events, 1).await, Outcome::LoadProject(Ok(()))));
+
+        commands
+            .send(Command::GetCommitLog {
+                target: EntryPath::Requirement(LogicalPath::root(entry_name("design"))),
+                request: 2,
+            })
+            .unwrap();
+        let Outcome::GetCommitLog(result) = recv_completed(&mut events, 2).await else {
+            panic!("expected GetCommitLog");
+        };
+        let log = result.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].hash, "");
+        assert_eq!(log[0].subject, "Uncommitted changes");
     }
 
     #[tokio::test]

@@ -68,6 +68,19 @@ pub struct GuiApp {
     /// one (a requirement, test, and result can share a name within one
     /// module) — see `render_leaf`.
     selection: Option<EntryPath>,
+    /// True once a `GetEntryDetail` reply for the current `selection` has
+    /// come back empty — the entry was deleted (by an undo, a git pull, or
+    /// anything else) between being selected and that reply landing, most
+    /// often hit via Back/Forward re-fetching a history entry that no
+    /// longer exists. `render_center_pane`'s `Pane::Empty` branch uses this
+    /// to tell "still waiting on the round trip" apart from "the round
+    /// trip came back with nothing" — without it, both look like
+    /// `selection: Some(_)` with `editor: EditorState::None` and the pane
+    /// shows "Loading…" forever. Reset to `false` by every place that
+    /// starts a fresh fetch or clears `selection` (`select_from_history`,
+    /// `select_module_from_history`, `clear_center_pane_from_history`), set
+    /// `true` only by `apply_entry_detail`'s `None` arm.
+    selection_not_found: bool,
     /// The module new entries get created in, and the Attachments dialog
     /// targets — independent of `selection` so a module can be the
     /// "current" one without any leaf being selected. Kept in sync with
@@ -1004,6 +1017,7 @@ impl GuiApp {
             core,
             tree: None,
             selection: None,
+            selection_not_found: false,
             selected_module: Vec::new(),
             editor: EditorState::default(),
             nav_history: Vec::new(),
@@ -1850,6 +1864,26 @@ impl GuiApp {
         self.send_command(Command::GetResultReferenceIsStale { target, request });
     }
 
+    /// The toolbar's "Refresh" button — re-fetches whatever cached data
+    /// the currently open view is showing (a requirement's `met_status`, a
+    /// result's `stale` flag, a module page's `summary`, and the sidebar's
+    /// `sidebar_pools` for whatever module is currently selected) without
+    /// touching navigation or `self.editor` itself, so it can't clobber an
+    /// in-progress edit the way Back/Forward/Clear/the "New ___" buttons
+    /// could. Same set of re-fetches `Outcome::Validate` already triggers
+    /// (see below) plus `fetch_sidebar_pools`, which `Validate` has no
+    /// reason to also do since nothing about validating changes the
+    /// attachment/template pools. A no-op with nothing loaded.
+    fn refresh_clicked(&mut self) {
+        if self.tree.is_none() {
+            return;
+        }
+        self.refresh_open_requirement_met_status();
+        self.refresh_open_result_stale_status();
+        self.refresh_open_module_summary();
+        self.fetch_sidebar_pools(self.selected_module.clone());
+    }
+
     /// The module/project page's counterpart to
     /// `refresh_open_requirement_met_status` — a `Validate` can change the
     /// met/unmet and pass/fail/incomplete counts an open page's `summary`
@@ -2136,6 +2170,7 @@ impl GuiApp {
     fn select_from_history(&mut self, target: EntryPath) {
         self.selected_module = target.modules().to_vec();
         self.selection = Some(target.clone());
+        self.selection_not_found = false;
         self.editor = EditorState::None;
         let request = self.next_request_id();
         self.detail_request = Some(request);
@@ -2224,6 +2259,7 @@ impl GuiApp {
     /// shows, neither of which "clear the center pane" implies changing.
     fn clear_center_pane_from_history(&mut self) {
         self.selection = None;
+        self.selection_not_found = false;
         self.editor = EditorState::None;
     }
 
@@ -2251,6 +2287,7 @@ impl GuiApp {
     fn select_module_from_history(&mut self, module: Vec<EntryName>) {
         self.selected_module = module.clone();
         self.selection = None;
+        self.selection_not_found = false;
         self.fetch_sidebar_pools(module.clone());
         let display_name = module_display_name(self.tree.as_ref(), &module);
         let request = self.next_request_id();
@@ -2897,11 +2934,14 @@ impl GuiApp {
     /// place that decides which of the two `render_*_form` actually
     /// shows. `None` (nothing found — e.g. the entry was removed by
     /// someone/something else between selecting it and this reply
-    /// arriving) closes the editor rather than showing a stale form.
+    /// arriving) closes the editor rather than showing a stale form, and
+    /// sets `selection_not_found` so `render_center_pane` reports that
+    /// rather than "Loading…" forever.
     fn apply_entry_detail(&mut self, detail: Option<EntryDetail>) {
         let Some(target) = self.selection.clone() else {
             return;
         };
+        self.selection_not_found = detail.is_none();
         let read_only = self.current_nav_mode() == NavMode::View;
         // The open entry is changing (or reloading) — any "Commit history"
         // fetched/pending for whatever was open before no longer applies.
@@ -5457,6 +5497,18 @@ pub(crate) fn absolute_reference_path(target: &LogicalPath, kind_segment: &str) 
     path
 }
 
+/// Same shape as `absolute_reference_path`, extended for a result — which
+/// has no `LogicalPath` of its own (see `ResultPath`'s own doc comment) —
+/// by nesting its own name under its owning requirement's path, the same
+/// `results/<name>` layout the on-disk project itself uses.
+pub(crate) fn absolute_result_path(target: &ResultPath) -> String {
+    format!(
+        "{}/results/{}",
+        absolute_reference_path(&target.requirement, "requirements"),
+        target.name.as_str()
+    )
+}
+
 /// The on-disk directory name for a leaf `kind` — `"requirements"`/
 /// `"tests"`, matching `disk`'s own project layout (see
 /// `absolute_reference_path`'s doc comment). Takes `LeafKind` rather than
@@ -7628,6 +7680,46 @@ mod test {
     }
 
     #[test]
+    fn back_navigation_to_a_since_deleted_entry_reports_not_found_instead_of_loading_forever() {
+        // Regression test: Back re-fetches the history entry's detail via
+        // `select_from_history` same as any other navigation, but until
+        // `apply_entry_detail` started setting `selection_not_found`, an
+        // `EntryDetail(None)` reply (the entry was deleted after it was
+        // last visited) left `selection: Some(_)` with `editor: None` —
+        // indistinguishable from "still loading" in `render_center_pane`,
+        // so the center pane showed "Loading…" forever.
+        let mut app = test_app();
+        app.select(gui_core::EntryPath::Requirement(LogicalPath::root(
+            disk_entry_name("definition"),
+        )));
+        let first_request = app.detail_request.unwrap();
+        app.apply_event(Event::Completed {
+            request: first_request,
+            outcome: entry_detail_for(RequirementDraft::new("Definition")),
+        });
+        assert!(!app.selection_not_found);
+
+        app.select_module(Vec::new());
+        app.back_clicked();
+        let request = app.detail_request.unwrap();
+        assert!(app.pending.contains_key(&request));
+
+        app.apply_event(Event::Completed {
+            request,
+            outcome: Outcome::EntryDetail(None),
+        });
+
+        assert!(matches!(app.editor, EditorState::None));
+        assert!(app.selection_not_found);
+        assert_eq!(
+            app.selection,
+            Some(gui_core::EntryPath::Requirement(LogicalPath::root(
+                disk_entry_name("definition")
+            )))
+        );
+    }
+
+    #[test]
     fn a_failed_create_reports_the_error_and_leaves_the_form_open() {
         let mut app = test_app();
         app.new_module_clicked();
@@ -8599,6 +8691,49 @@ mod test {
 
         // `NewModule` (creation) has no `ExistingModule` page to refresh.
         assert!(app.module_summary_request.is_none());
+    }
+
+    #[test]
+    fn refresh_clicked_does_nothing_with_no_project_loaded() {
+        let mut app = test_app();
+
+        app.refresh_clicked();
+
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn refresh_clicked_refetches_the_open_requirements_met_status_and_the_sidebar_pools() {
+        let mut app = app_editing_a_requirement();
+        app.apply_event(Event::TreeChanged(TreeSnapshot {
+            root: gui_core::TreeNode {
+                name: disk_entry_name("Project"),
+                kind: EntryKind::Module,
+                status: gui_core::EntryStatus::Unvalidated,
+                requirement_count: 0,
+                requirements_met: 0,
+                children: Vec::new(),
+            },
+            can_undo: false,
+            can_redo: false,
+            validated: false,
+        }));
+        // Cleared so the assertions below can only be satisfied by
+        // `refresh_clicked`'s own re-fetches, not stray requests left over
+        // from building the fixture.
+        app.met_status_request = None;
+        app.sidebar_pools_request = None;
+
+        app.refresh_clicked();
+
+        assert!(
+            app.met_status_request.is_some(),
+            "refresh_clicked should have requested a met_status refresh"
+        );
+        assert!(
+            app.sidebar_pools_request.is_some(),
+            "refresh_clicked should have requested a sidebar pools refresh"
+        );
     }
 
     #[test]
